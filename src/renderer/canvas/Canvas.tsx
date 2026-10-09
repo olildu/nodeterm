@@ -742,6 +742,7 @@ import type {
   SshProjectStatus,
   TranscriptHit
 } from '@shared/types'
+import { resolveTidyLayout } from '@shared/types'
 import type { KanbanCreateChoice, KanbanSession } from '../components/kanban/KanbanView'
 import { assignNode, assignedTo, defaultKanban, labelsForCard, migrateProjectTags, resolveColumnRef, unassigned } from '../lib/kanban'
 import { registerWorkspaceDirty } from '../state/workspaceDirty'
@@ -851,6 +852,9 @@ import {
   arrangeByLineage,
   arrangeGroupChildren,
   tidyCanvas,
+  tidyCanvasCross,
+  crossLayout,
+  crossUnits,
   arrangeNodes,
   fitAncestorChain,
   groupArrangeRefusal,
@@ -1312,6 +1316,13 @@ function StatusAwareMiniMap({ onNodeDoubleClick }: { onNodeDoubleClick: (node: N
  */
 function setupApi(): typeof window.nodeTerminal.projectSetup {
   return window.nodeTerminal.projectSetup
+}
+
+/** The cross layout's gap: 40px, rounded up to a whole grid step while snap-to-grid is on so a
+ *  tidied cross stays on the grid (default nodes are grid multiples). */
+function crossGap(): number {
+  const { snapToGrid, gridSize } = useSettings.getState().settings
+  return snapToGrid && gridSize > 0 ? Math.ceil(40 / gridSize) * gridSize : 40
 }
 
 export function Canvas() {
@@ -8960,14 +8971,50 @@ export function Canvas() {
   const arrangeAllNodes = useCallback(() => {
     if (isGlobalKanbanOpen() || isKanbanOpen(useProjects.getState().activeProjectId)) return
     const edges = lineageEdges()
+    // `tidyLayout: 'cross'` swaps in the cross for a canvas of at most CROSS_MAX_UNITS units and
+    // falls back to this same stock Tidy above that (`tidyCanvasCross`).
+    const cross = resolveTidyLayout(useSettings.getState().settings.tidyLayout) === 'cross'
+    const gap = crossGap()
+    const tidy = (ns: CanvasNode[]): CanvasNode[] =>
+      cross ? tidyCanvasCross(ns, edges, { gap }) : tidyCanvas(ns, edges)
     // The SAME array means nothing moves (under 2 units, or already tidy): no undo entry, no
     // project.json write. Decided against nodesRef BEFORE the write — see arrangeByLineageAction.
-    if (tidyCanvas(nodesRef.current as CanvasNode[], edges) !== nodesRef.current) {
-      setNodes((ns) => tidyCanvas(ns as CanvasNode[], edges))
+    if (tidy(nodesRef.current as CanvasNode[]) !== nodesRef.current) {
+      setNodes((ns) => tidy(ns as CanvasNode[]))
       markDirty()
     }
     fitAll()
   }, [setNodes, markDirty, fitAll, lineageEdges])
+
+  // Cross layout, live: with `tidyLayout: 'cross'`, a node opening lands in its cross slot and a
+  // node closing lets the rest close up — the same picture Cmd+Shift+A draws for the same nodes
+  // (`crossLayout` anchors on the oldest unit, so the three paths cannot disagree). Keyed on the
+  // set of top-level units of the RENDERED project: `renderedProjectId` changes in the same render
+  // as a load's nodes, so a project load or switch is recorded as the new baseline and never read
+  // as "nodes opened". Above CROSS_MAX_UNITS `crossLayout` returns the same array and nothing moves.
+  const crossOn = resolveTidyLayout(settings.tidyLayout) === 'cross'
+  const crossSig = useMemo(
+    () => (crossOn ? crossUnits(nodes as CanvasNode[]).map((n) => n.id).join(',') : ''),
+    [crossOn, nodes]
+  )
+  const crossPrevRef = useRef<{ pid: string | null; sig: string } | null>(null)
+  useEffect(() => {
+    const prev = crossPrevRef.current
+    crossPrevRef.current = { pid: renderedProjectId, sig: crossSig }
+    if (!crossSig || !prev || prev.pid !== renderedProjectId || prev.sig === crossSig) return
+    if (loadingRef.current || renderedProjectId !== nodesProjectIdRef.current) return
+    const live = nodesRef.current as CanvasNode[]
+    // Never yank a node out of maximize; the next open/close or Cmd+Shift+A re-applies the cross.
+    if (live.some((n) => !n.parentId && n.data?.premaxRect)) return
+    const gap = crossGap()
+    if (crossLayout(live, { gap }) === live) return
+    setNodes((ns) => crossLayout(ns as CanvasNode[], { gap }))
+    markDirty()
+    // A node was added: bring the whole cross into view so the new one is on screen. A close keeps
+    // the camera where the user left it.
+    const prevIds = new Set(prev.sig.split(','))
+    if (crossSig.split(',').some((id) => !prevIds.has(id))) requestAnimationFrame(() => fitAll())
+  }, [crossSig, renderedProjectId, setNodes, markDirty, fitAll, nodesRef, nodesProjectIdRef])
 
   // Whether the lineage tidy has anything to say. Asked when the menu OPENS so the row can be
   // disabled with its reason instead of silently doing nothing on click: on a canvas nobody

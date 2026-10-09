@@ -1839,6 +1839,90 @@ export function tidyCanvas(
   return unmoved(out)
 }
 
+/** The most top-level units the cross layout places; a bigger canvas keeps the stock Tidy grid. */
+export const CROSS_MAX_UNITS = 5
+
+/**
+ * When a node was opened, read from its id: every factory mints `<prefix>-<Date.now() base36>-<token>`
+ * (`nextId`). `undefined` for an id that does not carry one (hand-edited, imported), which then
+ * sorts after every stamped id, by array order.
+ */
+function openedAtOf(id: string): number | undefined {
+  for (const part of id.split('-')) {
+    if (!/^[0-9a-z]{8,9}$/.test(part)) continue
+    const t = parseInt(part, 36)
+    // 2015..2100: a base36 ms timestamp, not a hex token that happens to parse.
+    if (t > 1.42e12 && t < 4.1e12) return t
+  }
+  return undefined
+}
+
+/** The top-level units the cross places, in opening order. Render-only kinds are never units. */
+export function crossUnits(nodes: CanvasNode[]): CanvasNode[] {
+  const index = new Map(nodes.map((nd, i) => [nd.id, i]))
+  return nodes
+    .filter((nd) => !nd.parentId && nd.type !== 'subagent' && nd.type !== 'loop')
+    .map((nd) => ({ nd, t: openedAtOf(nd.id) ?? Number.POSITIVE_INFINITY }))
+    .sort((a, b) => a.t - b.t || index.get(a.nd.id)! - index.get(b.nd.id)!)
+    .map(({ nd }) => nd)
+}
+
+/**
+ * **Cross layout** for a canvas of at most `CROSS_MAX_UNITS` top-level units, in opening order:
+ *
+ * ```
+ *   1–3:  A B C        4:    D         5:    D
+ *                          A B C           A B C
+ *                                            E
+ * ```
+ *
+ * The oldest unit (A) is the anchor and never moves; the row is top-aligned on it, D and E are
+ * centred on B, one `gap` above the row and one below its tallest member. Because the anchor and
+ * the order are both properties of the set itself, opening a node, closing one and Tidy all land
+ * on the same picture for the same nodes. Returns the SAME array when nothing moves, or when the
+ * canvas has more units than the cross holds (the caller falls back). Pure.
+ */
+export function crossLayout(nodes: CanvasNode[], opts?: { gap?: number }): CanvasNode[] {
+  const units = crossUnits(nodes)
+  if (units.length < 2 || units.length > CROSS_MAX_UNITS) return nodes
+  const gap = opts?.gap ?? 40
+  const unitIds = new Set(units.map((u) => u.id))
+  const restored = restoreMaximizedWhere(nodes, (nd) => unitIds.has(nd.id))
+  const byId = new Map(restored.map((nd) => [nd.id, nd]))
+  const [a, b, c, d, e] = units.map((u) => byId.get(u.id)!)
+
+  const pos = new Map<string, { x: number; y: number }>()
+  const top = a.position.y
+  let x = a.position.x
+  for (const m of [a, b, c]) {
+    if (!m) break
+    pos.set(m.id, { x, y: top })
+    x += nodeW(m) + gap
+  }
+  const rowH = Math.max(...[a, b, c].filter(Boolean).map((m) => nodeH(m!)))
+  const centreOnB = (m: CanvasNode): number => pos.get(b.id)!.x + (nodeW(b) - nodeW(m)) / 2
+  if (d) pos.set(d.id, { x: centreOnB(d), y: top - gap - nodeH(d) })
+  if (e) pos.set(e.id, { x: centreOnB(e), y: top + rowH + gap })
+
+  const out = restored.map((nd) => {
+    const p = pos.get(nd.id)
+    return p && (p.x !== nd.position.x || p.y !== nd.position.y) ? { ...nd, position: p } : nd
+  })
+  return out.every((nd, i) => nd === nodes[i]) ? nodes : out
+}
+
+/**
+ * Tidy canvas with the cross preference: the cross for a canvas it holds, the stock lineage-aware
+ * Tidy for anything bigger. Same contract as `tidyCanvas` — the SAME array means nothing moved.
+ */
+export function tidyCanvasCross(
+  nodes: CanvasNode[],
+  edges: readonly LineageEdge[] = [],
+  opts?: { gap?: number }
+): CanvasNode[] {
+  return crossUnits(nodes).length <= CROSS_MAX_UNITS ? crossLayout(nodes, opts) : tidyCanvas(nodes, edges, opts)
+}
+
 /**
  * Why `arrangeGroupChildren` has nothing to do for this frame, as a sentence a menu row can show
  * and a control reply can carry — or `null` when it can run. ONE definition for both, so the row's

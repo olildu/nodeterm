@@ -10,6 +10,7 @@ import { Input } from '@renderer/ui/Input'
 import { hintLabel } from '@shared/platform-utils'
 import { clampWheelZoomSpeed } from '@renderer/canvas/wheel-zoom'
 import { DEFAULT_WORKTREE_PATH_TEMPLATE } from '@shared/worktree'
+import { resolveTidyLayout } from '@shared/types'
 
 const ROWS = {
   defaultView: {
@@ -33,6 +34,10 @@ const ROWS = {
   autoAlign: {
     title: 'Snap to grid mode (auto-arrange)',
     keywords: ['snap', 'grid', 'align', 'arrange', 'auto', 'mode']
+  },
+  tidyLayout: {
+    title: 'Tidy layout',
+    keywords: ['tidy', 'layout', 'cross', 'arrange', 'order', 'grid']
   },
   panHover: { title: 'Pan-hover delay (ms)', keywords: ['pan', 'hover', 'delay', 'focus', 'guard'] },
   focusFollowsPointer: {
@@ -203,6 +208,22 @@ export function BehaviorSection({ isActive }: { isActive: boolean }): React.JSX.
               onChange={(v) => update({ autoAlignGrid: v })}
               ariaLabel="Snap to grid mode"
             />
+          }
+        />
+      </SearchableRow>
+      <SearchableRow {...ROWS.tidyLayout}>
+        <FieldRow
+          label="Tidy layout"
+          description="Cmd+Shift+A arranges up to 5 nodes in opening order: a row of three, the 4th above the middle, the 5th below. New nodes snap into place and the rest close up when one closes. More than 5 nodes use the normal grid."
+          control={
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <span style={{ opacity: 0.6 }}>Cross (up to 5 nodes)</span>
+              <Switch
+                checked={resolveTidyLayout(settings.tidyLayout) === 'cross'}
+                onChange={(v) => update({ tidyLayout: v ? 'cross' : 'auto' })}
+                ariaLabel="Cross (up to 5 nodes)"
+              />
+            </div>
           }
         />
       </SearchableRow>

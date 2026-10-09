@@ -8,6 +8,10 @@ import {
   groupArrangeRefusal,
   lineageLayers,
   tidyCanvas,
+  crossLayout,
+  crossUnits,
+  tidyCanvasCross,
+  CROSS_MAX_UNITS,
   GROUP_PAD,
   GROUP_HEADER,
   type CanvasNode
@@ -653,5 +657,180 @@ describe('lineageLayers slots siblings under their OPENER first', () => {
     const nodes = [n('o', 0, 0), n('a', 0, 200), n('b', 300, 200), n('c', 0, 400), n('d', 300, 400)]
     const { layers } = lineageLayers(nodes, [opens('o', 'a'), opens('o', 'b'), opens('a', 'd'), opens('b', 'c'), waits('a', 'c')])
     expect(layers).toEqual([['o'], ['a', 'b'], ['d', 'c']])
+  })
+})
+
+// ── Cross layout ────────────────────────────────────────────────────────────────────────────────
+// Ids carry the opening time the way `nextId` mints them: `term-<Date.now() base36>-<hex token>`.
+const tid = (i: number) => `term-${(1.8e12 + i * 1000).toString(36)}-abcd1234`
+const A = tid(1), B = tid(2), C = tid(3), D = tid(4), E = tid(5), F = tid(6)
+const posOf = (out: CanvasNode[], id: string) => out.find((x) => x.id === id)!.position
+const rect = (nd: CanvasNode) => ({ x: nd.position.x, y: nd.position.y, w: nd.width as number, h: nd.height as number })
+const overlaps = (p: ReturnType<typeof rect>, q: ReturnType<typeof rect>) =>
+  p.x < q.x + q.w && q.x < p.x + p.w && p.y < q.y + q.h && q.y < p.y + p.h
+const expectNoOverlap = (out: CanvasNode[], ids: string[]) => {
+  const rs = ids.map((id) => rect(out.find((x) => x.id === id)!))
+  for (let i = 0; i < rs.length; i++) for (let j = i + 1; j < rs.length; j++) expect(overlaps(rs[i], rs[j])).toBe(false)
+}
+
+describe('crossLayout', () => {
+  it('the cap is five units', () => {
+    expect(CROSS_MAX_UNITS).toBe(5)
+  })
+
+  it('orders units by the timestamp in the id, not by array position', () => {
+    const nodes = [n(D, 0, 0), n(B, 0, 0), n(E, 0, 0), n(A, 0, 0), n(C, 0, 0)]
+    expect(crossUnits(nodes).map((u) => u.id)).toEqual([A, B, C, D, E])
+  })
+
+  it('ids without a timestamp sort after stamped ones, by array order', () => {
+    const nodes = [n('zeta', 0, 0), n(B, 0, 0), n('alpha', 0, 0), n(A, 0, 0)]
+    expect(crossUnits(nodes).map((u) => u.id)).toEqual([A, B, 'zeta', 'alpha'])
+    // and they land in the row after the stamped ones
+    const out = crossLayout(nodes, { gap: 10 })
+    const a = posOf(out, A)
+    expect(posOf(out, B)).toEqual({ x: a.x + 110, y: a.y })
+    expect(posOf(out, 'zeta')).toEqual({ x: a.x + 220, y: a.y })
+    expect(posOf(out, 'alpha')).toEqual({ x: posOf(out, B).x, y: a.y - 10 - 50 }) // 4th → on top
+  })
+
+  it('n=1 is a no-op (same array)', () => {
+    const nodes = [n(A, 30, 40)]
+    expect(crossLayout(nodes)).toBe(nodes)
+    expect(tidyCanvasCross(nodes)).toBe(nodes)
+  })
+
+  it('n=2: A B in a row at A, default gap 40', () => {
+    const out = crossLayout([n(B, 999, -300), n(A, 100, 200)])
+    expect(posOf(out, A)).toEqual({ x: 100, y: 200 })
+    expect(posOf(out, B)).toEqual({ x: 240, y: 200 })
+  })
+
+  it('n=3: A B C in a row', () => {
+    const out = crossLayout([n(C, 5, 5), n(A, 100, 200), n(B, -50, 900)])
+    expect(posOf(out, A)).toEqual({ x: 100, y: 200 })
+    expect(posOf(out, B)).toEqual({ x: 240, y: 200 })
+    expect(posOf(out, C)).toEqual({ x: 380, y: 200 })
+  })
+
+  it('n=4: D centred over B, one gap above the row', () => {
+    const out = crossLayout([n(D, 0, 0), n(C, 5, 5), n(A, 100, 200), n(B, -50, 900)])
+    expect(posOf(out, A)).toEqual({ x: 100, y: 200 })
+    expect(posOf(out, B)).toEqual({ x: 240, y: 200 })
+    expect(posOf(out, C)).toEqual({ x: 380, y: 200 })
+    expect(posOf(out, D)).toEqual({ x: 240, y: 200 - 40 - 50 })
+    expectNoOverlap(out, [A, B, C, D])
+  })
+
+  it('n=5: E centred under B, one gap below the row', () => {
+    const out = crossLayout([n(E, 7, 7), n(D, 0, 0), n(C, 5, 5), n(A, 100, 200), n(B, -50, 900)])
+    expect(posOf(out, D)).toEqual({ x: 240, y: 110 })
+    expect(posOf(out, E)).toEqual({ x: 240, y: 200 + 50 + 40 })
+    expectNoOverlap(out, [A, B, C, D, E])
+  })
+
+  it('respects opts.gap', () => {
+    const out = crossLayout([n(A, 0, 0), n(B, 0, 0), n(C, 0, 0), n(D, 0, 0), n(E, 0, 0)], { gap: 10 })
+    expect(posOf(out, B)).toEqual({ x: 110, y: 0 })
+    expect(posOf(out, C)).toEqual({ x: 220, y: 0 })
+    expect(posOf(out, D)).toEqual({ x: 110, y: -60 })
+    expect(posOf(out, E)).toEqual({ x: 110, y: 60 })
+  })
+
+  it('unequal sizes: row top-aligned, D/E centred on B, E below the TALLEST row node', () => {
+    const nodes = [
+      n(E, 0, 0, 60, 30),
+      n(C, 0, 0, 80, 300), // tallest in the row
+      n(A, 0, 0, 200, 100),
+      n(D, 0, 0, 400, 70), // wider than B
+      n(B, 0, 0, 120, 150)
+    ]
+    const out = crossLayout(nodes, { gap: 20 })
+    expect(posOf(out, A)).toEqual({ x: 0, y: 0 })
+    expect(posOf(out, B)).toEqual({ x: 220, y: 0 })
+    expect(posOf(out, C)).toEqual({ x: 360, y: 0 })
+    expect(posOf(out, D)).toEqual({ x: 220 + (120 - 400) / 2, y: -20 - 70 })
+    expect(posOf(out, E)).toEqual({ x: 220 + (120 - 60) / 2, y: 300 + 20 })
+    expectNoOverlap(out, [A, B, C, D, E])
+  })
+
+  it('anchor A stays put even when it is not the top-left node', () => {
+    const nodes = [n(B, -500, -500), n(C, -900, 0), n(A, 600, 400), n(D, 0, -1000)]
+    const out = crossLayout(nodes)
+    expect(posOf(out, A)).toEqual({ x: 600, y: 400 })
+    expect(out.find((x) => x.id === A)).toBe(nodes[2]) // not even copied
+    expect(posOf(out, B)).toEqual({ x: 740, y: 400 })
+    expect(posOf(out, C)).toEqual({ x: 880, y: 400 })
+    expect(posOf(out, D)).toEqual({ x: 740, y: 310 })
+  })
+
+  it('closing B re-flows A, C, D — the same picture as a fresh A, C, D', () => {
+    const laid = crossLayout([n(A, 0, 0), n(B, 0, 0), n(C, 0, 0), n(D, 0, 0)])
+    expect(posOf(laid, D)).toEqual({ x: 140, y: -90 }) // D on top of B while there are four
+    const afterClose = crossLayout(laid.filter((x) => x.id !== B))
+    // Three units are a row (1–3: A B C), so D drops into the row's third slot.
+    expect(posOf(afterClose, A)).toEqual({ x: 0, y: 0 })
+    expect(posOf(afterClose, C)).toEqual({ x: 140, y: 0 })
+    expect(posOf(afterClose, D)).toEqual({ x: 280, y: 0 })
+    const fresh = crossLayout([n(D, 77, 77), n(C, -3, 9), n(A, 0, 0)])
+    for (const id of [A, C, D]) expect(posOf(afterClose, id)).toEqual(posOf(fresh, id))
+    expectNoOverlap(afterClose, [A, C, D])
+  })
+
+  it('is idempotent: a second call returns the SAME array', () => {
+    for (const ids of [[A, B], [A, B, C], [A, B, C, D], [A, B, C, D, E]]) {
+      const once = crossLayout(ids.map((id, i) => n(id, i * 13, -i * 7)))
+      expect(crossLayout(once)).toBe(once)
+      expect(tidyCanvasCross(once)).toBe(once)
+    }
+  })
+
+  it('returns untouched nodes by reference', () => {
+    const nodes = [n(A, 0, 0), n(B, 140, 0), n(C, 9, 9)]
+    const out = crossLayout(nodes)
+    expect(out).not.toBe(nodes)
+    expect(out[0]).toBe(nodes[0])
+    expect(out[1]).toBe(nodes[1])
+    expect(out[2]).not.toBe(nodes[2])
+  })
+
+  it('ignores subagent/loop cards and grouped children', () => {
+    const sub = { ...n(tid(0), 3, 3), type: 'subagent' } as CanvasNode // older than A
+    const loop = { ...n('loop-x', 4, 4), type: 'loop' } as CanvasNode
+    const frame = { ...n(B, 500, 500, 300, 200), type: 'group' } as CanvasNode
+    const kid = { ...n(tid(-5), 20, 60), parentId: B } as CanvasNode // older than A, but grouped
+    const nodes = [sub, kid, frame, loop, n(C, 1, 1), n(A, 0, 0)]
+    expect(crossUnits(nodes).map((u) => u.id)).toEqual([A, B, C])
+    const out = crossLayout(nodes)
+    expect(out.find((x) => x.id === sub.id)).toBe(sub)
+    expect(out.find((x) => x.id === loop.id)).toBe(loop)
+    expect(out.find((x) => x.id === kid.id)).toBe(kid)
+    expect(posOf(out, A)).toEqual({ x: 0, y: 0 })
+    expect(posOf(out, B)).toEqual({ x: 140, y: 0 })
+    expect(posOf(out, C)).toEqual({ x: 480, y: 0 })
+  })
+
+  it('n=6 is out of range: same array', () => {
+    const nodes = [A, B, C, D, E, F].map((id, i) => n(id, i * 300, 0))
+    expect(crossLayout(nodes)).toBe(nodes)
+  })
+})
+
+describe('tidyCanvasCross', () => {
+  it('uses the cross for five units or fewer', () => {
+    const nodes = [n(E, 0, 0), n(D, 0, 0), n(C, 0, 0), n(B, 0, 0), n(A, 10, 20)]
+    expect(tidyCanvasCross(nodes)).toEqual(crossLayout(nodes))
+  })
+
+  it('falls back to the stock tidyCanvas above five units', () => {
+    const nodes = [F, E, D, C, B, A].map((id, i) => n(id, (i % 3) * 400 + 7, Math.floor(i / 3) * 300 + 3))
+    expect(tidyCanvasCross(nodes)).toEqual(tidyCanvas(nodes))
+    expect(tidyCanvasCross(nodes)).not.toBe(nodes) // the fallback actually moved something
+  })
+
+  it('counts subagent cards out when choosing (5 units + a card = cross)', () => {
+    const sub = { ...n('sub-x', 0, 0), type: 'subagent' } as CanvasNode
+    const nodes = [sub, n(A, 0, 0), n(B, 0, 0), n(C, 0, 0), n(D, 0, 0), n(E, 0, 0)]
+    expect(tidyCanvasCross(nodes)).toEqual(crossLayout(nodes))
   })
 })

@@ -118,9 +118,11 @@ describe('arrange inside a group (source pins)', () => {
 
   it('Tidy canvas is tidyCanvas over the ropes WITH their ids, and a no-op writes nothing', () => {
     const tidy = between('const arrangeAllNodes = useCallback(', '\n  // Whether the lineage tidy')
-    const guard = tidy.indexOf('tidyCanvas(nodesRef.current as CanvasNode[], edges) !== nodesRef.current')
+    // `tidy` is tidyCanvas, or tidyCanvasCross (cross layout, which falls back to tidyCanvas).
+    expect(tidy).toContain('cross ? tidyCanvasCross(ns, edges, { gap }) : tidyCanvas(ns, edges)')
+    const guard = tidy.indexOf('tidy(nodesRef.current as CanvasNode[]) !== nodesRef.current')
     expect(guard).toBeGreaterThan(-1)
-    expect(tidy.indexOf('setNodes((ns) => tidyCanvas(ns as CanvasNode[], edges))')).toBeGreaterThan(guard)
+    expect(tidy.indexOf('setNodes((ns) => tidy(ns as CanvasNode[]))')).toBeGreaterThan(guard)
     expect(tidy).not.toContain('arrangeNodes(')
     expect(tidy).toContain('isKanbanOpen(')
     const edges = between('const lineageEdges = useCallback(', 'const arrangeAllNodes')

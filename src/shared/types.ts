@@ -1749,6 +1749,15 @@ export interface ZoomActualSizeModifiers {
   control: boolean
 }
 
+/** What Tidy canvas lays out (`Settings.tidyLayout`). */
+export type TidyLayout = 'auto' | 'cross'
+
+/** Reads `Settings.tidyLayout` from a hand-editable settings.json: only the literal `'cross'`
+ *  yields `'cross'`; anything else (absent, misspelled, wrong type) is the stock `'auto'`. */
+export function resolveTidyLayout(v: unknown): TidyLayout {
+  return v === 'cross' ? 'cross' : 'auto'
+}
+
 /** User-configurable application settings (settings.json). */
 export interface Settings {
   fontSize: number
@@ -1824,6 +1833,12 @@ export interface Settings {
    *  Distinct from `snapToGrid` (drag-time snap) — turning this on arranges once; it does not
    *  constrain future drags. v1: arrange-all-on-enable only. */
   autoAlignGrid: boolean
+  /** What Tidy canvas (Cmd+Shift+A) lays out. `'auto'` (default) = the stock lineage-aware Tidy
+   *  grid. `'cross'` = for a canvas of at most 5 top-level nodes, Tidy arranges them in opening
+   *  order as a cross (1–3 in a row, the 4th above the middle, the 5th below it), newly opened
+   *  nodes snap into their slot and the rest re-flow when one closes; more than 5 falls back to
+   *  the grid. Hand-editable: every reader goes through `resolveTidyLayout`. */
+  tidyLayout: TidyLayout
   /** Height of the top project tab bar in CSS px (Settings → Appearance). Hand-editable; every
    *  reader — the renderer's `--tabbar-h` and main's traffic-light `y` — goes through
    *  `resolveTabBarHeight` (`@shared/window-chrome-metrics`), which clamps to 28–64 and answers
@@ -2321,6 +2336,7 @@ export const DEFAULT_SETTINGS: Settings = {
   gridSize: 24,
   snapToGrid: false,
   autoAlignGrid: false,
+  tidyLayout: 'auto',
   tabBarHeight: TABBAR_HEIGHT_PX,
   defaultNodeWidth: 640,
   defaultNodeHeight: 440,
