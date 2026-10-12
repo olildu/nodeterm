@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest'
-import { setLiveCanvasNodesSource, terminalNodeSize, type CanvasNode } from './workspace'
+import { setLiveCanvasNodesSource, terminalNodeSize, withNodeSizeSource, type CanvasNode } from './workspace'
 import { useSettings } from './settings'
 import { DEFAULT_SETTINGS, type Settings } from '@shared/types'
 
@@ -62,5 +62,38 @@ describe('terminalNodeSize with newNodeSize', () => {
     withSettings({ newNodeSize: 'matchLargest' })
     setLiveCanvasNodesSource(() => [node('terminal', 5000, 3000)])
     expect(terminalNodeSize()).toEqual({ width: 2400, height: 1600 })
+  })
+})
+
+describe('withNodeSizeSource (a node built for a project that is not on screen)', () => {
+  const onScreen = [node('terminal', 1128, 600)]
+  const target = [node('terminal', 640, 440), node('terminal', 1152, 600)]
+
+  it('measures the given nodes instead of the canvas on screen, only while building', () => {
+    withSettings({ newNodeSize: 'matchLargest' })
+    setLiveCanvasNodesSource(() => onScreen)
+    expect(withNodeSizeSource(target, () => terminalNodeSize())).toEqual({ width: 1152, height: 600 })
+    expect(terminalNodeSize()).toEqual({ width: 1128, height: 600 })
+  })
+
+  it('restores the previous source when the build throws, and nests', () => {
+    withSettings({ newNodeSize: 'matchLargest' })
+    setLiveCanvasNodesSource(() => onScreen)
+    expect(() =>
+      withNodeSizeSource(target, () => {
+        throw new Error('boom')
+      })
+    ).toThrow('boom')
+    expect(terminalNodeSize()).toEqual({ width: 1128, height: 600 })
+    const inner = withNodeSizeSource(target, () =>
+      withNodeSizeSource([node('terminal', 800, 500)], () => terminalNodeSize())
+    )
+    expect(inner).toEqual({ width: 800, height: 500 })
+  })
+
+  it('an empty target falls back to the default size, not to the canvas on screen', () => {
+    withSettings({ newNodeSize: 'matchLargest' })
+    setLiveCanvasNodesSource(() => onScreen)
+    expect(withNodeSizeSource([], () => terminalNodeSize())).toEqual({ width: 640, height: 440 })
   })
 })

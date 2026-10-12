@@ -905,6 +905,7 @@ import {
   placeNodeInRect,
   terminalNodeSize,
   setLiveCanvasNodesSource,
+  withNodeSizeSource,
   type CanvasNode
 } from '../state/workspace'
 import { codexAccountSelectable, codexAccountSwitchStillEligible } from './codex-account-switch'
@@ -13047,8 +13048,10 @@ export function Canvas() {
           const tgMade: CanvasNode[] = []
           let tgBase = { x: 0, y: 0 }
           const tgIndexBase = tgActive ? nodesRef.current.length : tgStoredNodes.length
+          // `newNodeSize: 'matchLargest'` measures the TARGET project, not the canvas on screen.
+          const tgSizeNodes = tgActive ? nodesRef.current : nodeStatesToFlow(tgStoredNodes)
           for (let i = 0; i < tgCount; i++) {
-            const node = tgIsTerminal
+            const node = withNodeSizeSource(tgSizeNodes, () => tgIsTerminal
               ? createTerminalNode(tgIndexBase + i, tgCwd, { x: 0, y: 0 }, args.cmd)
               : bindIssue(
                   createAgentNode(
@@ -13069,7 +13072,7 @@ export function Canvas() {
                     openPrompt.promptFile
                   ),
                   tgIssueRef
-                )
+                ))
             const w = (node.width as number) ?? 640
             const h = (node.height as number) ?? 440
             if (i === 0) tgBase = nextFreePosition(tgPlacedNodes, { width: w, height: h })
@@ -13320,6 +13323,7 @@ export function Canvas() {
               return
             }
             const coldNodes = owner.nodes as unknown as ColdNode[]
+            const coldSizeNodes = nodeStatesToFlow(owner.nodes)
             const coldTerminal = verb === 'open-terminal'
             const coldAgentId = (verb === 'open-agent' ? args.agent : 'claude') as AgentId
             const coldCount = Math.max(
@@ -13445,7 +13449,8 @@ export function Canvas() {
               : 0
             const coldMade: CanvasNode[] = []
             for (let i = 0; i < coldCount; i++) {
-              const built = coldTerminal
+              // `newNodeSize: 'matchLargest'` measures the OWNING project, not the canvas on screen.
+              const built = withNodeSizeSource(coldSizeNodes, () => coldTerminal
                 ? createTerminalNode(coldNodes.length + i, coldCwd, undefined, args.cmd, coldSsh)
                 : bindIssue(
                     createAgentNode(
@@ -13462,7 +13467,7 @@ export function Canvas() {
                       openPrompt.promptFile
                     ),
                     coldIssueRef
-                  )
+                  ))
               // Arm it: the project is not mounted, so nothing would deliver an `initialCommand`
               // and serialization drops it. `--after` rides the same held launch — an empty `after`
               // is vacuously ready, so a node with no deps fires on that project's first view.

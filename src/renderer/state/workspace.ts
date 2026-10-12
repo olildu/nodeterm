@@ -340,7 +340,7 @@ export function terminalNodeSize(): { width: number; height: number } {
     height: clamp(s.defaultNodeHeight, 160, 1600, TERMINAL_SIZE.height)
   }
   if (resolveNewNodeSize(s.newNodeSize) !== 'matchLargest') return fallback
-  const largest = largestTerminalSize((liveCanvasNodes?.() ?? []).map(sizedFlowNode))
+  const largest = largestTerminalSize(((nodeSizeSourceOverride ?? liveCanvasNodes)?.() ?? []).map(sizedFlowNode))
   if (!largest) return fallback
   return {
     width: clamp(largest.width, 280, 2400, fallback.width),
@@ -357,6 +357,26 @@ let liveCanvasNodes: (() => readonly CanvasNode[]) | null = null
 
 export function setLiveCanvasNodesSource(source: (() => readonly CanvasNode[]) | null): void {
   liveCanvasNodes = source
+}
+
+/**
+ * The canvas a node is being built FOR, when that is not the one on screen: canvas control opens
+ * nodes into a project the user is not looking at (an agent's own project in the background, or
+ * `--project`). Set only for the duration of `withNodeSizeSource`'s synchronous build, so a node
+ * opened that way matches the largest terminal of ITS project, not of whatever canvas is visible.
+ */
+let nodeSizeSourceOverride: (() => readonly CanvasNode[]) | null = null
+
+/** Run `build` (synchronous node factories) with `matchLargest` measuring `nodes` instead of the
+ *  live canvas. Restores the previous source afterwards, also when `build` throws. */
+export function withNodeSizeSource<T>(nodes: readonly CanvasNode[], build: () => T): T {
+  const prev = nodeSizeSourceOverride
+  nodeSizeSourceOverride = () => nodes
+  try {
+    return build()
+  } finally {
+    nodeSizeSourceOverride = prev
+  }
 }
 
 /** A live node's NORMAL size: a maximized node's pre-maximize rect, a collapsed node's expanded
@@ -1891,11 +1911,16 @@ function openedAtOf(id: string): number | undefined {
   return undefined
 }
 
-/** The top-level units the cross places, in opening order. Render-only kinds are never units. */
+/**
+ * The nodes the cross places, in opening order: top-level TERMINAL nodes only — plain terminals
+ * and agent sessions (an agent node is a terminal). Notes, browsers, editors, files, group frames
+ * and the render-only cards are not part of the cross: it never moves them and they do not count
+ * towards its five slots.
+ */
 export function crossUnits(nodes: CanvasNode[]): CanvasNode[] {
   const index = new Map(nodes.map((nd, i) => [nd.id, i]))
   return nodes
-    .filter((nd) => !nd.parentId && nd.type !== 'subagent' && nd.type !== 'loop')
+    .filter((nd) => !nd.parentId && (nd.type ?? 'terminal') === 'terminal')
     .map((nd) => ({ nd, t: openedAtOf(nd.id) ?? Number.POSITIVE_INFINITY }))
     .sort((a, b) => a.t - b.t || index.get(a.nd.id)! - index.get(b.nd.id)!)
     .map(({ nd }) => nd)
@@ -1930,7 +1955,8 @@ function permutations<T>(items: T[]): T[][] {
 }
 
 /**
- * **Cross layout** for a canvas of at most `CROSS_MAX_UNITS` top-level units:
+ * **Cross layout** for a canvas of at most `CROSS_MAX_UNITS` top-level terminal nodes (`crossUnits`;
+ * every other node is left exactly where it is):
  *
  * ```
  *   1–3:  ■ ■ ■        4:    ■         5:    ■
@@ -2025,8 +2051,9 @@ export function crossLayout(
 }
 
 /**
- * Tidy canvas with the cross preference: the cross for a canvas it holds, the stock lineage-aware
- * Tidy for anything bigger. Same contract as `tidyCanvas` — the SAME array means nothing moved.
+ * Tidy canvas with the cross preference: the cross when the canvas has at most `CROSS_MAX_UNITS`
+ * terminal nodes (only they move; notes, browsers, frames… stay put), the stock lineage-aware Tidy
+ * for anything bigger. Same contract as `tidyCanvas` — the SAME array means nothing moved.
  */
 export function tidyCanvasCross(
   nodes: CanvasNode[],

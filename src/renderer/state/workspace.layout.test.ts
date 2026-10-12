@@ -948,21 +948,31 @@ describe('crossLayout', () => {
     expect(posOf(out, C)).toEqual({ x: 280, y: 0 })
   })
 
-  it('ignores subagent/loop cards and grouped children', () => {
+  it('only terminal nodes are units: cards, frames, grouped children and other kinds are ignored', () => {
     const sub = { ...n(tid(0), 3, 3), type: 'subagent' } as CanvasNode // older than A
     const loop = { ...n('loop-x', 4, 4), type: 'loop' } as CanvasNode
-    const frame = { ...n(B, 140, 0, 300, 200), type: 'group' } as CanvasNode
-    const kid = { ...n(tid(-5), 20, 60), parentId: B } as CanvasNode // older than A, but grouped
-    // A (0,0), frame B 300 wide at (140,0), so C's slot is 140 + 300 + 40 = 480; C is 3px off.
-    const nodes = [sub, kid, frame, loop, n(C, 483, 2), n(A, 0, 0)]
+    const frame = { ...n(tid(-9), 140, 0, 300, 200), type: 'group' } as CanvasNode
+    const kid = { ...n(tid(-5), 20, 60), parentId: frame.id } as CanvasNode // older than A, but grouped
+    const sticky = { ...n(tid(-4), 900, 900), type: 'sticky' } as CanvasNode
+    const browser = { ...n(tid(-3), -500, 40), type: 'browser' } as CanvasNode
+    // A (0,0), B's slot is 140, C's is 280; B and C are a few px off.
+    const nodes = [sub, kid, frame, loop, sticky, browser, n(C, 283, 2), n(B, 141, -1), n(A, 0, 0)]
     expect(crossUnits(nodes).map((u) => u.id)).toEqual([A, B, C])
     const out = crossLayout(nodes)
-    expect(out.find((x) => x.id === sub.id)).toBe(sub)
-    expect(out.find((x) => x.id === loop.id)).toBe(loop)
-    expect(out.find((x) => x.id === kid.id)).toBe(kid)
-    expect(out.find((x) => x.id === B)).toBe(frame)
+    for (const other of [sub, loop, kid, frame, sticky, browser]) expect(out.find((x) => x.id === other.id)).toBe(other)
     expect(posOf(out, A)).toEqual({ x: 0, y: 0 })
-    expect(posOf(out, C)).toEqual({ x: 480, y: 0 })
+    expect(posOf(out, B)).toEqual({ x: 140, y: 0 })
+    expect(posOf(out, C)).toEqual({ x: 280, y: 0 })
+  })
+
+  it('non-terminal nodes do not count towards the five slots', () => {
+    const notes = [1, 2, 3, 4].map((i) => ({ ...n(`sticky-${i}`, i * 50, 500), type: 'sticky' }) as CanvasNode)
+    const nodes = [...notes, n(C, 0, 0), n(B, 0, 0), n(A, 0, 0)]
+    expect(crossUnits(nodes)).toHaveLength(3)
+    const out = crossLayout(nodes)
+    expect(posOf(out, B)).toEqual({ x: 140, y: 0 })
+    expect(posOf(out, C)).toEqual({ x: 280, y: 0 })
+    notes.forEach((note) => expect(out.find((x) => x.id === note.id)).toBe(note))
   })
 })
 
@@ -970,6 +980,14 @@ describe('tidyCanvasCross', () => {
   it('uses the cross for five units or fewer', () => {
     const nodes = [n(E, 0, 0), n(D, 0, 0), n(C, 0, 0), n(B, 0, 0), n(A, 10, 20)]
     expect(tidyCanvasCross(nodes)).toEqual(crossLayout(nodes))
+  })
+
+  it('a canvas of <=5 terminals plus other nodes still gets the cross', () => {
+    const sticky = { ...n('sticky-x', 700, 700), type: 'sticky' } as CanvasNode
+    const nodes = [sticky, n(E, 0, 0), n(D, 0, 0), n(C, 0, 0), n(B, 0, 0), n(A, 10, 20)]
+    const out = tidyCanvasCross(nodes)
+    expect(out).toEqual(crossLayout(nodes))
+    expect(out.find((x) => x.id === sticky.id)).toBe(sticky)
   })
 
   it('passes prefer through to the cross', () => {

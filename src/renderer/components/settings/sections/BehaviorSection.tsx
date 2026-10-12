@@ -232,7 +232,7 @@ export function BehaviorSection({ isActive }: { isActive: boolean }): React.JSX.
       <SearchableRow {...ROWS.tidyLayout}>
         <FieldRow
           label="Tidy layout"
-          description="Cmd+Shift+A arranges up to 5 nodes as a cross: a row of three, one above the middle, one below. Each node takes the slot nearest to where it is, so drag a node where you want it and press the shortcut. New nodes fill the free slot and the nearest node fills a closed one. More than 5 nodes use the normal grid."
+          description="Cmd+Shift+A arranges up to 5 terminals (Claude and other agent sessions included) as a cross: a row of three, one above the middle, one below. Each node takes the slot nearest to where it is, so drag a node where you want it and press the shortcut. New nodes fill the free slot and the nearest node fills a closed one. Notes, browsers, editors and group frames are left where they are. More than 5 terminals use the normal grid."
           control={
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
               <span style={{ opacity: 0.6 }}>Cross (up to 5 nodes)</span>
