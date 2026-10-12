@@ -8,7 +8,8 @@ import {
   normalizeSimUdid,
   normalizeSimViewOptions,
   parseSimFrame,
-  sanitizeSimCommand
+  sanitizeSimCommand,
+  simPlatformOf
 } from './sim'
 
 const UDID = 'AE342EEF-B624-4060-B9E6-AE6E9EAAC24A'
@@ -20,6 +21,16 @@ describe('normalizeSimUdid', () => {
   })
   it.each([undefined, null, 5, '', 'iPhone 15', `${UDID}x`, ` ${UDID}`, `${UDID}\n`, '../../etc/passwd', {}])(
     'refuses %j',
+    (v) => expect(normalizeSimUdid(v)).toBeUndefined()
+  )
+  it('accepts an Android emulator id, keeping the AVD name case-sensitive', () => {
+    expect(normalizeSimUdid('android:Nexus_7')).toBe('android:Nexus_7')
+    expect(normalizeSimUdid('android:pixel-6.api_34')).toBe('android:pixel-6.api_34')
+    expect(simPlatformOf('android:Nexus_7')).toBe('android')
+    expect(simPlatformOf(UDID)).toBe('ios')
+  })
+  it.each(['android:', 'android:../x', 'android:a b', 'android:a;rm', 'Android:Nexus_7', 'android:Nexus_7\n', `android:${'a'.repeat(101)}`, 'android:-x/y', 'android:-no-window', 'android:.hidden'])(
+    'refuses the Android id %j',
     (v) => expect(normalizeSimUdid(v)).toBeUndefined()
   )
 })
@@ -67,11 +78,11 @@ describe('sanitizeSimCommand', () => {
   it('refuses unknown phases, edges and buttons', () => {
     refused({ cmd: 'touch', phase: 'hover', x: 1, y: 1 })
     refused({ cmd: 'touch', phase: 'down', x: 1, y: 1, edge: 'middle' })
-    refused({ cmd: 'button', name: 'power' })
+    refused({ cmd: 'button', name: 'mute' })
     refused({ cmd: 'button', name: 'home; rm -rf' })
   })
   it('accepts every documented button', () => {
-    for (const name of ['home', 'lock', 'side', 'siri', 'volup', 'voldown', 'playpause']) {
+    for (const name of ['home', 'lock', 'side', 'siri', 'volup', 'voldown', 'playpause', 'back', 'recents', 'power']) {
       expect(ok({ cmd: 'button', name })).toEqual({ cmd: 'button', name })
     }
   })

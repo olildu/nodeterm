@@ -1,5 +1,6 @@
-import { spawn as nodeSpawn } from 'node:child_process'
+import { execFile, spawn as nodeSpawn } from 'node:child_process'
 import fs from 'node:fs'
+import path from 'node:path'
 import { IPC } from '../../shared/ipc'
 import {
   SIM_QUALITY,
@@ -8,7 +9,10 @@ import {
   normalizeSimUdid,
   normalizeSimViewOptions,
   sanitizeSimCommand,
+  simPlatformOf,
   type SimAvailability,
+  type SimPlatform,
+  type SimDeviceEntry,
   type SimDeviceInfo,
   type SimDevicesResult,
   type SimErrorCode,
@@ -19,8 +23,8 @@ import {
 } from '../../shared/sim'
 import { bootSimulatorHeadless, listSimulators } from '../run-service'
 import { platform } from '../platform'
-import { SimHelper, type HelperChild, type HelperEvent, type HelperExit, type SpawnHelper } from './helper-process'
-import { simHelperPath } from './helper-path'
+import { SimHelper, type HelperChild, type HelperEvent, type HelperExit, type HelperLaunch, type SpawnHelper } from './helper-process'
+import { androidHelperPath, simHelperPath } from './helper-path'
 
 /**
  * The host side of the simulator node (CLAUDE.md → Simulator node).
@@ -43,6 +47,13 @@ import { simHelperPath } from './helper-path'
 
 /** How long a device keeps its helper after its last viewer leaves. */
 export const SIM_GRACE_MS = 4_000
+/**
+ * The same for an Android emulator. Longer on purpose: the android-helper STOPS an emulator it
+ * booted when it quits, and a cold boot costs ~20 s, so a project switch, a closed card modal or an
+ * agent's pause between `sim` calls (a Maestro run in a terminal) must not cost a reboot. An emulator
+ * the user started is never stopped either way.
+ */
+export const ANDROID_GRACE_MS = 5 * 60_000
 /** Unacknowledged frames per window. */
 export const SIM_MAX_IN_FLIGHT = 2
 /** An unacknowledged frame older than this is assumed lost. */
@@ -89,6 +100,13 @@ export interface AgentDevice {
 export interface SimServiceDeps {
   isDarwin: boolean
   helperPath: () => string | null
+  /** Android emulators (android-helper). Absent = iOS only. */
+  android?: {
+    /** How to start the helper, or null when this build has none. */
+    launch: () => HelperLaunch | null
+    listDevices: () => Promise<SimDevicesResult>
+    graceMs?: number
+  }
   spawn: SpawnHelper
   listDevices: () => Promise<SimDevicesResult>
   boot: (udid: string) => Promise<{ ok: boolean; error?: string }>
@@ -160,6 +178,7 @@ export function toDeviceInfo(raw: unknown): SimDeviceInfo | undefined {
     ...(str(r.runtime) ? { runtime: str(r.runtime) } : {}),
     ...(str(r.state) ? { state: str(r.state) } : {}),
     ...(str(r.deviceType) ? { deviceType: str(r.deviceType) } : {}),
+    ...(r.platform === 'android' || udid.startsWith('android:') ? { platform: 'android' as const } : {}),
     pixelWidth: num(r.pixelWidth),
     pixelHeight: num(r.pixelHeight),
     pointWidth: num(r.pointWidth),
@@ -170,7 +189,7 @@ export function toDeviceInfo(raw: unknown): SimDeviceInfo | undefined {
   }
 }
 
-const FATAL_CODES: ReadonlySet<string> = new Set(['no-xcode', 'already-attached', 'device-not-found'])
+const FATAL_CODES: ReadonlySet<string> = new Set(['no-xcode', 'no-android-sdk', 'already-attached', 'device-not-found'])
 
 export function createSimService(deps: SimServiceDeps) {
   const devices = new Map<string, Entry>()
@@ -178,7 +197,7 @@ export function createSimService(deps: SimServiceDeps) {
   const now = deps.now ?? Date.now
   const log = deps.log ?? ((m: string) => console.warn(`[sim] ${m}`))
 
-  function availability(): SimAvailability {
+  function iosAvailability(): SimAvailability {
     if (!deps.isDarwin) {
       return { ok: false, code: 'unsupported', message: 'The iOS Simulator needs macOS with Xcode installed.' }
     }
@@ -187,6 +206,34 @@ export function createSimService(deps: SimServiceDeps) {
     }
     return { ok: true }
   }
+
+  function androidAvailability(): SimAvailability {
+    if (!deps.android?.launch()) {
+      return { ok: false, code: 'no-helper', message: 'This build does not include the Android emulator helper (android-helper).' }
+    }
+    return { ok: true }
+  }
+
+  /** Can this host show ANY device, and which platforms. Unavailable only when neither helper runs. */
+  function availability(): SimAvailability {
+    const ios = iosAvailability()
+    const android = deps.android ? androidAvailability() : null
+    if (!ios.ok && !android?.ok) return ios
+    return { ok: true, platforms: { ios: ios.ok, android: android?.ok === true } }
+  }
+
+  function availabilityFor(udid: string): SimAvailability {
+    return simPlatformOf(udid) === 'android' ? androidAvailability() : iosAvailability()
+  }
+
+  function launchFor(udid: string): HelperLaunch | null {
+    if (simPlatformOf(udid) === 'android') return deps.android?.launch() ?? null
+    const bin = deps.helperPath()
+    return bin ? { bin } : null
+  }
+
+  const graceFor = (udid: string): number =>
+    simPlatformOf(udid) === 'android' ? deps.android?.graceMs ?? deps.graceMs ?? ANDROID_GRACE_MS : graceMs
 
   // ─── delivery ───────────────────────────────────────────────────────────────────────────────
 
@@ -279,15 +326,20 @@ export function createSimService(deps: SimServiceDeps) {
         if (entry.viewers.size === 0) scheduleStop(entry)
         return
       }
-      const bin = deps.helperPath()
-      if (!bin) {
-        entry.status = errorStatus('no-helper', 'The simulator helper (sim-helper) is missing from this build.')
+      const launch = launchFor(entry.udid)
+      if (!launch) {
+        entry.status = errorStatus(
+          'no-helper',
+          simPlatformOf(entry.udid) === 'android'
+            ? 'The Android emulator helper (android-helper) is missing from this build.'
+            : 'The simulator helper (sim-helper) is missing from this build.'
+        )
         pushStatus(entry)
         return
       }
       const generation = ++entry.generation
       const live = (): boolean => entry.generation === generation
-      const helper = new SimHelper(bin, entry.udid, deps.spawn, {
+      const helper = new SimHelper(launch, entry.udid, deps.spawn, {
         onFrame: (payload) => {
           if (!live()) return
           entry.lastFrame = payload
@@ -386,7 +438,9 @@ export function createSimService(deps: SimServiceDeps) {
           : info.code === 4
             ? 'device-not-found'
             : info.code === 5
-              ? 'no-xcode'
+              ? simPlatformOf(entry.udid) === 'android'
+                ? 'no-android-sdk'
+                : 'no-xcode'
               : 'helper-exited'
       const detail = info.spawnError ?? lastLine(info.stderrTail)
       entry.status = errorStatus(
@@ -408,7 +462,7 @@ export function createSimService(deps: SimServiceDeps) {
       entry.grace = null
       if (entry.viewers.size > 0) return
       stopHelper(entry)
-    }, graceMs)
+    }, graceFor(entry.udid))
   }
 
   function stopHelper(entry: Entry): void {
@@ -459,7 +513,7 @@ export function createSimService(deps: SimServiceDeps) {
   function attach(senderId: number, rawUdid: unknown, rawViewerId: unknown, rawView: unknown): SimStatus {
     const udid = normalizeSimUdid(rawUdid)
     if (!udid) return errorStatus('device-not-found', 'That is not a simulator id.')
-    const avail = availability()
+    const avail = availabilityFor(udid)
     if (!avail.ok) return errorStatus(avail.code, avail.message)
     if (typeof rawViewerId !== 'string' || !VIEWER_ID.test(rawViewerId)) {
       return errorStatus('setup-failed', 'Bad viewer id.')
@@ -742,7 +796,7 @@ export function createSimService(deps: SimServiceDeps) {
   ): Promise<{ ok: true; value: T } | AgentFailure> {
     const udid = normalizeSimUdid(rawUdid)
     if (!udid) return Promise.resolve({ ok: false, code: 'device-not-found', error: 'That is not a simulator id.' })
-    const avail = availability()
+    const avail = availabilityFor(udid)
     if (!avail.ok) return Promise.resolve({ ok: false, code: avail.code, error: avail.message })
     const entry = ensureEntry(udid)
     const job = entry.agentTail.then(() => leased(entry, opts, fn))
@@ -753,8 +807,54 @@ export function createSimService(deps: SimServiceDeps) {
   async function bootDevice(rawUdid: unknown): Promise<{ ok: boolean; error?: string }> {
     const udid = normalizeSimUdid(rawUdid)
     if (!udid) return { ok: false, error: 'That is not a simulator id.' }
+    if (simPlatformOf(udid) === 'android') return bootAndroid(udid)
     if (!deps.isDarwin) return { ok: false, error: 'The iOS Simulator needs macOS with Xcode installed.' }
     return deps.boot(udid)
+  }
+
+  /**
+   * An Android emulator is booted BY its helper (which then owns it and stops it on quit), so this
+   * asks the device's helper — starting one under an internal lease if no node or agent has — and
+   * returns once the emulator process is launched, not booted (the `ready` event says that).
+   */
+  async function bootAndroid(udid: string): Promise<{ ok: boolean; error?: string }> {
+    const avail = androidAvailability()
+    if (!avail.ok) return { ok: false, error: avail.message }
+    const entry = ensureEntry(udid)
+    const bootKey = key(AGENT_SENDER, 'boot')
+    if (entry.grace) {
+      clearTimeout(entry.grace)
+      entry.grace = null
+    }
+    entry.viewers.set(bootKey, { senderId: AGENT_SENDER, viewerId: 'boot', view: { level: 'off' }, internal: true })
+    try {
+      if (!entry.helper && !entry.starting) startHelper(entry)
+      const end = now() + 10_000
+      while (!entry.helper?.running && entry.status.phase !== 'error' && now() < end) {
+        await new Promise<void>((resolve) => setTimeout(resolve, AGENT_IDLE_POLL_MS))
+      }
+      const helper = entry.helper
+      if (!helper?.running) {
+        return { ok: false, error: entry.status.error?.message ?? 'The Android emulator helper did not start.' }
+      }
+      const reply = await helper.request({ cmd: 'boot' })
+      return reply.ok ? { ok: true } : { ok: false, error: typeof reply.error === 'string' ? reply.error : 'The emulator did not start.' }
+    } finally {
+      entry.viewers.delete(bootKey)
+      if (entry.viewers.size === 0) scheduleStop(entry)
+    }
+  }
+
+  /** iOS simulators and Android emulators, each from its own lister; one failing does not hide the other. */
+  async function listAll(): Promise<SimDevicesResult> {
+    const ios = iosAvailability().ok ? deps.listDevices().catch((e: unknown): SimDevicesResult => ({ devices: [], error: String(e) })) : null
+    const android = deps.android && androidAvailability().ok
+      ? deps.android.listDevices().catch((e: unknown): SimDevicesResult => ({ devices: [], error: String(e) }))
+      : null
+    const parts = (await Promise.all([ios, android])).filter((r): r is SimDevicesResult => r !== null)
+    const devices = parts.flatMap((r) => r.devices)
+    const errors = parts.map((r) => r.error).filter((e): e is string => !!e)
+    return { devices, ...(errors.length && devices.length === 0 ? { error: errors.join('; ') } : {}) }
   }
 
   /** Quit every helper now (app quit). stdin EOF would end them anyway if the process died first. */
@@ -775,7 +875,7 @@ export function createSimService(deps: SimServiceDeps) {
 
   return {
     availability,
-    devices: (): Promise<SimDevicesResult> => (availability().ok ? deps.listDevices() : Promise.resolve({ devices: [] })),
+    devices: listAll,
     attach,
     detach,
     dropSender,
@@ -800,6 +900,8 @@ function asErrorCode(code: string): SimErrorCode {
     'unsupported',
     'no-helper',
     'no-xcode',
+    'no-android-sdk',
+    'boot-failed',
     'already-attached',
     'device-not-found',
     'spawn-failed',
@@ -830,13 +932,52 @@ export function disposeSim(): void {
   void registered?.dispose()
 }
 
+/** android-helper's `list` mode → device entries. Bad lines are dropped, never thrown. */
+export function parseAndroidList(stdout: string): SimDevicesResult {
+  let raw: unknown
+  try {
+    raw = JSON.parse(stdout)
+  } catch {
+    return { devices: [], error: 'The Android emulator helper returned an unreadable list.' }
+  }
+  if (!Array.isArray(raw)) return { devices: [] }
+  const devices: SimDeviceEntry[] = []
+  for (const d of raw) {
+    if (!d || typeof d !== 'object') continue
+    const r = d as Record<string, unknown>
+    const udid = normalizeSimUdid(r.udid)
+    if (!udid || simPlatformOf(udid) !== 'android' || typeof r.name !== 'string') continue
+    devices.push({
+      udid,
+      name: r.name.slice(0, 80),
+      runtime: typeof r.runtime === 'string' ? r.runtime.slice(0, 40) : 'Android',
+      booted: r.state === 'Booted',
+      platform: 'android',
+      ...(typeof r.deviceType === 'string' ? { deviceType: r.deviceType.slice(0, 80) } : {}),
+      ...(typeof r.serial === 'string' && /^emulator-\d{1,5}$/.test(r.serial) ? { serial: r.serial } : {})
+    })
+  }
+  return { devices }
+}
+
 export function registerSimIpc(): SimService {
   const p = platform()
+  // The Android helper is a script for Electron's own Node. In a packaged build it resolves `sharp`
+  // from the app (inside app.asar, unpacked); in dev, from the repo next to resources/bin.
+  const androidLaunch = (): HelperLaunch | null => {
+    const script = androidHelperPath({ resourcesPath: p.resourcesPath, repoRoot: process.cwd(), exists: (f) => fs.existsSync(f) })
+    if (!script) return null
+    const env: Record<string, string> = {}
+    for (const [k, v] of Object.entries(process.env)) if (typeof v === 'string') env[k] = v
+    env.ELECTRON_RUN_AS_NODE = '1'
+    if (p.resourcesPath) env.NODETERM_REQUIRE_FROM = path.join(p.resourcesPath, 'app.asar', 'package.json')
+    return { bin: process.execPath, args: [script], env }
+  }
   const service = createSimService({
     isDarwin: process.platform === 'darwin',
     helperPath: () =>
       simHelperPath({ resourcesPath: p.resourcesPath, repoRoot: process.cwd(), exists: (f) => fs.existsSync(f) }),
-    spawn: (bin, args) => nodeSpawn(bin, args, { stdio: ['pipe', 'pipe', 'pipe'] }) as unknown as HelperChild,
+    spawn: (bin, args, env) => nodeSpawn(bin, args, { stdio: ['pipe', 'pipe', 'pipe'], ...(env ? { env } : {}) }) as unknown as HelperChild,
     listDevices: async () => {
       const list = await listSimulators()
       return {
@@ -844,11 +985,23 @@ export function registerSimIpc(): SimService {
           udid: d.id,
           name: d.name,
           runtime: d.platform ?? 'iOS',
-          booted: d.state === 'booted'
+          booted: d.state === 'booted',
+          platform: 'ios' as const
         }))
       }
     },
     boot: bootSimulatorHeadless,
+    android: {
+      launch: androidLaunch,
+      listDevices: () =>
+        new Promise<SimDevicesResult>((resolve) => {
+          const l = androidLaunch()
+          if (!l) return resolve({ devices: [] })
+          execFile(l.bin, [...(l.args ?? []), 'list'], { env: l.env, timeout: 20_000, encoding: 'utf8' }, (err, stdout) => {
+            resolve(err ? { devices: [], error: `Could not list Android emulators: ${err.message}` } : parseAndroidList(stdout))
+          })
+        })
+    },
     send: (id, channel, ...args) => p.sendTo(id, channel, ...args),
     clientIds: () => p.clientIds()
   })

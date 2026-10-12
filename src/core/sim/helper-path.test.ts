@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { simHelperPath } from './helper-path'
+import { androidHelperPath, simHelperPath } from './helper-path'
 
 describe('simHelperPath', () => {
   const has = (...files: string[]) => (p: string) => files.includes(p)
@@ -16,5 +16,15 @@ describe('simHelperPath', () => {
     expect(
       simHelperPath({ resourcesPath: '/App/Resources', repoRoot: '/repo', exists: (p) => { if (p.startsWith('/App')) throw new Error('EACCES'); return true } })
     ).toBe('/repo/resources/bin/sim-helper')
+  })
+})
+
+describe('androidHelperPath', () => {
+  it('prefers the packaged script, then the dev build, never PATH', () => {
+    const have = new Set(['/repo/resources/bin/android-helper.cjs'])
+    expect(androidHelperPath({ resourcesPath: '/R', repoRoot: '/repo', exists: (p) => have.has(p) })).toBe('/repo/resources/bin/android-helper.cjs')
+    have.add('/R/bin/android-helper.cjs')
+    expect(androidHelperPath({ resourcesPath: '/R', repoRoot: '/repo', exists: (p) => have.has(p) })).toBe('/R/bin/android-helper.cjs')
+    expect(androidHelperPath({ resourcesPath: null, repoRoot: null, exists: () => true })).toBeNull()
   })
 })

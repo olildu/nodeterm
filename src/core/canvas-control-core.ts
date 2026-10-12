@@ -511,14 +511,17 @@ function simLinkDocLines(): string[] {
 function simVerbDocLines(): string[] {
   const secs = (ms: number): string => `${Math.round(ms / 1000)}s`
   return [
-    '- `sim <one action> [--node <Simulator node id> | --udid <device id>]` — look at and drive the iOS',
+    '- `sim <one action> [--node <Simulator node id> | --udid <device id>]` — look at and drive an iOS',
     '  (with a Simulator node linked to you, the target flags are optional — see LINKING below)',
-    '  Simulator (macOS desktop only). You act through the SAME helper the Simulator node uses, so the',
-    '  user watches every tap live in their node; Simulator.app is never opened. Verified-only. The',
-    '  Server Edition refuses it by name (permanent — do not retry). Pass exactly ONE action:',
-    '  - `--list` — the iOS simulators on this Mac (udid, name, runtime, Booted/Shutdown) and which',
-    '    Simulator nodes IN YOUR PROJECT show each. It takes no target.',
+    '  Simulator or an Android emulator (macOS desktop only). You act through the SAME helper the Simulator',
+    '  node uses, so the user watches every tap live in their node; no Simulator.app or emulator window is',
+    '  opened. Verified-only. The Server Edition refuses it by name (permanent — do not retry). Pass exactly ONE action:',
+    '  - `--list` — the iOS simulators (id = a UUID) and Android emulators (id = `android:<avd>`, plus the',
+    '    `adb emulator-NNNN` serial while it runs) on this machine, Booted/Shutdown, and which Simulator',
+    '    nodes IN YOUR PROJECT show each. It takes no target.',
     `  - \`--boot\` — boot a shut-down device headless; waits up to ${secs(SIM_BOOT_TIMEOUT_MS)} (\`--timeout\` to change).`,
+    '    An Android emulator nodeterm booted is stopped a few minutes after nothing shows or drives it; one the',
+    '    user started (Android Studio, a terminal) is never stopped.',
     '  - `--describe` — the screen as text, one NAMED element per line: `Button "General" (196,430)` =',
     '    role, label, `value=…`, `id=…`, then the element\'s CENTRE in device POINTS (not pixels), plus',
     '    `disabled` / `offscreen` / `clipped`. A `PARTIAL` header means the accessibility tree was',
@@ -534,9 +537,10 @@ function simVerbDocLines(): string[] {
     `  - \`--swipe x1,y1,x2,y2 [--ms ${SIM_SWIPE_MS_MIN}-${SIM_SWIPE_MS_MAX}]\` — a drag (scroll = swipe up; ${SIM_SWIPE_MS_DEFAULT} ms default).`,
     `  - \`--type <text>\` — type into the focused field (at most ${SIM_TEXT_MAX} characters). Plain ASCII is typed key`,
     '    by key; any character a keyboard cannot type makes the helper PASTE the whole string, which',
-    '    OVERWRITES the device pasteboard (the reply says so).',
+    '    OVERWRITES the device pasteboard (the reply says so). Android: the same, through its clipboard.',
     `  - \`--key ${SIM_KEY_DOC_NAMES.join('|')}|<letter or digit>|<HID usage> [--mods cmd,shift,ctrl,alt]\` — one key press.`,
-    `  - \`--press ${SIM_PRESS_BUTTONS.join('|')}\` — a hardware button.`,
+    `  - \`--press ${SIM_PRESS_BUTTONS.join('|')}\` — a hardware button (\`back\`/\`recents\`/\`power\`: Android only;`,
+    '    `siri`: iOS only). On Android `--mods` ctrl/alt/cmd are not applied (shift is).',
     `  - \`--wait-idle [--quiet ${SIM_IDLE_QUIET_MIN_MS}-${SIM_IDLE_QUIET_MAX_MS}]\` — return once the screen has not changed for ${SIM_IDLE_QUIET_MS} ms`,
     '    (frame-diff on the live stream); the reply says "still changing" if it never settled in time.',
     `  Every INPUT action (tap, swipe, type, key, press) waits for the screen to settle before it answers,`,
@@ -563,7 +567,7 @@ function simVerbDocLines(): string[] {
  */
 function simTestingDocLines(): string[] {
   return [
-    'Testing an iOS app (the `sim` verb + Maestro):',
+    'Testing an iOS or Android app (the `sim` verb + Maestro):',
     '1. `sim --list` → pick a device (rules below). Prefer the Simulator node the user already has open',
     '   (`--node`) so they can watch; no Simulator node? run `open-simulator --udid <id>` — never ask the user to add one.',
     ...simPickDeviceDocLines('   '),
@@ -581,13 +585,15 @@ function simTestingDocLines(): string[] {
     '   ```',
     '   Labels in `tapOn` / `assertVisible` are the same strings `--describe` printed.',
     '4. Run it in a TERMINAL node (not through `sim`): `maestro --device <udid> test .maestro/<name>.yaml`',
+    '   (Android: `--device` takes the `emulator-NNNN` serial `sim --list` prints, not `android:<avd>`)',
     '   (`~/.maestro/bin/maestro` when `maestro` is not on PATH). Fix the YAML until it is green. Maestro takes',
     '   10-45 s per run (it reinstalls its XCUITest driver each time): use it for REGRESSION runs, not for',
     '   looking at the screen — `sim` is the fast loop.',
     '5. ONE driver per device: do not call `sim` (input or looking) while Maestro runs on the same device —',
     '   two drivers share one touch queue. The Simulator node may stay open beside a run (it only watches).',
     '   Wait for Maestro to finish, then look again.',
-    '6. `--describe` sees what the app exposes to accessibility. A Flutter widget with no `Semantics` / label',
+    '6. `--describe` sees what the app exposes to accessibility (Android: the uiautomator tree, ~1.5 s per read).',
+    '   A Flutter widget with no `Semantics` / label',
     '   (a bare `GestureDetector`, a custom-painted control) is invisible to it AND to Maestro\'s text',
     '   selectors — add `Semantics(label: …)` / `tooltip:` / `semanticLabel:` to the widget, or fall back to',
     '   `--tap x,y` from a `--screenshot`.'
@@ -698,7 +704,7 @@ const VERBS: ControlVerb[] = [
   // GitHub request, no canvas. Verified-only; `--project` own-or-granted.
   'issues',
   'prs',
-  // Look at and drive an iOS Simulator through the one helper process the Simulator node watches
+  // Look at and drive an iOS Simulator or Android emulator through the one helper process the Simulator node watches
   // (core/sim/control.ts). Answered by the shell's control handler, never forwarded to a canvas.
   // Verified-only; refused by name on the Server Edition (a device is the Mac desktop's).
   'sim',

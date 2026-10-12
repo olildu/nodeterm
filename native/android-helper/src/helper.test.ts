@@ -30,6 +30,7 @@ describe('sdk', () => {
     expect(avdOf('android:Nexus_7')).toBe('Nexus_7')
     expect(avdOf('android:../x')).toBeNull()
     expect(avdOf('android:a b')).toBeNull()
+    expect(avdOf('android:-wipe-data')).toBeNull()
     expect(avdOf('Nexus_7')).toBeNull()
   })
   it('orders SDK candidates: our env, the standard env vars, then the OS default', () => {

@@ -6,10 +6,29 @@
 // Everything here is pure and runs in the renderer, the main process and tests alike.
 import { SIMULATOR_UDID } from './run-config'
 
-/** A UUID the way CoreSimulator spells a device id; anything else is "no device". */
+/**
+ * An Android emulator, by AVD name: `android:<avd>`. AVD names are `[A-Za-z0-9._-]` (avdmanager's
+ * rule); the id is stable across boots and is what the android-helper is attached with.
+ */
+export const ANDROID_SIM_ID = /^android:[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/
+
+export type SimPlatform = 'ios' | 'android'
+
+/**
+ * A device id: a UUID the way CoreSimulator spells an iOS device, or `android:<avd>`. Anything
+ * else is "no device". This is the gate at BOTH serializer seams and in front of every helper
+ * process argument, so nothing else may reach `sim-helper attach` / `android-helper attach`.
+ */
 export function normalizeSimUdid(value: unknown): string | undefined {
-  if (typeof value !== 'string' || !SIMULATOR_UDID.test(value)) return undefined
-  return value.toUpperCase()
+  if (typeof value !== 'string') return undefined
+  if (SIMULATOR_UDID.test(value)) return value.toUpperCase()
+  if (ANDROID_SIM_ID.test(value)) return value // AVD names are case-sensitive
+  return undefined
+}
+
+/** Which helper drives a (normalized) device id. */
+export function simPlatformOf(udid: string): SimPlatform {
+  return udid.startsWith('android:') ? 'android' : 'ios'
 }
 
 /** A device name is display text read from `simctl` output or a hand-editable project file. */
@@ -22,7 +41,8 @@ export function normalizeSimName(value: unknown): string | undefined {
 
 // ─── Closed vocabularies ─────────────────────────────────────────────────────────────────────
 
-export const SIM_BUTTONS = ['home', 'lock', 'side', 'siri', 'volup', 'voldown', 'playpause'] as const
+/** Hardware buttons. `back`, `recents` and `power` are Android's; each helper refuses the ones it has no meaning for. */
+export const SIM_BUTTONS = ['home', 'lock', 'side', 'siri', 'volup', 'voldown', 'playpause', 'back', 'recents', 'power'] as const
 export type SimButton = (typeof SIM_BUTTONS)[number]
 export const SIM_MODIFIERS = ['shift', 'ctrl', 'alt', 'cmd'] as const
 export type SimModifier = (typeof SIM_MODIFIERS)[number]
@@ -45,6 +65,8 @@ export const SIM_HID_USAGE_MAX = 0xe7
 export interface SimDeviceInfo {
   udid: string
   name: string
+  /** Absent = iOS (the iOS helper predates the field). */
+  platform?: SimPlatform
   runtime?: string
   state?: string
   deviceType?: string
@@ -62,6 +84,8 @@ export type SimErrorCode =
   | 'unsupported' //       not macOS
   | 'no-helper' //         resources/bin/sim-helper is missing
   | 'no-xcode' //          the helper could not load the Simulator frameworks
+  | 'no-android-sdk' //    android-helper found no Android SDK
+  | 'boot-failed' //       android-helper could not start the emulator (non-fatal: Boot again)
   | 'already-attached' //  another controller (a second nodeterm, a spike viewer) holds the device
   | 'device-not-found'
   | 'spawn-failed'
@@ -84,15 +108,22 @@ export interface SimStatus {
 }
 
 export type SimAvailability =
-  | { ok: true }
+  /** `platforms` says which helpers this host can run; absent (an older core) = iOS only. */
+  | { ok: true; platforms?: Record<SimPlatform, boolean> }
   | { ok: false; code: 'unsupported' | 'no-helper'; message: string }
 
 export interface SimDeviceEntry {
   udid: string
   name: string
-  /** "iOS 26.5" */
+  /** "iOS 26.5", "Android 11" */
   runtime: string
   booted: boolean
+  /** Absent = iOS. */
+  platform?: SimPlatform
+  /** "iPhone 15", "pixel" — the hardware profile, when known. */
+  deviceType?: string
+  /** A running Android emulator's adb serial (`emulator-5554`): Maestro's and adb's name for it. */
+  serial?: string
 }
 
 export interface SimDevicesResult {

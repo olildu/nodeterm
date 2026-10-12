@@ -47,6 +47,12 @@ const ERROR_COPY: Record<SimErrorCode, { title: string; detail: string }> = {
     title: 'Device not found',
     detail: 'This simulator is not available on this computer any more. Pick another device.'
   },
+  'no-android-sdk': {
+    title: 'Android SDK not found',
+    detail:
+      'Install Android Studio (or the SDK command-line tools) and create an emulator. nodeterm looks at ANDROID_SDK_ROOT, ANDROID_HOME and the default SDK location.'
+  },
+  'boot-failed': { title: 'The emulator did not start', detail: 'Boot it again, or start it from Android Studio.' },
   'spawn-failed': { title: 'Could not start the helper', detail: 'The simulator helper would not start.' },
   'helper-exited': { title: 'The simulator helper stopped', detail: 'It ended unexpectedly.' },
   'setup-failed': { title: 'Setting up the simulator', detail: 'The device is not ready yet.' },
@@ -54,7 +60,7 @@ const ERROR_COPY: Record<SimErrorCode, { title: string; detail: string }> = {
 }
 
 /** Errors where Reconnect cannot help until something outside the app changes. */
-const NO_RECONNECT: ReadonlySet<SimErrorCode> = new Set(['unsupported', 'no-helper', 'no-xcode'])
+const NO_RECONNECT: ReadonlySet<SimErrorCode> = new Set(['unsupported', 'no-helper', 'no-xcode', 'no-android-sdk'])
 
 export function simView(input: {
   availability: SimAvailability | null
@@ -67,7 +73,17 @@ export function simView(input: {
     return { kind: 'unavailable', title: copy.title, detail: availability.message || copy.detail, action: null }
   }
   if (!udid) {
-    return { kind: 'pick', title: 'Choose a device', detail: 'Pick an iOS simulator to show in this node.', action: 'pick' }
+    return {
+      kind: 'pick',
+      title: 'Choose a device',
+      detail:
+        availability?.ok && availability.platforms?.android
+          ? availability.platforms.ios
+            ? 'Pick an iOS simulator or an Android emulator to show in this node.'
+            : 'Pick an Android emulator to show in this node.'
+          : 'Pick an iOS simulator to show in this node.',
+      action: 'pick'
+    }
   }
   if (!status) return { kind: 'connecting', title: 'Connecting…', action: null }
   switch (status.phase) {
@@ -82,7 +98,8 @@ export function simView(input: {
       return {
         kind: 'shutdown',
         title: 'Device shut down',
-        detail: `${status.device?.name ?? 'This simulator'} is not running.`,
+        // A failed boot (android-helper's boot-failed) says why; Boot is still the way forward.
+        detail: status.error?.message ?? `${status.device?.name ?? 'This simulator'} is not running.`,
         action: 'boot'
       }
     case 'connecting':

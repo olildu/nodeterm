@@ -16,7 +16,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 /** `android:<avd>` — the device id nodeterm stores. AVD names are `[A-Za-z0-9._-]` (avdmanager's rule). */
-export const ANDROID_ID = /^android:([A-Za-z0-9._-]{1,100})$/
+export const ANDROID_ID = /^android:([A-Za-z0-9][A-Za-z0-9._-]{0,99})$/
 
 export function avdOf(id: string): string | null {
   const m = ANDROID_ID.exec(id)

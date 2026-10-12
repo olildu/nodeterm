@@ -101,8 +101,8 @@ describe('parseSimArgs — exactly one action, a target, nothing unknown', () =>
 
   it('--press is a closed set', () => {
     expect(ok({ udid: UDID, press: 'Home' }).action).toEqual({ kind: 'press', button: 'home' })
-    for (const b of ['lock', 'volup', 'voldown', 'siri']) expect(ok({ udid: UDID, press: b }).action).toMatchObject({ button: b })
-    expect(err({ udid: UDID, press: 'power' })).toMatch(/home\|lock\|volup\|voldown\|siri/)
+    for (const b of ['lock', 'volup', 'voldown', 'siri', 'back', 'recents', 'power']) expect(ok({ udid: UDID, press: b }).action).toMatchObject({ button: b })
+    expect(err({ udid: UDID, press: 'mute' })).toMatch(/home\|back\|recents\|lock\|power\|volup\|voldown\|siri/)
     expect(err({ udid: UDID, press: 'side' })).toMatch(/--press takes/)
   })
 

@@ -570,3 +570,106 @@ describe('toDeviceInfo', () => {
     expect(toDeviceInfo(null)).toBeUndefined()
   })
 })
+
+describe('Android emulators (android-helper)', () => {
+  const AVD = 'android:Pixel_6'
+  const launch = { bin: '/electron', args: ['/res/android-helper.cjs'], env: { ELECTRON_RUN_AS_NODE: '1' } }
+  const androidRig = (over: Partial<SimServiceDeps> = {}) => {
+    const spawned: Array<{ bin: string; args: string[]; env?: Record<string, string> }> = []
+    const r = rig({
+      android: { launch: () => launch, listDevices: async () => ({ devices: [{ udid: AVD, name: 'Pixel 6', runtime: 'Android 11', booted: false, platform: 'android' }] }) },
+      ...over
+    })
+    const base = r.deps.spawn
+    r.deps.spawn = (bin, args, env) => {
+      spawned.push({ bin, args, ...(env ? { env } : {}) })
+      return base(bin, args, env)
+    }
+    return { ...r, svc: createSimService(r.deps), spawned }
+  }
+
+  it('is available off macOS when the Android helper is present, and says which platforms', () => {
+    const r = androidRig({ isDarwin: false })
+    expect(r.svc.availability()).toEqual({ ok: true, platforms: { ios: false, android: true } })
+    expect(r.svc.attach(1, UDID, 'v1', ACTIVE)).toMatchObject({ phase: 'error', error: { code: 'unsupported' } })
+  })
+
+  it('launches the Android helper by its launch (Electron as Node), never the iOS binary', async () => {
+    const r = androidRig()
+    expect(r.svc.attach(1, AVD, 'v1', ACTIVE).phase).toBe('connecting')
+    await settle()
+    expect(r.spawned).toEqual([{ bin: '/electron', args: ['/res/android-helper.cjs', 'attach', AVD], env: { ELECTRON_RUN_AS_NODE: '1' } }])
+  })
+
+  it('refuses an Android id when this build has no Android helper', () => {
+    const r = rig({ android: { launch: () => null, listDevices: async () => ({ devices: [] }) } })
+    expect(r.svc.attach(1, AVD, 'v1', ACTIVE)).toMatchObject({ phase: 'error', error: { code: 'no-helper' } })
+  })
+
+  it('boots through the device\'s helper and keeps it for the longer Android grace', async () => {
+    const r = androidRig()
+    const booting = r.svc.boot(AVD)
+    await settle()
+    const child = r.children[0]
+    const bootCmd = child.last('boot') as { id: number }
+    expect(bootCmd).toBeDefined()
+    child.json({ id: bootCmd.id, ok: true, booting: true })
+    expect(await booting).toEqual({ ok: true })
+    // The internal boot lease is gone; the helper (and so the emulator it owns) stays for minutes, not seconds.
+    await vi.advanceTimersByTimeAsync(SIM_GRACE_MS * 3)
+    expect(child.last('quit')).toBeUndefined()
+    await vi.advanceTimersByTimeAsync(5 * 60_000)
+    expect(child.last('quit')).toBeDefined()
+  })
+
+  it('reports a boot the helper refused', async () => {
+    const r = androidRig()
+    const booting = r.svc.boot(AVD)
+    await settle()
+    const child = r.children[0]
+    const bootCmd = child.last('boot') as { id: number }
+    child.json({ id: bootCmd.id, ok: false, code: 'boot-failed', error: 'No free emulator console port' })
+    expect(await booting).toEqual({ ok: false, error: 'No free emulator console port' })
+  })
+
+  it('lists iOS and Android devices together, and one lister failing does not hide the other', async () => {
+    const r = androidRig({ listDevices: async () => { throw new Error('simctl broke') } })
+    const out = await r.svc.devices()
+    expect(out.devices.map((d) => d.udid)).toEqual([AVD])
+    expect(out.error).toBeUndefined()
+  })
+
+  it('maps the helper\'s exit 5 to no-android-sdk for an Android device', async () => {
+    const r = androidRig()
+    r.svc.attach(1, AVD, 'v1', ACTIVE)
+    await settle()
+    r.children[0].exit(5)
+    const st = r.sent.filter((s) => s.channel === IPC.simStatus(AVD)).map((s) => s.args[0] as SimStatus).pop()
+    expect(st).toMatchObject({ phase: 'error', error: { code: 'no-android-sdk' } })
+  })
+
+  it('carries the platform on device info', () => {
+    expect(toDeviceInfo({ ...DEVICE, udid: AVD, platform: 'android' })).toMatchObject({ udid: AVD, platform: 'android' })
+    expect(toDeviceInfo(DEVICE)?.platform).toBeUndefined()
+  })
+})
+
+describe('parseAndroidList', () => {
+  it('keeps only valid android entries and a well-formed adb serial', async () => {
+    const { parseAndroidList } = await import('./service')
+    const out = parseAndroidList(
+      JSON.stringify([
+        { udid: 'android:Pixel_6', name: 'Pixel 6', runtime: 'Android 14', state: 'Booted', serial: 'emulator-5556', deviceType: 'pixel_6' },
+        { udid: 'android:Old', name: 'Old', state: 'Shutdown', serial: 'emulator-5554; rm -rf /' },
+        { udid: UDID, name: 'not android' },
+        { udid: 'android:../x', name: 'bad' },
+        'junk'
+      ])
+    )
+    expect(out.devices).toEqual([
+      { udid: 'android:Pixel_6', name: 'Pixel 6', runtime: 'Android 14', booted: true, platform: 'android', deviceType: 'pixel_6', serial: 'emulator-5556' },
+      { udid: 'android:Old', name: 'Old', runtime: 'Android', booted: false, platform: 'android' }
+    ])
+    expect(parseAndroidList('nope').error).toMatch(/unreadable/)
+  })
+})

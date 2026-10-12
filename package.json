@@ -103,6 +103,10 @@
           "to": "bin/sim-helper"
         },
         {
+          "from": "resources/bin/android-helper.cjs",
+          "to": "bin/android-helper.cjs"
+        },
+        {
           "from": "resources/licenses",
           "to": "licenses"
         }

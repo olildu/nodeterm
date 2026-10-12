@@ -70,7 +70,9 @@ describe('both agent-facing bodies document the sim verb, rendered from the code
         expect(body, `${name} ${flag}`).toContain(flag)
       }
       expect(body, name).toMatch(/Pass exactly ONE action/)
-      expect(body, name).toMatch(/Simulator\.app is never opened/)
+      expect(body, name).toMatch(/no Simulator\.app or emulator window is\s+opened/)
+      expect(body, name).toMatch(/Android emulators \(id = `android:<avd>`/)
+      expect(body, name).toMatch(/one the\s+user started \(Android Studio, a terminal\) is never stopped/)
       expect(body, name).toMatch(/Server\s+Edition refuses it by name/)
     }
   })
@@ -130,7 +132,8 @@ describe('both agent-facing bodies document the sim verb, rendered from the code
 describe('the iOS testing guidance both bodies carry (step 4)', () => {
   it('spells the loop: list, describe, act, re-describe, then a Maestro flow in a terminal node', () => {
     for (const [name, body] of bodies()) {
-      expect(body, name).toContain('Testing an iOS app (the `sim` verb + Maestro):')
+      expect(body, name).toContain('Testing an iOS or Android app (the `sim` verb + Maestro):')
+      expect(body, name).toContain('`--device` takes the `emulator-NNNN` serial')
       expect(body, name).toContain('`sim --list`')
       expect(body, name).toContain('re-`--describe` to')
       expect(body, name).toContain('.maestro/<name>.yaml')

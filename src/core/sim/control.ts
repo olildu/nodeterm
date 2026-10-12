@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
-import type { SimAgentEvent, SimDeviceEntry, SimStatus } from '../../shared/sim'
+import { simPlatformOf, type SimAgentEvent, type SimDeviceEntry, type SimStatus } from '../../shared/sim'
 import type { AgentDevice, AgentFailure, AgentRunOptions, SimService } from './service'
 import {
   createSimLinkLedger,
@@ -39,7 +39,8 @@ interface DriveProgress {
 }
 
 /**
- * The `sim` canvas-control verb, run: an agent looks at and drives an iOS Simulator through the SAME
+ * The `sim` canvas-control verb, run: an agent looks at and drives an iOS Simulator (or an Android
+ * emulator, through android-helper — same protocol) through the SAME
  * helper process the Simulator node watches (CLAUDE.md → Simulator node, "Agents drive it too").
  *
  * Answered entirely in the shell's control handler and never forwarded to a canvas — a device is a
@@ -95,7 +96,7 @@ function plural(n: number, word: string): string {
   return `${n} ${word}${n === 1 ? '' : 's'}`
 }
 
-/** "iPhone 15 (AE34…) iOS 26.5 Booted" — one device, one line. */
+/** "<udid>  "iPhone 15"  iOS 26.5  Booted" — one device, one line; a running emulator adds its adb serial. */
 export function renderDeviceLine(
   d: SimDeviceEntry,
   nodes: Array<{ id: string; title: string; linked?: boolean }>
@@ -105,7 +106,8 @@ export function renderDeviceLine(
         .map((n) => `${n.id}${n.title ? ` ${JSON.stringify(n.title)}` : ''}${n.linked ? ' (linked to you)' : ''}`)
         .join(', ')}`
     : ''
-  return `${d.udid}  ${JSON.stringify(d.name)}  ${d.runtime}  ${d.booted ? 'Booted' : 'Shutdown'}${shown}`
+  const serial = d.serial ? `  adb ${d.serial}` : ''
+  return `${d.udid}  ${JSON.stringify(d.name)}  ${d.runtime}  ${d.booted ? 'Booted' : 'Shutdown'}${serial}${shown}`
 }
 
 const DEVICE_LIST_MAX = 40
@@ -121,10 +123,11 @@ export function failureReply(f: AgentFailure, udid: string): SimControlReply {
           'Close it and retry.'
       )
     case 'device-not-found':
-      return fail(`sim-device-not-found: no simulator ${udid} on this Mac. \`sim --list\` shows the ones that exist.`)
+      return fail(`sim-device-not-found: no simulator or emulator ${udid} on this machine. \`sim --list\` shows the ones that exist.`)
     case 'unsupported':
     case 'no-helper':
     case 'no-xcode':
+    case 'no-android-sdk':
       return fail(`sim-unavailable: ${f.error}`)
     case 'timeout':
       return fail(`sim-timeout: ${f.error} Retry in a few seconds.`)
@@ -175,7 +178,7 @@ export function createSimControl(deps: SimControlDeps): (req: {
     }
     const booted = found.devices.filter((d) => d.booted)
     const lines: string[] = [
-      `iOS simulators on this Mac: ${plural(found.devices.length, 'device')}, ${booted.length} booted. ` +
+      `iOS simulators and Android emulators on this machine: ${plural(found.devices.length, 'device')}, ${booted.length} booted. ` +
         'Act with --udid <id> or --node <Simulator node id>.'
     ]
     for (const d of found.devices.slice(0, DEVICE_LIST_MAX)) lines.push(renderDeviceLine(d, byUdid.get(d.udid) ?? []))
@@ -430,7 +433,7 @@ export function createSimControl(deps: SimControlDeps): (req: {
 
   async function boot(udid: string, call: SimCall): Promise<SimControlReply> {
     const booted = await deps.service.boot(udid)
-    if (!booted.ok) return fail(`sim-boot-failed: ${booted.error ?? 'simctl could not boot the device'}`)
+    if (!booted.ok) return fail(`sim-boot-failed: ${booted.error ?? 'the device could not be booted'}`)
     const opts: AgentRunOptions = { connectTimeoutMs: call.timeoutMs, tolerateShutdown: true }
     const run = await deps.service.agentRun(udid, opts, async (d) => d.status())
     if (!run.ok) {
@@ -444,7 +447,14 @@ export function createSimControl(deps: SimControlDeps): (req: {
     }
     const dev = (run.value as SimStatus).device
     const size = dev && dev.pointWidth > 0 ? `, screen ${Math.round(dev.pointWidth)}×${Math.round(dev.pointHeight)} pt` : ''
-    return { ok: true, message: `booted ${dev?.name ?? udid}${size}. No Simulator window was opened.` }
+    return {
+      ok: true,
+      message:
+        `booted ${dev?.name ?? udid}${size}. ` +
+        (simPlatformOf(udid) === 'android'
+          ? 'No emulator window was opened. nodeterm stops this emulator a few minutes after nothing shows or drives it.'
+          : 'No Simulator window was opened.')
+    }
   }
 
   /** Create the link a manual drag would have made, once, and tell the agent. '' = nothing to say. */

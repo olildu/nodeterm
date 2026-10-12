@@ -25,7 +25,18 @@ export interface HelperChild {
   pid?: number
 }
 
-export type SpawnHelper = (bin: string, args: string[]) => HelperChild
+export type SpawnHelper = (bin: string, args: string[], env?: Record<string, string>) => HelperChild
+
+/**
+ * How to start a helper: the executable, the arguments BEFORE `attach <udid>`, and extra env. The iOS
+ * helper is a native binary (`{bin}`); the Android one is a script run by Electron's own Node
+ * (`{bin: execPath, args: [script], env: {ELECTRON_RUN_AS_NODE: '1'}}`).
+ */
+export interface HelperLaunch {
+  bin: string
+  args?: string[]
+  env?: Record<string, string>
+}
 
 export type HelperEvent = { event: string } & Record<string, unknown>
 export type HelperReply = { ok: boolean } & Record<string, unknown>
@@ -82,7 +93,7 @@ export class SimHelper {
   private exitWaiters: Array<() => void> = []
 
   constructor(
-    private readonly bin: string,
+    private readonly launch: HelperLaunch,
     private readonly udid: string,
     private readonly spawn: SpawnHelper,
     private readonly handlers: HelperHandlers
@@ -99,7 +110,8 @@ export class SimHelper {
   start(): void {
     let child: HelperChild
     try {
-      child = this.spawn(this.bin, ['attach', this.udid])
+      const { bin, args = [], env } = this.launch
+      child = env ? this.spawn(bin, [...args, 'attach', this.udid], env) : this.spawn(bin, [...args, 'attach', this.udid])
     } catch (e) {
       this.finish(null, null, e instanceof Error ? e.message : String(e))
       return

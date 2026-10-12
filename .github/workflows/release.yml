@@ -69,6 +69,11 @@ jobs:
       - name: Build simulator helper (universal)
         run: node scripts/build-sim-helper.mjs
 
+      # The Android emulator helper (native/android-helper): one esbuild-bundled CommonJS file run by
+      # Electron's own Node. No native code; sharp stays external (the app ships it).
+      - name: Build the Android emulator helper
+        run: node scripts/build-android-helper.mjs
+
       # ELECTRON-BUILDER FLOOR — 26.16.1, and the `^26.16.1` range in package.json is what keeps
       # it. Up to and including 26.16.0, createKeychain generated a random keychain password but
       # then handed `security set-key-partition-list` the P12 password instead

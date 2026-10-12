@@ -87,7 +87,8 @@ export const SIM_INPUT_ACTIONS: ReadonlySet<SimActionKey> = new Set([
 const BARE_ACTIONS: ReadonlySet<string> = new Set(['list', 'describe', 'boot', 'wait-idle'])
 
 /** The buttons an agent may press. `side` and `playpause` exist in the helper but have no use here. */
-export const SIM_PRESS_BUTTONS = ['home', 'lock', 'volup', 'voldown', 'siri'] as const satisfies readonly SimButton[]
+/** `back`, `recents`, `power`: Android only; `siri`: iOS only (each helper refuses what it lacks). */
+export const SIM_PRESS_BUTTONS = ['home', 'back', 'recents', 'lock', 'power', 'volup', 'voldown', 'siri'] as const satisfies readonly SimButton[]
 
 const KNOWN_FLAGS: ReadonlySet<string> = new Set([
   ...SIM_ACTION_KEYS,
@@ -717,7 +718,7 @@ export function parseOpenSimulatorArgs(args: Record<string, string>): OpenSimula
   if (args.udid !== undefined) {
     const udid = normalizeSimUdid(args.udid)
     if (!udid) {
-      return { error: 'open-simulator: --udid must be a simulator device UUID (`sim --list` prints them)' }
+      return { error: 'open-simulator: --udid must be an iOS simulator UUID or android:<avd> (`sim --list` prints them)' }
     }
     call.udid = udid
   }
@@ -740,8 +741,9 @@ export const SIM_PICK_DEVICE_RULES: readonly string[] = [
   'Run `sim --list` first.',
   'If you already have a linked Simulator node, use it (pass no flags) and do NOT open another.',
   'Otherwise pick a Booted device and pass `--udid <id>`.',
-  'With several Booted: prefer the one the project\'s app is installed on, else the newest iPhone — and say which one you picked.',
-  'With none Booted: choose the newest iPhone runtime, run `open-simulator --udid <it>`, then `sim --boot`.',
+  'Match the platform the user asked for: an iOS UUID is an iPhone/iPad simulator, `android:<avd>` an Android emulator.',
+  'With several Booted: prefer the one the project\'s app is installed on, else the newest iPhone (iOS) or newest API level (Android) — and say which one you picked.',
+  'With none Booted: choose the newest runtime of that platform, run `open-simulator --udid <it>`, then `sim --boot`.',
   'Never open a second Simulator node for a device that already has one (`sim --list` shows which nodes show each device).'
 ]
 
@@ -754,7 +756,7 @@ export function simPickDeviceDocLines(indent = ''): string[] {
 
 export function openSimulatorDocLines(): string[] {
   return [
-    `- \`${OPEN_SIMULATOR_SYNTAX}\` — add a Simulator node to the canvas (macOS desktop only; verified-only;`,
+    `- \`${OPEN_SIMULATOR_SYNTAX}\` — add a Simulator node (iOS simulator or Android emulator) to the canvas (macOS desktop only; verified-only;`,
     '  the Server Edition refuses it by name). It is linked to you, so it becomes your default `sim` target and',
     '  the user can watch it. It never switches the user\'s project tab. ' + OPEN_SIMULATOR_DEVICE_NOTE,
     '  `--group` places it in a group frame of the project on screen. A malformed `--udid` is refused.',

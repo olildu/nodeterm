@@ -136,13 +136,16 @@ async function listMode(): Promise<number> {
   const running = runningEmulators()
   const out = names.map((avd) => {
     const info = readAvd(avd)
-    const booted = running.some((r) => r.avd === avd)
+    const live = running.find((r) => r.avd === avd)
+    const booted = !!live
     return {
       udid: `android:${avd}`,
       name: info.name,
       runtime: info.runtime,
       state: booted ? 'Booted' : 'Shutdown',
-      ...(info.deviceType ? { deviceType: info.deviceType } : {})
+      ...(info.deviceType ? { deviceType: info.deviceType } : {}),
+      // The adb serial: what Maestro (`--device`) and adb (`-s`) call this emulator.
+      ...(live ? { serial: `emulator-${live.consolePort}` } : {})
     }
   })
   process.stdout.write(JSON.stringify(out) + '\n')
