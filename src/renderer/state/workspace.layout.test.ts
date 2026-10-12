@@ -673,6 +673,20 @@ const expectNoOverlap = (out: CanvasNode[], ids: string[]) => {
   for (let i = 0; i < rs.length; i++) for (let j = i + 1; j < rs.length; j++) expect(overlaps(rs[i], rs[j])).toBe(false)
 }
 
+// A perfect cross of equal 100x50 nodes at the default gap 40, row top-left at (0, 0):
+// slots 0–2 the row, 3 centred above slot 1, 4 centred below the row.
+const SLOT = [
+  { x: 0, y: 0 },
+  { x: 140, y: 0 },
+  { x: 280, y: 0 },
+  { x: 140, y: -90 },
+  { x: 140, y: 90 }
+]
+/** `ids[i]` sitting exactly on slot i, shifted by (ox, oy). */
+const cross = (ids: string[], ox = 0, oy = 0): CanvasNode[] => ids.map((id, i) => n(id, SLOT[i].x + ox, SLOT[i].y + oy))
+const moved = (nodes: CanvasNode[], id: string, x: number, y: number): CanvasNode[] =>
+  nodes.map((nd) => (nd.id === id ? { ...nd, position: { x, y } } : nd))
+
 describe('crossLayout', () => {
   it('the cap is five units', () => {
     expect(CROSS_MAX_UNITS).toBe(5)
@@ -686,7 +700,7 @@ describe('crossLayout', () => {
   it('ids without a timestamp sort after stamped ones, by array order', () => {
     const nodes = [n('zeta', 0, 0), n(B, 0, 0), n('alpha', 0, 0), n(A, 0, 0)]
     expect(crossUnits(nodes).map((u) => u.id)).toEqual([A, B, 'zeta', 'alpha'])
-    // and they land in the row after the stamped ones
+    // and they take the slots after the stamped ones
     const out = crossLayout(nodes, { gap: 10 })
     const a = posOf(out, A)
     expect(posOf(out, B)).toEqual({ x: a.x + 110, y: a.y })
@@ -700,119 +714,255 @@ describe('crossLayout', () => {
     expect(tidyCanvasCross(nodes)).toBe(nodes)
   })
 
-  it('n=2: A B in a row at A, default gap 40', () => {
-    const out = crossLayout([n(B, 999, -300), n(A, 100, 200)])
-    expect(posOf(out, A)).toEqual({ x: 100, y: 200 })
-    expect(posOf(out, B)).toEqual({ x: 240, y: 200 })
+  it('n=6 is out of range: same array', () => {
+    const nodes = [A, B, C, D, E, F].map((id, i) => n(id, i * 300, 0))
+    expect(crossLayout(nodes)).toBe(nodes)
   })
 
-  it('n=3: A B C in a row', () => {
-    const out = crossLayout([n(C, 5, 5), n(A, 100, 200), n(B, -50, 900)])
-    expect(posOf(out, A)).toEqual({ x: 100, y: 200 })
-    expect(posOf(out, B)).toEqual({ x: 240, y: 200 })
-    expect(posOf(out, C)).toEqual({ x: 380, y: 200 })
+  describe('fresh layout', () => {
+    // KNOWN DISCREPANCY: the brief and crossLayout's own docstring say a pile gets opening order
+    // AND the oldest anchor. Opening order holds, but placing the cross so A stays moves the pile
+    // more than placing it so the MIDDLE node stays, so min-movement anchors on B (A lands at
+    // x = -140). Left failing on purpose; see the station report.
+    it('a pile at one spot: opening order A B C (D top, E bottom) anchored on the OLDEST node A', () => {
+      const out = crossLayout([n(E, 0, 0), n(D, 0, 0), n(C, 0, 0), n(B, 0, 0), n(A, 0, 0)])
+      expect(posOf(out, A)).toEqual({ x: 0, y: 0 })
+      expect(posOf(out, B)).toEqual({ x: 140, y: 0 })
+      expect(posOf(out, C)).toEqual({ x: 280, y: 0 })
+      expect(posOf(out, D)).toEqual({ x: 140, y: -90 })
+      expect(posOf(out, E)).toEqual({ x: 140, y: 90 })
+    })
+
+    it('a pile at one spot is laid out in opening order (relative positions)', () => {
+      for (const k of [2, 3, 4, 5]) {
+        const ids = [A, B, C, D, E].slice(0, k)
+        const out = crossLayout([...ids].reverse().map((id) => n(id, 0, 0)))
+        const a = posOf(out, A)
+        ids.forEach((id, i) => expect(posOf(out, id)).toEqual({ x: a.x + SLOT[i].x, y: a.y + SLOT[i].y }))
+      }
+    })
+
+    it('every node free: the oldest anchors where it stands, the rest follow in opening order', () => {
+      const nodes = [n(D, -700, 20), n(B, 900, -40), n(A, 50, 60), n(C, 3, 3)]
+      const out = crossLayout(nodes, { free: new Set([A, B, C, D]) })
+      expect(posOf(out, A)).toEqual({ x: 50, y: 60 })
+      expect(posOf(out, B)).toEqual({ x: 190, y: 60 })
+      expect(posOf(out, C)).toEqual({ x: 330, y: 60 })
+      expect(posOf(out, D)).toEqual({ x: 190, y: -30 })
+    })
   })
 
-  it('n=4: D centred over B, one gap above the row', () => {
-    const out = crossLayout([n(D, 0, 0), n(C, 5, 5), n(A, 100, 200), n(B, -50, 900)])
-    expect(posOf(out, A)).toEqual({ x: 100, y: 200 })
-    expect(posOf(out, B)).toEqual({ x: 240, y: 200 })
-    expect(posOf(out, C)).toEqual({ x: 380, y: 200 })
-    expect(posOf(out, D)).toEqual({ x: 240, y: 200 - 40 - 50 })
-    expectNoOverlap(out, [A, B, C, D])
+  describe('a cross already in place does not move', () => {
+    it('same array for n=2..5, even with the slots filled out of opening order', () => {
+      const scrambled = [D, A, E, C, B]
+      for (const k of [2, 3, 4, 5]) {
+        const ids = [A, B, C, D, E].slice(0, k)
+        const inSlots = scrambled.filter((id) => ids.includes(id)) // e.g. k=3 → C A B
+        const nodes = cross(inSlots, 300, -120)
+        expect(crossLayout(nodes)).toBe(nodes)
+        expect(tidyCanvasCross(nodes)).toBe(nodes)
+      }
+    })
+
+    it('same array for a perfect cross of unequal sizes', () => {
+      const nodes = [
+        n(A, 0, 0, 200, 100),
+        n(B, 220, 0, 120, 150),
+        n(C, 360, 0, 80, 300),
+        n(D, 80, -90, 400, 70),
+        n(E, 250, 320, 60, 30)
+      ]
+      expect(crossLayout(nodes, { gap: 20 })).toBe(nodes)
+    })
   })
 
-  it('n=5: E centred under B, one gap below the row', () => {
-    const out = crossLayout([n(E, 7, 7), n(D, 0, 0), n(C, 5, 5), n(A, 100, 200), n(B, -50, 900)])
-    expect(posOf(out, D)).toEqual({ x: 240, y: 110 })
-    expect(posOf(out, E)).toEqual({ x: 240, y: 200 + 50 + 40 })
-    expectNoOverlap(out, [A, B, C, D, E])
+  describe('the user moves a node', () => {
+    it('dragging C exactly onto B (prefer C): C takes the middle, B the right slot, A stays', () => {
+      const nodes = moved(cross([A, B, C]), C, 140, 0)
+      const out = crossLayout(nodes, { prefer: new Set([C]) })
+      expect(posOf(out, A)).toEqual({ x: 0, y: 0 })
+      expect(out.find((x) => x.id === A)).toBe(nodes[0])
+      expect(posOf(out, C)).toEqual({ x: 140, y: 0 })
+      expect(posOf(out, B)).toEqual({ x: 280, y: 0 })
+    })
+
+    it('the same drag WITHOUT prefer is a tie, which opening order wins (C goes back)', () => {
+      const out = crossLayout(moved(cross([A, B, C]), C, 140, 0))
+      expect(posOf(out, A)).toEqual({ x: 0, y: 0 })
+      expect(posOf(out, B)).toEqual({ x: 140, y: 0 })
+      expect(posOf(out, C)).toEqual({ x: 280, y: 0 })
+    })
+
+    it('without prefer the nearest wins: C a few px off the middle, B moved away right', () => {
+      // A (0,0), C (142,0), B (420,0). Best: A C B with C anchoring (cost 4 + 138²), so the
+      // cross shifts 2px right: A (2,0), C stays, B (282,0).
+      const nodes = [n(A, 0, 0), n(B, 420, 0), n(C, 142, 0)]
+      const out = crossLayout(nodes)
+      expect(posOf(out, C)).toEqual({ x: 142, y: 0 })
+      expect(out.find((x) => x.id === C)).toBe(nodes[2])
+      expect(posOf(out, A)).toEqual({ x: 2, y: 0 })
+      expect(posOf(out, B)).toEqual({ x: 282, y: 0 })
+    })
+
+    it('a node dragged a few px off its slot snaps back; the rest does not move', () => {
+      const laid = cross([A, B, C, D, E], 100, 200)
+      const nodes = moved(laid, D, 245, 114) // slot 3 is (240, 110)
+      const out = crossLayout(nodes)
+      expect(posOf(out, D)).toEqual({ x: 240, y: 110 })
+      for (const i of [0, 1, 2, 4]) expect(out[i]).toBe(nodes[i])
+    })
   })
 
-  it('respects opts.gap', () => {
-    const out = crossLayout([n(A, 0, 0), n(B, 0, 0), n(C, 0, 0), n(D, 0, 0), n(E, 0, 0)], { gap: 10 })
-    expect(posOf(out, B)).toEqual({ x: 110, y: 0 })
-    expect(posOf(out, C)).toEqual({ x: 220, y: 0 })
-    expect(posOf(out, D)).toEqual({ x: 110, y: -60 })
-    expect(posOf(out, E)).toEqual({ x: 110, y: 60 })
+  describe('opening a node (free)', () => {
+    it('a 4th node opened far away takes the top slot; A B C do not move', () => {
+      const nodes = [...cross([A, B, C]), n(D, 5000, 5000)]
+      const out = crossLayout(nodes, { free: new Set([D]) })
+      expect(posOf(out, D)).toEqual({ x: 140, y: -90 })
+      for (const i of [0, 1, 2]) expect(out[i]).toBe(nodes[i])
+    })
+
+    it('a 5th takes the bottom slot', () => {
+      const nodes = [...cross([A, B, C, D], 30, 30), n(E, -4000, 12)]
+      const out = crossLayout(nodes, { free: new Set([E]) })
+      expect(posOf(out, E)).toEqual({ x: 170, y: 120 })
+      for (const i of [0, 1, 2, 3]) expect(out[i]).toBe(nodes[i])
+    })
+
+    it('a free node is never the anchor, even when it is the oldest', () => {
+      // A (the oldest) is free at a stray spot; B and C already stand in slots 1 and 2.
+      const nodes = [n(A, 9000, 9000), n(B, 140, 0), n(C, 280, 0)]
+      const out = crossLayout(nodes, { free: new Set([A]) })
+      expect(posOf(out, A)).toEqual({ x: 0, y: 0 })
+      expect(out[1]).toBe(nodes[1])
+      expect(out[2]).toBe(nodes[2])
+    })
   })
 
-  it('unequal sizes: row top-aligned, D/E centred on B, E below the TALLEST row node', () => {
-    const nodes = [
-      n(E, 0, 0, 60, 30),
-      n(C, 0, 0, 80, 300), // tallest in the row
-      n(A, 0, 0, 200, 100),
-      n(D, 0, 0, 400, 70), // wider than B
-      n(B, 0, 0, 120, 150)
+  describe('closing a node', () => {
+    it('row A B C, close B: A stays, C slides into slot 1', () => {
+      const out = crossLayout(cross([A, B, C]).filter((x) => x.id !== B))
+      expect(posOf(out, A)).toEqual({ x: 0, y: 0 })
+      expect(posOf(out, C)).toEqual({ x: 140, y: 0 })
+    })
+
+    it('row A B C, close A: B and C do not move at all (the cross shifts)', () => {
+      const rest = cross([A, B, C]).filter((x) => x.id !== A)
+      expect(crossLayout(rest)).toBe(rest)
+    })
+
+    it('full cross, close the middle B: the bottom E fills the middle, D keeps the top, A C stay', () => {
+      // With only four units there is no bottom slot, so D staying on top and E moving up one
+      // step (90²) beats D moving down into the middle and E moving all the way to the top.
+      const nodes = cross([A, B, C, D, E]).filter((x) => x.id !== B)
+      const out = crossLayout(nodes)
+      expect(posOf(out, A)).toEqual({ x: 0, y: 0 })
+      expect(posOf(out, C)).toEqual({ x: 280, y: 0 })
+      expect(posOf(out, D)).toEqual({ x: 140, y: -90 })
+      expect(posOf(out, E)).toEqual({ x: 140, y: 0 })
+      expectNoOverlap(out, [A, C, D, E])
+    })
+
+    it('full cross, close the top D: B rises to the top and E takes the middle (two short moves beat one long)', () => {
+      // 4 units leave no bottom slot. E straight up to the top moves 180² = 32400; B up one step
+      // to the top plus E up one step into the middle moves 2·90² = 16200. A and C stay.
+      const nodes = cross([A, B, C, D, E]).filter((x) => x.id !== D)
+      const out = crossLayout(nodes)
+      expect(posOf(out, A)).toEqual({ x: 0, y: 0 })
+      expect(posOf(out, C)).toEqual({ x: 280, y: 0 })
+      expect(posOf(out, B)).toEqual({ x: 140, y: -90 })
+      expect(posOf(out, E)).toEqual({ x: 140, y: 0 })
+    })
+  })
+
+  describe('geometry', () => {
+    // Perfect cross at gap 20 (row top-left (1000,500)):
+    //   A 200x100 at (1000,500); B 120x150 at (1220,500); C 80x300 at (1360,500) (tallest)
+    //   D 400x70 centred on B, above: x = 1220 + (120-400)/2 = 1080, y = 500 - 20 - 70 = 410
+    //   E 60x30  centred on B, below the TALLEST: x = 1220 + (120-60)/2 = 1250, y = 500 + 300 + 20 = 820
+    const sized = (): CanvasNode[] => [
+      n(A, 1000, 500, 200, 100),
+      n(B, 1220, 500, 120, 150),
+      n(C, 1360, 500, 80, 300),
+      n(D, 1080, 410, 400, 70),
+      n(E, 1250, 820, 60, 30)
     ]
-    const out = crossLayout(nodes, { gap: 20 })
-    expect(posOf(out, A)).toEqual({ x: 0, y: 0 })
-    expect(posOf(out, B)).toEqual({ x: 220, y: 0 })
-    expect(posOf(out, C)).toEqual({ x: 360, y: 0 })
-    expect(posOf(out, D)).toEqual({ x: 220 + (120 - 400) / 2, y: -20 - 70 })
-    expect(posOf(out, E)).toEqual({ x: 220 + (120 - 60) / 2, y: 300 + 20 })
-    expectNoOverlap(out, [A, B, C, D, E])
+
+    it('unequal sizes: row top-aligned, D/E centred on B, E below the tallest row node', () => {
+      const nodes = moved(moved(sized(), D, 1084, 407), E, 1248, 825)
+      const out = crossLayout(nodes, { gap: 20 })
+      expect(posOf(out, A)).toEqual({ x: 1000, y: 500 })
+      expect(posOf(out, B)).toEqual({ x: 1220, y: 500 })
+      expect(posOf(out, C)).toEqual({ x: 1360, y: 500 })
+      expect(posOf(out, D)).toEqual({ x: 1080, y: 410 })
+      expect(posOf(out, E)).toEqual({ x: 1250, y: 820 })
+      expectNoOverlap(out, [A, B, C, D, E])
+    })
+
+    it('no overlaps for n=4 and n=5 with unequal sizes from a messy start', () => {
+      const messy = [
+        n(A, 0, 0, 200, 100),
+        n(B, 37, 12, 120, 150),
+        n(C, -80, 400, 80, 300),
+        n(D, 600, -300, 400, 70),
+        n(E, 15, 15, 60, 30)
+      ]
+      for (const k of [4, 5]) {
+        const ids = [A, B, C, D, E].slice(0, k)
+        const out = crossLayout(messy.slice(0, k), { gap: 20 })
+        expectNoOverlap(out, ids)
+      }
+    })
+
+    it('respects opts.gap', () => {
+      // A gap-10 cross, C nudged: C snaps back to its gap-10 slot.
+      const g10 = [n(A, 0, 0), n(B, 110, 0), n(C, 220, 0), n(D, 110, -60), n(E, 110, 60)]
+      const out = crossLayout(moved(g10, C, 223, 4), { gap: 10 })
+      expect(posOf(out, C)).toEqual({ x: 220, y: 0 })
+      for (const i of [0, 1, 3, 4]) expect(out[i]).toBe(g10[i])
+      // The same cross laid out at the default gap 40 spreads around the middle node B.
+      const wide = crossLayout(g10)
+      expect(posOf(wide, B)).toEqual({ x: 110, y: 0 })
+      expect(posOf(wide, A)).toEqual({ x: -30, y: 0 })
+      expect(posOf(wide, C)).toEqual({ x: 250, y: 0 })
+      expect(posOf(wide, D)).toEqual({ x: 110, y: -90 })
+      expect(posOf(wide, E)).toEqual({ x: 110, y: 90 })
+    })
   })
 
-  it('anchor A stays put even when it is not the top-left node', () => {
-    const nodes = [n(B, -500, -500), n(C, -900, 0), n(A, 600, 400), n(D, 0, -1000)]
-    const out = crossLayout(nodes)
-    expect(posOf(out, A)).toEqual({ x: 600, y: 400 })
-    expect(out.find((x) => x.id === A)).toBe(nodes[2]) // not even copied
-    expect(posOf(out, B)).toEqual({ x: 740, y: 400 })
-    expect(posOf(out, C)).toEqual({ x: 880, y: 400 })
-    expect(posOf(out, D)).toEqual({ x: 740, y: 310 })
-  })
-
-  it('closing B re-flows A, C, D — the same picture as a fresh A, C, D', () => {
-    const laid = crossLayout([n(A, 0, 0), n(B, 0, 0), n(C, 0, 0), n(D, 0, 0)])
-    expect(posOf(laid, D)).toEqual({ x: 140, y: -90 }) // D on top of B while there are four
-    const afterClose = crossLayout(laid.filter((x) => x.id !== B))
-    // Three units are a row (1–3: A B C), so D drops into the row's third slot.
-    expect(posOf(afterClose, A)).toEqual({ x: 0, y: 0 })
-    expect(posOf(afterClose, C)).toEqual({ x: 140, y: 0 })
-    expect(posOf(afterClose, D)).toEqual({ x: 280, y: 0 })
-    const fresh = crossLayout([n(D, 77, 77), n(C, -3, 9), n(A, 0, 0)])
-    for (const id of [A, C, D]) expect(posOf(afterClose, id)).toEqual(posOf(fresh, id))
-    expectNoOverlap(afterClose, [A, C, D])
-  })
-
-  it('is idempotent: a second call returns the SAME array', () => {
-    for (const ids of [[A, B], [A, B, C], [A, B, C, D], [A, B, C, D, E]]) {
-      const once = crossLayout(ids.map((id, i) => n(id, i * 13, -i * 7)))
+  it('is idempotent: a second call returns its input (SAME array)', () => {
+    const messy = [n(A, 0, 0), n(B, 37, -12), n(C, -80, 400), n(D, 600, -300), n(E, 15, 15)]
+    for (const k of [2, 3, 4, 5]) {
+      const once = crossLayout(messy.slice(0, k))
       expect(crossLayout(once)).toBe(once)
       expect(tidyCanvasCross(once)).toBe(once)
     }
   })
 
   it('returns untouched nodes by reference', () => {
-    const nodes = [n(A, 0, 0), n(B, 140, 0), n(C, 9, 9)]
+    const nodes = [n(A, 0, 0), n(B, 140, 0), n(C, 285, 3)]
     const out = crossLayout(nodes)
     expect(out).not.toBe(nodes)
     expect(out[0]).toBe(nodes[0])
     expect(out[1]).toBe(nodes[1])
     expect(out[2]).not.toBe(nodes[2])
+    expect(posOf(out, C)).toEqual({ x: 280, y: 0 })
   })
 
   it('ignores subagent/loop cards and grouped children', () => {
     const sub = { ...n(tid(0), 3, 3), type: 'subagent' } as CanvasNode // older than A
     const loop = { ...n('loop-x', 4, 4), type: 'loop' } as CanvasNode
-    const frame = { ...n(B, 500, 500, 300, 200), type: 'group' } as CanvasNode
+    const frame = { ...n(B, 140, 0, 300, 200), type: 'group' } as CanvasNode
     const kid = { ...n(tid(-5), 20, 60), parentId: B } as CanvasNode // older than A, but grouped
-    const nodes = [sub, kid, frame, loop, n(C, 1, 1), n(A, 0, 0)]
+    // A (0,0), frame B 300 wide at (140,0), so C's slot is 140 + 300 + 40 = 480; C is 3px off.
+    const nodes = [sub, kid, frame, loop, n(C, 483, 2), n(A, 0, 0)]
     expect(crossUnits(nodes).map((u) => u.id)).toEqual([A, B, C])
     const out = crossLayout(nodes)
     expect(out.find((x) => x.id === sub.id)).toBe(sub)
     expect(out.find((x) => x.id === loop.id)).toBe(loop)
     expect(out.find((x) => x.id === kid.id)).toBe(kid)
+    expect(out.find((x) => x.id === B)).toBe(frame)
     expect(posOf(out, A)).toEqual({ x: 0, y: 0 })
-    expect(posOf(out, B)).toEqual({ x: 140, y: 0 })
     expect(posOf(out, C)).toEqual({ x: 480, y: 0 })
-  })
-
-  it('n=6 is out of range: same array', () => {
-    const nodes = [A, B, C, D, E, F].map((id, i) => n(id, i * 300, 0))
-    expect(crossLayout(nodes)).toBe(nodes)
   })
 })
 
@@ -820,6 +970,15 @@ describe('tidyCanvasCross', () => {
   it('uses the cross for five units or fewer', () => {
     const nodes = [n(E, 0, 0), n(D, 0, 0), n(C, 0, 0), n(B, 0, 0), n(A, 10, 20)]
     expect(tidyCanvasCross(nodes)).toEqual(crossLayout(nodes))
+  })
+
+  it('passes prefer through to the cross', () => {
+    const nodes = moved(cross([A, B, C]), C, 140, 0)
+    const out = tidyCanvasCross(nodes, [], { prefer: new Set([C]) })
+    expect(posOf(out, C)).toEqual({ x: 140, y: 0 })
+    expect(posOf(out, B)).toEqual({ x: 280, y: 0 })
+    // and without it the tie goes back to opening order
+    expect(posOf(tidyCanvasCross(nodes), C)).toEqual({ x: 280, y: 0 })
   })
 
   it('falls back to the stock tidyCanvas above five units', () => {

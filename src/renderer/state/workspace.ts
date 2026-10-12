@@ -1901,43 +1901,122 @@ export function crossUnits(nodes: CanvasNode[]): CanvasNode[] {
     .map(({ nd }) => nd)
 }
 
+/** Where each node of `order` sits in the cross, relative to the row's top-left: slot 0-2 the
+ *  row (top-aligned), slot 3 centred above slot 1, slot 4 centred below the row's tallest member. */
+function crossSlotPositions(order: CanvasNode[], gap: number): { x: number; y: number }[] {
+  const out: { x: number; y: number }[] = []
+  const row = order.slice(0, 3)
+  let x = 0
+  for (const m of row) {
+    out.push({ x, y: 0 })
+    x += nodeW(m) + gap
+  }
+  const rowH = Math.max(...row.map(nodeH))
+  const mid = row[1]
+  const centreOnMid = (m: CanvasNode): number => (mid ? out[1].x + (nodeW(mid) - nodeW(m)) / 2 : 0)
+  if (order[3]) out.push({ x: centreOnMid(order[3]), y: -gap - nodeH(order[3]) })
+  if (order[4]) out.push({ x: centreOnMid(order[4]), y: rowH + gap })
+  return out
+}
+
+/** Every ordering of `items`, the given order first (so it wins every tie). */
+function permutations<T>(items: T[]): T[][] {
+  if (items.length <= 1) return [items.slice()]
+  const out: T[][] = []
+  items.forEach((head, i) => {
+    for (const rest of permutations([...items.slice(0, i), ...items.slice(i + 1)])) out.push([head, ...rest])
+  })
+  return out
+}
+
 /**
- * **Cross layout** for a canvas of at most `CROSS_MAX_UNITS` top-level units, in opening order:
+ * **Cross layout** for a canvas of at most `CROSS_MAX_UNITS` top-level units:
  *
  * ```
- *   1–3:  A B C        4:    D         5:    D
- *                          A B C           A B C
- *                                            E
+ *   1–3:  ■ ■ ■        4:    ■         5:    ■
+ *                          ■ ■ ■           ■ ■ ■
+ *                                            ■
  * ```
  *
- * The oldest unit (A) is the anchor and never moves; the row is top-aligned on it, D and E are
- * centred on B, one `gap` above the row and one below its tallest member. Because the anchor and
- * the order are both properties of the set itself, opening a node, closing one and Tidy all land
- * on the same picture for the same nodes. Returns the SAME array when nothing moves, or when the
- * canvas has more units than the cross holds (the caller falls back). Pure.
+ * WHICH node takes which slot is decided by where the nodes ARE, not by when they opened: every
+ * assignment of nodes to slots (at most 5! = 120) is tried, the cross is placed so one node stays
+ * exactly where it is (the anchor), and the assignment that moves the nodes least wins — so a node
+ * the user dragged into the middle stays in the middle, a closed node's slot is taken by the
+ * nearest neighbour, and a cross already in place does not move at all. Ties go to opening order
+ * (read from the node id) and to the oldest anchor, which is what a pile of nodes at one spot gets.
+ *
+ * - `free`: nodes whose current position means nothing (a node that just opened): they take
+ *   whatever slot is left and never anchor.
+ * - `prefer`: nodes the user moved by hand since the last layout: their displacement counts
+ *   double when choosing the assignment, so dragging a node onto another's slot wins that slot.
+ *
+ * Returns the SAME array when nothing moves, or when the canvas has more units than the cross
+ * holds (the caller falls back). Pure.
  */
-export function crossLayout(nodes: CanvasNode[], opts?: { gap?: number }): CanvasNode[] {
+export function crossLayout(
+  nodes: CanvasNode[],
+  opts?: { gap?: number; free?: ReadonlySet<string>; prefer?: ReadonlySet<string> }
+): CanvasNode[] {
   const units = crossUnits(nodes)
   if (units.length < 2 || units.length > CROSS_MAX_UNITS) return nodes
   const gap = opts?.gap ?? 40
+  const free = opts?.free ?? new Set<string>()
+  const prefer = opts?.prefer ?? new Set<string>()
   const unitIds = new Set(units.map((u) => u.id))
   const restored = restoreMaximizedWhere(nodes, (nd) => unitIds.has(nd.id))
   const byId = new Map(restored.map((nd) => [nd.id, nd]))
-  const [a, b, c, d, e] = units.map((u) => byId.get(u.id)!)
+  const ordered = units.map((u) => byId.get(u.id)!)
+  // Anchors: nodes whose position is a fact. With none (several nodes opened at once into an empty
+  // canvas) the oldest node anchors where it stands.
+  const anchors = ordered.filter((n) => !free.has(n.id))
+  // A pile (every placed node on the same spot) says nothing about where anything belongs: treat
+  // it like no information at all, so the oldest node anchors and the rest fill in opening order.
+  const piled = anchors.every((n) => n.position.x === anchors[0].position.x && n.position.y === anchors[0].position.y)
+  const noInfo = anchors.length === 0 || (anchors.length > 1 && piled)
+  const anchorPool = noInfo ? [ordered[0]] : anchors
+  const weight = (n: CanvasNode): number => (free.has(n.id) ? 0 : prefer.has(n.id) ? 2 : 1)
 
-  const pos = new Map<string, { x: number; y: number }>()
-  const top = a.position.y
-  let x = a.position.x
-  for (const m of [a, b, c]) {
-    if (!m) break
-    pos.set(m.id, { x, y: top })
-    x += nodeW(m) + gap
+  type Plan = { order: CanvasNode[]; rel: { x: number; y: number }[]; dx: number; dy: number }
+  const costOf = (plan: Plan, w: (n: CanvasNode) => number): number =>
+    plan.order.reduce((sum, n, i) => {
+      const ex = plan.rel[i].x + plan.dx - n.position.x
+      const ey = plan.rel[i].y + plan.dy - n.position.y
+      return sum + w(n) * (ex * ex + ey * ey)
+    }, 0)
+  // The cross placed so `anchor` does not move.
+  const placed = (order: CanvasNode[], rel: { x: number; y: number }[], anchor: CanvasNode): Plan => {
+    const i = order.indexOf(anchor)
+    return { order, rel, dx: anchor.position.x - rel[i].x, dy: anchor.position.y - rel[i].y }
   }
-  const rowH = Math.max(...[a, b, c].filter(Boolean).map((m) => nodeH(m!)))
-  const centreOnB = (m: CanvasNode): number => pos.get(b.id)!.x + (nodeW(b) - nodeW(m)) / 2
-  if (d) pos.set(d.id, { x: centreOnB(d), y: top - gap - nodeH(d) })
-  if (e) pos.set(e.id, { x: centreOnB(e), y: top + rowH + gap })
 
+  // 1. The assignment, by weighted cost (`prefer` counts double), each with its best anchor.
+  let best: { order: CanvasNode[]; rel: { x: number; y: number }[] } | null = null
+  let bestCost = Infinity
+  // With no information the order IS opening order; otherwise every assignment is a candidate.
+  for (const order of noInfo ? [ordered] : permutations(ordered)) {
+    const rel = crossSlotPositions(order, gap)
+    for (const anchor of anchorPool) {
+      const c = costOf(placed(order, rel, anchor), weight)
+      if (c < bestCost - 1e-6) {
+        bestCost = c
+        best = { order, rel }
+      }
+    }
+  }
+  // 2. For that assignment, the anchor by plain movement, ties to the oldest node — so a node
+  //    dragged a few pixels off its slot snaps in, and the rest of the cross stays put.
+  let plan: Plan | null = null
+  let planCost = Infinity
+  for (const anchor of anchorPool) {
+    const candidate = placed(best!.order, best!.rel, anchor)
+    const c = costOf(candidate, (n) => (free.has(n.id) ? 0 : 1))
+    if (c < planCost - 1e-6) {
+      planCost = c
+      plan = candidate
+    }
+  }
+
+  const pos = new Map(plan!.order.map((n, i) => [n.id, { x: plan!.rel[i].x + plan!.dx, y: plan!.rel[i].y + plan!.dy }]))
   const out = restored.map((nd) => {
     const p = pos.get(nd.id)
     return p && (p.x !== nd.position.x || p.y !== nd.position.y) ? { ...nd, position: p } : nd
@@ -1952,9 +2031,11 @@ export function crossLayout(nodes: CanvasNode[], opts?: { gap?: number }): Canva
 export function tidyCanvasCross(
   nodes: CanvasNode[],
   edges: readonly LineageEdge[] = [],
-  opts?: { gap?: number }
+  opts?: { gap?: number; prefer?: ReadonlySet<string> }
 ): CanvasNode[] {
-  return crossUnits(nodes).length <= CROSS_MAX_UNITS ? crossLayout(nodes, opts) : tidyCanvas(nodes, edges, opts)
+  return crossUnits(nodes).length <= CROSS_MAX_UNITS
+    ? crossLayout(nodes, opts)
+    : tidyCanvas(nodes, edges, { gap: opts?.gap })
 }
 
 /**
