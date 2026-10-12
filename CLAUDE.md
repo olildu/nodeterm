@@ -6472,6 +6472,15 @@ only learned a platform, not a second protocol. Rules a refactor must not undo:
   device clipboard + `adb input keyevent 279`; `describe` is `uiautomator dump` (~1.5 s) and has no
   degraded mode; `sim --list` prints a running emulator's `adb emulator-NNNN` serial because that
   (not `android:<avd>`) is Maestro's `--device`.
+- **What differs per platform in the node is ONE table**, `renderer/lib/simPlatform.ts` (header
+  buttons, the pre-report placeholder box, screen corners, the iOS-only `edge` flag, the picker's
+  sections, "Booting emulator…" while an AVD cold-boots). Add a platform difference there, never as a
+  `udid.startsWith('android:')` in the component.
+- **Flutter reads without any accessibility switch** (measured on Posha, API 30): `uiautomator`
+  is itself an accessibility client, so Flutter builds its semantics for each dump and nothing
+  persists. Do NOT add an iOS-style attach-time toggle. A text field's typed text is its `value`, never
+  its label. **Open bug:** gRPC keys/text and the clipboard paste do not reach a focused Flutter text
+  field (they report ok); native fields work. `adb shell input keyevent` does reach it; unfixed.
 - **Surfaces**: the renderer gate is still macOS-only (`simulatorUnavailableReason`), though core
   and the helper are platform-neutral — Linux/Windows Android is a deliberate follow-up, unmeasured.
   Server Edition, relay tabs, mobile: as for iOS (not registered / stub / N/A).
@@ -6479,7 +6488,7 @@ only learned a platform, not a second protocol. Rules a refactor must not undo:
   and a headless boot of a fresh AVD (ready in 18.4 s, stopped on quit); 44–46 fps at 600×960 with
   ~30 ms capture→stdout; `control.realandroid.test.ts`
   (`NODETERM_TEST_ANDROID_AVD=<running avd>`) through the real service + verb. **Not verified**:
-  the node in an Electron window, packaged builds, Flutter semantics through `describe` on Android.
+  the node in an Electron window, packaged builds, typing into a Flutter field (broken, above).
 
 ## Node colors (one palette, two sections)
 

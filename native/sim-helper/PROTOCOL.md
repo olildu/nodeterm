@@ -111,9 +111,18 @@ Differences, all MEASURED on emulator 36.6.11 (API 30 Nexus 7, API 30 Pixel):
 * **`text`**: printable ASCII via gRPC (newline = Enter). Anything else (or `paste: true`) goes through the
   emulator clipboard + `adb shell input keyevent 279` (KEYCODE_PASTE, ~0.5 s) — gRPC drops non-ASCII text and no
   gRPC Ctrl+V/Paste key pasted. It overwrites the device clipboard.
-* **`describe`**: `adb exec-out uiautomator dump /dev/tty` (~1.5 s, retried while the screen animates), mapped to
-  the element shape above: `label` = content-desc or text, `value` = text when both exist (never a password
-  field's), `identifier` = resource-id, `role` = class short name (`EditText` → `TextField`; a clickable generic
-  container → `Button`; else `Element`). No `axPref`, no degraded mode. `describe-point` hit-tests that dump.
+* **`describe`**: `adb exec-out uiautomator dump /dev/tty` (~1.5–2 s, retried while the screen animates), mapped to
+  the element shape above: `label` = content-desc or text, `value` = text when both exist; for a `TextField`
+  the typed text is always `value` and the label is content-desc, else `hint`, else empty (a password field's
+  text is never reported). `identifier` = resource-id, `role` = class short name (`EditText` → `TextField`; a
+  clickable generic container → `Button`; else `Element`). No `axPref`, no degraded mode. `describe-point`
+  hit-tests that dump.
+* **Flutter** (Posha, API 30, measured by the step-4 spike): labels show with NO accessibility setting changed —
+  `uiautomator` connects as a UiAutomation client, Flutter builds its semantics for it, and nothing persists
+  afterwards (`accessibility_enabled` stays 0). So there is no iOS-style attach-time switch, on purpose. Before a
+  cold-started Flutter app draws its first frame the dump fails (`null root node`) or shows only the splash; an
+  API 30 Flutter text field has no name (no content-desc, no hint), so pair it with the label above it.
+  **Open bug:** gRPC `sendKey` (text, keys) and the clipboard paste reply `ok` but do NOT reach a focused Flutter
+  text field (native fields work); `adb shell input keyevent` does. Typing into Flutter is not supported yet.
 * **Exit codes**: 3 already attached, 4 not an AVD / malformed id, 5 no Android SDK (`no-android-sdk`).
 * `list` → `{udid, name, runtime ("Android 11"), state, deviceType, serial?}` per AVD (`emulator -list-avds`).

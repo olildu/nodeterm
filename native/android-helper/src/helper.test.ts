@@ -81,6 +81,18 @@ describe('uiautomator', () => {
     expect(pw).toMatchObject({ label: '', value: '', role: 'TextField', password: true, offscreen: true })
     expect(pw.center).toBeUndefined()
   })
+  it('reads a text field’s typed text as its value, not its label (Flutter EditText, API 30)', () => {
+    const f =
+      `<hierarchy rotation="0">` +
+      `<node NAF="true" index="2" text="agent@example.com" resource-id="" class="android.widget.EditText" content-desc="" clickable="true" password="false" bounds="[42,475][1038,633]" />` +
+      `<node index="3" text="" class="android.widget.EditText" content-desc="" hint="Enter your password" password="true" bounds="[42,748][1038,906]" />` +
+      `<node index="4" text="Hi" class="android.widget.EditText" content-desc="Name" bounds="[42,900][1038,1000]" />` +
+      `</hierarchy>`
+    const [email, pw, name] = parseDump(f, 2.625, { width: 411.43, height: 914.29 }).flat
+    expect(email).toMatchObject({ role: 'TextField', label: '', value: 'agent@example.com' })
+    expect(pw).toMatchObject({ role: 'TextField', label: 'Enter your password', value: '', password: true })
+    expect(name).toMatchObject({ label: 'Name', value: 'Hi' })
+  })
   it('hit-tests the deepest visible element', () => {
     const { flat } = parseDump(xml, 2, { width: 600, height: 960 })
     expect(hitTest(flat, 100, 270)!.label).toBe('Display')

@@ -141,6 +141,10 @@ export function parseDump(xml: string, scale: number, screen: { width: number; h
     const text = attrs.text ?? ''
     const clickable = attrs.clickable === 'true'
     const password = attrs.password === 'true'
+    const role = roleOf(attrs.class ?? '', clickable)
+    // A text field's `text` is what was typed (iOS `value`), never its name; its name is content-desc
+    // or the hint (newer dumps only — API 30 writes neither for a Flutter field, which then has no label).
+    const field = role === 'TextField'
     const parent = stack[stack.length - 1]
     // Visible part: the frame cut to the screen AND to the parent's visible part (a scrolled row).
     const clip = parent.visibleFrame ?? parent.frame
@@ -153,10 +157,10 @@ export function parseDump(xml: string, scale: number, screen: { width: number; h
     const clipped = !offscreen && (vx1 > frame.x || vy1 > frame.y || vx2 < frame.x + frame.width || vy2 < frame.y + frame.height)
     const el: UiElement = {
       // content-desc is what TalkBack reads; text is the value when both exist.
-      label: desc || (password ? '' : text),
+      label: field ? desc || (attrs.hint ?? '') : desc || (password ? '' : text),
       identifier: attrs['resource-id'] ?? '',
-      role: roleOf(attrs.class ?? '', clickable),
-      value: desc && text && !password ? text : '',
+      role,
+      value: password ? '' : field ? text : desc && text ? text : '',
       enabled: attrs.enabled !== 'false',
       clickable,
       ...(attrs.checkable === 'true' ? { checked: attrs.checked === 'true' } : {}),
