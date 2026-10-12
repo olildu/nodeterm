@@ -23,7 +23,9 @@ export default defineConfig({
       'test/ssh-docker/**/*.test.ts',
       // Repo tooling that CI depends on (the release-notes generator). Not shipped in any
       // bundle and not in a tsconfig project, but its pure parts decide what a release says.
-      'scripts/**/*.test.ts'
+      'scripts/**/*.test.ts',
+      // The Android emulator helper's pure parsers (bundled separately into resources/bin).
+      'native/**/*.test.ts'
     ],
     environment: 'node',
     // Issue #629: every run gets a private `TMUX_TMPDIR`, so no test can reach the tmux servers
