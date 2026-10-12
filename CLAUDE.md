@@ -6479,8 +6479,12 @@ only learned a platform, not a second protocol. Rules a refactor must not undo:
 - **Flutter reads without any accessibility switch** (measured on Posha, API 30): `uiautomator`
   is itself an accessibility client, so Flutter builds its semantics for each dump and nothing
   persists. Do NOT add an iOS-style attach-time toggle. A text field's typed text is its `value`, never
-  its label. **Open bug:** gRPC keys/text and the clipboard paste do not reach a focused Flutter text
-  field (they report ok); native fields work. `adb shell input keyevent` does reach it; unfixed.
+  its label.
+- **No hardware keyboard means no gRPC typing.** An AVD with `hw.keyboard=no` (avdmanager's
+  default) accepts gRPC `sendKey` and silently drops it, native and Flutter fields alike; this was
+  first misread as a Flutter bug. The helper reads `hardware-qemu.ini` of the running instance and
+  then types through `adb shell input` (keycode batches; `input text` of a whole string drops
+  characters into Flutter), ~0.5 s per call. It never rewrites a user's AVD config to fix it.
 - **Surfaces**: the renderer gate is still macOS-only (`simulatorUnavailableReason`), though core
   and the helper are platform-neutral — Linux/Windows Android is a deliberate follow-up, unmeasured.
   Server Edition, relay tabs, mobile: as for iOS (not registered / stub / N/A).
@@ -6488,7 +6492,8 @@ only learned a platform, not a second protocol. Rules a refactor must not undo:
   and a headless boot of a fresh AVD (ready in 18.4 s, stopped on quit); 44–46 fps at 600×960 with
   ~30 ms capture→stdout; `control.realandroid.test.ts`
   (`NODETERM_TEST_ANDROID_AVD=<running avd>`) through the real service + verb. **Not verified**:
-  the node in an Electron window, packaged builds, typing into a Flutter field (broken, above).
+  the node in an Electron window, packaged builds, the adb typing route into a Flutter field (the
+  route is the one the Flutter spike saw work; nt_smoke_30 smoke ran 17/17 with keyboard on AND off).
 
 ## Node colors (one palette, two sections)
 

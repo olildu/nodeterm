@@ -79,3 +79,59 @@ export const BUTTON_KEYS: Record<string, string> = {
 export function isTypable(text: string): boolean {
   return /^[\x20-\x7e\n]*$/.test(text)
 }
+
+// ─── adb `input` fallback (an emulator without a hardware keyboard) ─────────────────────────
+
+/** Android KEYCODE_* for characters `input keyevent` can type without a modifier. */
+const CHAR_KEYCODES: Record<string, number> = {
+  ' ': 62, '\n': 66, '\t': 61, ',': 55, '.': 56, '`': 68, '-': 69, '=': 70, '[': 71, ']': 72, '\\': 73,
+  ';': 74, "'": 75, '/': 76, '@': 77
+}
+for (let i = 0; i < 26; i++) CHAR_KEYCODES[String.fromCharCode(97 + i)] = 29 + i
+for (let i = 0; i < 10; i++) CHAR_KEYCODES[String(i)] = 7 + i
+
+/** HID usage → Android KEYCODE for the named keys (letters/digits/punctuation go through their char). */
+const HID_KEYCODES: Record<number, number> = {
+  0x28: 66, 0x29: 111, 0x2a: 67, 0x2b: 61, 0x2c: 62, 0x49: 124, 0x4a: 122, 0x4b: 92, 0x4c: 112, 0x4d: 123,
+  0x4e: 93, 0x4f: 22, 0x50: 21, 0x51: 20, 0x52: 19
+}
+
+export const BUTTON_KEYCODES: Record<string, number> = {
+  home: 3, back: 4, recents: 187, power: 26, lock: 26, side: 26, volup: 24, voldown: 25
+}
+
+const shQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`
+
+/**
+ * One device-side shell line that types `text` with `input`: runs of characters that have a plain
+ * keycode go as ONE `input keyevent a b c` (MEASURED: `input text` drops characters into a Flutter
+ * field, a keyevent batch does not), anything else (uppercase, shifted punctuation) as `input text`
+ * one character at a time. Every argument is single-quoted for the device's sh; only printable ASCII
+ * reaches here (`isTypable`).
+ */
+export function inputTextScript(text: string): string {
+  const parts: string[] = []
+  let codes: number[] = []
+  const flush = (): void => {
+    if (codes.length) parts.push(`input keyevent ${codes.join(' ')}`)
+    codes = []
+  }
+  for (const ch of text) {
+    const code = CHAR_KEYCODES[ch]
+    if (code !== undefined) codes.push(code)
+    else {
+      flush()
+      parts.push(`input text ${shQuote(ch === '%' ? '\\%' : ch)}`)
+    }
+  }
+  flush()
+  return parts.join('; ')
+}
+
+/** `input` line for one HID key (+shift): a named key's KEYCODE, else its character. Null = no equivalent. */
+export function inputKeyScript(usage: number, shift: boolean): string | null {
+  const named = HID_KEYCODES[usage]
+  if (named !== undefined) return `input keyevent ${named}`
+  const ch = hidToKey(usage, shift)
+  return ch && ch.length === 1 ? inputTextScript(ch) : null
+}

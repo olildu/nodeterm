@@ -108,7 +108,7 @@ await test('ready event', async () => {
   info = e.device
   assert(info.pointWidth > 0 && Math.abs(info.pixelWidth - info.pointWidth * info.scale) < 1, 'point/pixel mismatch')
   assert(info.owned === false, 'a pre-existing emulator must not read as owned')
-  return `${info.name} ${info.pixelWidth}x${info.pixelHeight}px @${info.scale}x = ${info.pointWidth}x${info.pointHeight}pt, ${info.runtime}`
+  return `${info.name} ${info.pixelWidth}x${info.pixelHeight}px @${info.scale}x = ${info.pointWidth}x${info.pointHeight}pt, ${info.runtime}, hardware keyboard ${info.hardwareKeyboard}`
 })
 await test('info + ping', async () => {
   const r = await c.send('info'); assert(r.ok && r.device.ready === true && r.device.state === 'Booted', JSON.stringify(r))
@@ -163,18 +163,19 @@ await test('tap → navigates (Display) and back button', async () => {
   return `tap ${t.ms}ms → Display screen → back`
 })
 await test('swipe scrolls; raw touch drag scrolls', async () => {
+  const W = info.pointWidth, H = info.pointHeight, x = W / 2
   const y0 = findLabel((await describeFlat(c)).elements, /^Display$/).frame.y
-  const s = await c.send('swipe', { x1: 300, y1: 800, x2: 300, y2: 400, ms: 300, steps: 15 }); assert(s.ok, JSON.stringify(s))
+  const s = await c.send('swipe', { x1: x, y1: H * 0.8, x2: x, y2: H * 0.4, ms: 300, steps: 15 }); assert(s.ok, JSON.stringify(s))
   await sleep(1200)
   const d1 = findLabel((await describeFlat(c)).elements, /^Display$/)
   assert(!d1 || d1.frame.y < y0 - 60, `swipe: ${y0} → ${d1?.frame.y}`)
-  await c.send('swipe', { x1: 300, y1: 300, x2: 300, y2: 900, ms: 300 }); await sleep(1200)
-  let r = await c.send('touch', { phase: 'down', x: 300, y: 800 }); assert(r.ok, JSON.stringify(r))
-  for (let i = 1; i <= 12; i++) { c.notify('touch', { phase: 'move', x: 300, y: 800 - i * 30 }); await sleep(12) }
-  r = await c.send('touch', { phase: 'up', x: 300, y: 440 }); assert(r.ok, JSON.stringify(r)); await sleep(1200)
+  await c.send('swipe', { x1: x, y1: H * 0.3, x2: x, y2: H * 0.9, ms: 300 }); await sleep(1200)
+  let r = await c.send('touch', { phase: 'down', x, y: H * 0.8 }); assert(r.ok, JSON.stringify(r))
+  for (let i = 1; i <= 12; i++) { c.notify('touch', { phase: 'move', x, y: H * (0.8 - i * 0.03) }); await sleep(12) }
+  r = await c.send('touch', { phase: 'up', x, y: H * 0.44 }); assert(r.ok, JSON.stringify(r)); await sleep(1200)
   const d2 = findLabel((await describeFlat(c)).elements, /^Display$/)
   assert(!d2 || d2.frame.y < y0 - 60, `touch: ${y0} → ${d2?.frame.y}`)
-  await c.send('swipe', { x1: 300, y1: 300, x2: 300, y2: 900, ms: 300 }); await sleep(1000)
+  await c.send('swipe', { x1: x, y1: H * 0.3, x2: x, y2: H * 0.9, ms: 300 }); await sleep(1000)
   return `Display y ${y0} → swipe ${d1 ? d1.frame.y : 'off'}, drag ${d2 ? d2.frame.y : 'off'}`
 })
 await test('stream (static, then scrolling)', async () => {
@@ -184,8 +185,9 @@ await test('stream (static, then scrolling)', async () => {
   const staticFrames = c.frames.length
   const t0 = Date.now()
   for (let i = 0; i < 3; i++) {
-    await c.send('swipe', { x1: 300, y1: 800, x2: 300, y2: 300, ms: 350, steps: 20 })
-    await c.send('swipe', { x1: 300, y1: 300, x2: 300, y2: 800, ms: 350, steps: 20 })
+    const W = info.pointWidth, H = info.pointHeight
+    await c.send('swipe', { x1: W / 2, y1: H * 0.8, x2: W / 2, y2: H * 0.3, ms: 350, steps: 20 })
+    await c.send('swipe', { x1: W / 2, y1: H * 0.3, x2: W / 2, y2: H * 0.8, ms: 350, steps: 20 })
   }
   const animMs = Date.now() - t0; await sleep(300)
   const fr = c.frames.slice(staticFrames)

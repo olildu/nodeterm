@@ -38,11 +38,12 @@ import {
   type EmuTouch,
   type StreamHandle
 } from './grpc'
-import { BUTTON_KEYS, MODIFIER_KEYS, hidToKey, isTypable } from './keys'
+import { BUTTON_KEYCODES, BUTTON_KEYS, MODIFIER_KEYS, hidToKey, inputKeyScript, inputTextScript, isTypable } from './keys'
 import {
   avdHome,
   avdOf,
   findSdk,
+  hardwareKeyboard,
   parseAvdList,
   parseWmDensity,
   parseWmSize,
@@ -184,6 +185,8 @@ class Controller {
   private monitorTimer: ReturnType<typeof setTimeout> | null = null
   private reportedSetupError = ''
   private stopping = false
+  /** false = no hardware keyboard: gRPC keys are dropped, so keys/text/buttons go through adb `input`. */
+  private hwKeyboard: boolean | null = null
 
   private want: StreamWant = { on: false, maxFps: 30, scale: 0.5, quality: 0.7 }
   private stream: StreamHandle | null = null
@@ -234,7 +237,8 @@ class Controller {
       streaming: this.want.on,
       helperVersion: VERSION,
       pid: process.pid,
-      ...(this.emu ? { serial: this.serial, owned: this.isOwned(this.emu.pid) } : {})
+      ...(this.emu ? { serial: this.serial, owned: this.isOwned(this.emu.pid) } : {}),
+      ...(this.hwKeyboard !== null ? { hardwareKeyboard: this.hwKeyboard } : {})
     }
   }
 
@@ -310,6 +314,7 @@ class Controller {
     this.grpc = null
     this.emu = null
     this.ready = false
+    this.hwKeyboard = null
     this.facts = null
     this.fingers.clear()
     this.reportedSetupError = ''
@@ -339,6 +344,8 @@ class Controller {
     }
     const grpc = new EmulatorGrpc(emu.grpcPort, emu.grpcToken)
     this.grpc = grpc
+    this.hwKeyboard = hardwareKeyboard(emu.avdDir)
+    if (this.hwKeyboard === false) log('no hardware keyboard on this AVD: typing through adb input')
     // 1. gRPC answers and the guest says it has booted.
     for (;;) {
       if (!live()) return
@@ -556,10 +563,25 @@ class Controller {
     await grpc.unary('sendKey', keyboardEvent({ key, eventType }), 5000)
   }
 
+  /** One device-side `input …` line through adb (the no-hardware-keyboard route). */
+  private async adbInput(script: string): Promise<void> {
+    try {
+      await run(this.sdk.adb, ['-s', this.serial, 'shell', script], 30_000)
+    } catch (e) {
+      throw new CmdError('input-failed', `adb input: ${(e as Error).message}`)
+    }
+  }
+
   private async hidKey(r: Record<string, unknown>): Promise<void> {
     const grpc = this.needReady()
     const usage = Number(r.usage)
     const mods = Array.isArray(r.mods) ? (r.mods as string[]).filter((m) => MODIFIER_KEYS[m]) : []
+    if (this.hwKeyboard === false) {
+      if (r.down === false) return // a press is one `input keyevent`; the up half has nothing to do
+      const script = inputKeyScript(usage, mods.includes('shift'))
+      if (!script) throw new CmdError('bad-request', `key: usage 0x${usage.toString(16)} has no Android equivalent`)
+      return this.adbInput(script)
+    }
     // Shift alone just picks the shifted character; other modifiers are held around the key.
     const shift = mods.includes('shift')
     const key = hidToKey(usage, shift)
@@ -580,6 +602,10 @@ class Controller {
     const grpc = this.needReady()
     const text = String(r.text ?? '')
     if (!text) throw new CmdError('bad-request', 'text: empty')
+    if (r.paste !== true && isTypable(text) && this.hwKeyboard === false) {
+      await this.adbInput(inputTextScript(text))
+      return { typed: text.length, pasted: 0 }
+    }
     if (r.paste !== true && isTypable(text)) {
       // Newlines as Enter presses: `text` types characters, and "\n" is not one.
       const parts = text.split('\n')
@@ -613,6 +639,9 @@ class Controller {
     const key = BUTTON_KEYS[name]
     if (!key) throw new CmdError('bad-request', `button: ${name} has no Android equivalent (home, back, recents, power, volup, voldown)`)
     const hold = clamp(r.holdMs, 0, 5000, 0)
+    if (this.hwKeyboard === false) {
+      return this.adbInput(`input keyevent ${hold >= 500 ? '--longpress ' : ''}${BUTTON_KEYCODES[name]}`)
+    }
     if (hold > 0) {
       await this.key(grpc, key, KEY_DOWN)
       await sleep(hold)

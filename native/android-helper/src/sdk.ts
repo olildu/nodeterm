@@ -131,6 +131,8 @@ export interface RunningEmulator {
   grpcToken?: string
   /** The emulator asks for a JWT (Android Studio's default) — a token we cannot mint. */
   grpcJwt?: boolean
+  /** The running instance's AVD directory (its `hardware-qemu.ini` says what hardware it has). */
+  avdDir?: string
   cmdline: string
 }
 
@@ -160,6 +162,7 @@ export function parseDiscovery(pid: number, text: string): RunningEmulator | nul
     ...(Number.isInteger(grpc) && grpc > 0 ? { grpcPort: grpc } : {}),
     ...(ini['grpc.token'] ? { grpcToken: ini['grpc.token'] } : {}),
     ...(ini['grpc.jwks'] || ini['grpc.jwk_active'] ? { grpcJwt: true } : {}),
+    ...(ini['avd.dir'] ? { avdDir: ini['avd.dir'] } : {}),
     cmdline: ini.cmdline ?? ''
   }
 }
@@ -200,6 +203,23 @@ export function runningEmulators(dirs = discoveryDirs(process.env, process.platf
     }
   }
   return out
+}
+
+/**
+ * Does the running emulator have a hardware keyboard? MEASURED (emulator 36.6, API 30): with
+ * `hw.keyboard = false` — avdmanager's default, so most scripted AVDs — gRPC `sendKey` events are
+ * accepted and silently dropped, in native AND Flutter fields; with `true` they type. `null` = the
+ * file could not be read (assume gRPC works, as before).
+ */
+export function hardwareKeyboard(avdDir: string | undefined): boolean | null {
+  if (!avdDir) return null
+  try {
+    const ini = parseIni(fs.readFileSync(path.join(avdDir, 'hardware-qemu.ini'), 'utf8'))
+    const v = (ini['hw.keyboard'] ?? '').toLowerCase()
+    return v === 'true' || v === 'yes' ? true : v === 'false' || v === 'no' ? false : null
+  } catch {
+    return null
+  }
 }
 
 /** Free TCP port on 127.0.0.1? */

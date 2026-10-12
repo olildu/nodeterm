@@ -122,7 +122,12 @@ Differences, all MEASURED on emulator 36.6.11 (API 30 Nexus 7, API 30 Pixel):
   afterwards (`accessibility_enabled` stays 0). So there is no iOS-style attach-time switch, on purpose. Before a
   cold-started Flutter app draws its first frame the dump fails (`null root node`) or shows only the splash; an
   API 30 Flutter text field has no name (no content-desc, no hint), so pair it with the label above it.
-  **Open bug:** gRPC `sendKey` (text, keys) and the clipboard paste reply `ok` but do NOT reach a focused Flutter
-  text field (native fields work); `adb shell input keyevent` does. Typing into Flutter is not supported yet.
+* **No hardware keyboard → adb `input`.** gRPC `sendKey` is accepted and silently DROPPED on an AVD whose
+  `hw.keyboard` is off — avdmanager's default, so most scripted AVDs — in native and Flutter fields alike
+  (measured: the same AVD typed nothing with `no` and typed with `yes`). The helper reads the running instance's
+  `<avd.dir>/hardware-qemu.ini` (`info.hardwareKeyboard`) and, when it is off, sends `text`/`key`/`button` as
+  device-side `input` (runs of plain keycodes as ONE `input keyevent a b c`, other characters one quoted
+  `input text` each — `input text` of a whole string drops characters into Flutter). About 0.5 s per call, so
+  keys are slower there. It never edits the AVD's config.
 * **Exit codes**: 3 already attached, 4 not an AVD / malformed id, 5 no Android SDK (`no-android-sdk`).
 * `list` → `{udid, name, runtime ("Android 11"), state, deviceType, serial?}` per AVD (`emulator -list-avds`).
