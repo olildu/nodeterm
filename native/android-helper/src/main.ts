@@ -56,6 +56,7 @@ import {
   type Sdk
 } from './sdk'
 import { hitTest, parseDump, stripChildren } from './uiautomator'
+import { encodeWait } from './pacing'
 
 const VERSION = 'android-helper 0.1'
 
@@ -193,7 +194,7 @@ class Controller {
   private streamKey = ''
   private latest: EmuImage | null = null
   private encoding = false
-  private lastSentAt = 0
+  private lastEncodeStartAt = 0
   private lastJpeg: Buffer | null = null
   private pumpTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -441,7 +442,7 @@ class Controller {
 
   private pump(): void {
     if (this.encoding || !this.latest || this.pumpTimer) return
-    const wait = this.lastSentAt + 1000 / this.want.maxFps - Date.now()
+    const wait = encodeWait(this.lastEncodeStartAt, Date.now(), this.want.maxFps)
     if (wait > 0) {
       this.pumpTimer = setTimeout(() => {
         this.pumpTimer = null
@@ -452,6 +453,7 @@ class Controller {
     const img = this.latest
     this.latest = null
     this.encoding = true
+    this.lastEncodeStartAt = Date.now()
     void this.encode(img).finally(() => {
       this.encoding = false
       if (this.latest) this.pump()
@@ -469,7 +471,6 @@ class Controller {
       // stdout backed up (a slow reader): drop rather than queue — the newest frame wins next time.
       if (process.stdout.writableNeedDrain) return
       this.lastJpeg = jpeg
-      this.lastSentAt = Date.now()
       const head = Buffer.alloc(12)
       head.writeBigUInt64BE(BigInt(img.timestampUs || Date.now() * 1000), 0)
       head.writeUInt16BE(img.width, 8)

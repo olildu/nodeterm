@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { GrpcMessageReader, decodeImage, imageFormat, keyboardEvent, pbBytes, pbDecode, pbInt, pbNum, touchEvent } from './grpc'
+import { PACING_SLACK_MS, encodeWait } from './pacing'
 import { BUTTON_KEYS, hidToKey, isTypable } from './keys'
 import { avdOf, parseAvdList, parseDiscovery, parseIni, parseWmDensity, parseWmSize, runtimeLabel, sdkRootCandidates } from './sdk'
 import { decodeEntities, hitTest, parseAttributes, parseBounds, parseDump, roleOf } from './uiautomator'
@@ -212,5 +213,22 @@ describe('GrpcMessageReader', () => {
     const r = new GrpcMessageReader()
     expect(r.push(Buffer.alloc(0))).toEqual([])
     expect(r.pending).toBe(0)
+  })
+})
+
+describe('encodeWait', () => {
+  it('spaces encode STARTS, with slack, so wait + encode time is not added on top of the interval', () => {
+    const interval = 1000 / 60 - PACING_SLACK_MS
+    expect(encodeWait(1000, 1000, 60)).toBeCloseTo(interval, 5)
+    expect(encodeWait(1000, 1000 + interval, 60)).toBe(0)
+    // an encode that itself took 6 ms leaves the rest of the interval, not a fresh full one
+    expect(encodeWait(1000, 1006, 60)).toBeCloseTo(interval - 6, 5)
+    // a long encode (slower than the interval) never waits
+    expect(encodeWait(1000, 1030, 60)).toBe(0)
+  })
+  it('is 0 for a first frame and for a nonsensical rate, and honours lower caps', () => {
+    expect(encodeWait(0, 5_000_000, 60)).toBe(0)
+    expect(encodeWait(1000, 1000, 0)).toBe(0)
+    expect(encodeWait(1000, 1000, 8)).toBeCloseTo(125 - PACING_SLACK_MS, 5)
   })
 })
