@@ -904,6 +904,7 @@ import {
   restoreMaximizedNode,
   placeNodeInRect,
   terminalNodeSize,
+  setLiveCanvasNodesSource,
   type CanvasNode
 } from '../state/workspace'
 import { codexAccountSelectable, codexAccountSwitchStillEligible } from './codex-account-switch'
@@ -1857,6 +1858,12 @@ export function Canvas() {
    * empty `useNodesState([])` can never be committed as some project's canvas.
    */
   const { nodesRef, nodesProjectIdRef, renderedProjectId, installEpoch } = useNodesEpoch(nodes)
+  // `newNodeSize: 'matchLargest'` sizes a new terminal by the largest one on THIS canvas. Read
+  // lazily at creation; nothing while no project's nodes are installed (welcome screen, first load).
+  useEffect(() => {
+    setLiveCanvasNodesSource(() => (nodesProjectIdRef.current ? nodesRef.current : []))
+    return () => setLiveCanvasNodesSource(null)
+  }, [nodesRef, nodesProjectIdRef])
   // The two edge refs' render-time mirrors (declared beside their state, above), under the node
   // mirror's two conditions: the state CHANGED, and this render belongs to the latest epoch. Without
   // the second, a discrete `setLinkEdges(fn)` in a switch window renders fn(the OUTGOING project's

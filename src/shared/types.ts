@@ -1839,6 +1839,11 @@ export interface Settings {
    *  nodes snap into their slot and the rest re-flow when one closes; more than 5 falls back to
    *  the grid. Hand-editable: every reader goes through `resolveTidyLayout`. */
   tidyLayout: TidyLayout
+  /** How NEW terminal/agent nodes are sized. `'default'` (default) = `defaultNodeWidth` ×
+   *  `defaultNodeHeight`. `'matchLargest'` = the size of the largest-area terminal/agent node on the
+   *  canvas, falling back to the default when there is none. Hand-editable: every reader goes
+   *  through `resolveNewNodeSize` (@shared/new-node-size). */
+  newNodeSize: import('./new-node-size').NewNodeSize
   /** Height of the top project tab bar in CSS px (Settings → Appearance). Hand-editable; every
    *  reader — the renderer's `--tabbar-h` and main's traffic-light `y` — goes through
    *  `resolveTabBarHeight` (`@shared/window-chrome-metrics`), which clamps to 28–64 and answers
@@ -2337,6 +2342,7 @@ export const DEFAULT_SETTINGS: Settings = {
   snapToGrid: false,
   autoAlignGrid: false,
   tidyLayout: 'auto',
+  newNodeSize: 'default',
   tabBarHeight: TABBAR_HEIGHT_PX,
   defaultNodeWidth: 640,
   defaultNodeHeight: 440,

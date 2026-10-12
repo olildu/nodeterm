@@ -6,6 +6,7 @@ import path from 'node:path'
 import { publishCanvasMutation } from '../core/canvas-sync'
 import { contentOf, diffContent, type CanvasContent } from '../shared/canvas-content'
 import { groupsFirst } from '../shared/node-order'
+import { largestTerminalSize, resolveNewNodeSize } from '../shared/new-node-size'
 import { launchHeadless } from '../core/headless-launch'
 import { gateProjectTarget, GRANT_CAP } from '../core/project-grants'
 import {
@@ -257,14 +258,28 @@ function parseCount(raw: string | undefined, max: number): number {
   return Math.max(1, Math.min(max, Number.parseInt(raw || '1', 10) || 1))
 }
 
-function terminalSize(settings: Settings): { width: number; height: number } {
+function terminalSize(
+  settings: Settings,
+  nodes: readonly CanvasNodeState[] = []
+): { width: number; height: number } {
   const clamp = (value: unknown, min: number, max: number, fallback: number): number => {
     const n = typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : fallback
     return Math.min(max, Math.max(min, n))
   }
-  return {
+  const fallback = {
     width: clamp(settings.defaultNodeWidth, 280, 2400, TERMINAL_SIZE.width),
     height: clamp(settings.defaultNodeHeight, 160, 1600, TERMINAL_SIZE.height)
+  }
+  if (resolveNewNodeSize(settings.newNodeSize) !== 'matchLargest') return fallback
+  // A persisted size is already the expanded one for a collapsed node; a maximized node counts at
+  // its pre-maximize size, as on the desktop (`terminalNodeSize`).
+  const largest = largestTerminalSize(
+    nodes.map((n) => ({ kind: n.kind, size: n.premaxRect ?? n.size }))
+  )
+  if (!largest) return fallback
+  return {
+    width: clamp(largest.width, 280, 2400, fallback.width),
+    height: clamp(largest.height, 160, 1600, fallback.height)
   }
 }
 
@@ -1523,7 +1538,7 @@ export class HeadlessNodeFactory {
       }
 
       const settings = this.deps.settings()
-      const nodeSize = terminalSize(settings)
+      const nodeSize = terminalSize(settings, target.nodes)
       const caps = verb === 'open-agent' ? await this.deps.cliCaps() : null
       const grokCaps = verb === 'open-agent' ? await this.deps.grokCaps() : null
       const agentId = args.agent as BuiltinAgentId | undefined

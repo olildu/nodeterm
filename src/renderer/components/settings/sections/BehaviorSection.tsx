@@ -11,6 +11,7 @@ import { hintLabel } from '@shared/platform-utils'
 import { clampWheelZoomSpeed } from '@renderer/canvas/wheel-zoom'
 import { DEFAULT_WORKTREE_PATH_TEMPLATE } from '@shared/worktree'
 import { resolveTidyLayout } from '@shared/types'
+import { resolveNewNodeSize } from '@shared/new-node-size'
 
 const ROWS = {
   defaultView: {
@@ -29,6 +30,10 @@ const ROWS = {
   nodeSize: {
     title: 'Default node size',
     keywords: ['node', 'size', 'width', 'height', 'terminal', 'default']
+  },
+  matchLargest: {
+    title: 'New nodes match the largest terminal',
+    keywords: ['node', 'size', 'largest', 'biggest', 'match', 'terminal', 'new', 'default']
   },
   snap: { title: 'Snap to grid', keywords: ['snap', 'grid', 'align'] },
   autoAlign: {
@@ -183,6 +188,19 @@ export function BehaviorSection({ isActive }: { isActive: boolean }): React.JSX.
                 onChange={(v) => update({ defaultNodeHeight: v || 440 })}
               />
             </div>
+          }
+        />
+      </SearchableRow>
+      <SearchableRow {...ROWS.matchLargest}>
+        <FieldRow
+          label="New nodes match the largest terminal"
+          description="A new terminal or agent node opens at the size of the largest one on the canvas (a maximized node counts at its normal size). With none open, the default size above applies."
+          control={
+            <Switch
+              checked={resolveNewNodeSize(settings.newNodeSize) === 'matchLargest'}
+              onChange={(v) => update({ newNodeSize: v ? 'matchLargest' : 'default' })}
+              ariaLabel="New nodes match the largest terminal"
+            />
           }
         />
       </SearchableRow>

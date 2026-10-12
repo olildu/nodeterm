@@ -9,6 +9,7 @@ import type {
   Settings
 } from '@shared/types'
 import { DEFAULT_SETTINGS } from '@shared/types'
+import { largestTerminalSize, resolveNewNodeSize, type SizedNode } from '@shared/new-node-size'
 import type { AgentId, AgentPermissionMode, BuiltinAgentId } from '@shared/agents/config'
 import {
   agentConfig,
@@ -324,7 +325,9 @@ function placeNode(
 /**
  * Default size for NEW terminal/agent nodes: the user's setting (Settings → Canvas), clamped
  * to sane canvas bounds — settings.json is hand-editable, and a 0×0 or NaN node would be
- * unclickable/ungrabbable forever. Falls back to the historical 600×400.
+ * unclickable/ungrabbable forever. Falls back to the historical 600×400. With
+ * `newNodeSize: 'matchLargest'` it is instead the largest terminal/agent node on the active canvas
+ * (same clamp), and the default only when there is none.
  */
 export function terminalNodeSize(): { width: number; height: number } {
   const s = useSettings.getState().settings
@@ -332,10 +335,41 @@ export function terminalNodeSize(): { width: number; height: number } {
     const n = typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : dflt
     return Math.min(hi, Math.max(lo, n))
   }
-  return {
+  const fallback = {
     width: clamp(s.defaultNodeWidth, 280, 2400, TERMINAL_SIZE.width),
     height: clamp(s.defaultNodeHeight, 160, 1600, TERMINAL_SIZE.height)
   }
+  if (resolveNewNodeSize(s.newNodeSize) !== 'matchLargest') return fallback
+  const largest = largestTerminalSize((liveCanvasNodes?.() ?? []).map(sizedFlowNode))
+  if (!largest) return fallback
+  return {
+    width: clamp(largest.width, 280, 2400, fallback.width),
+    height: clamp(largest.height, 160, 1600, fallback.height)
+  }
+}
+
+/**
+ * The active canvas's live React Flow nodes, registered by Canvas (React Flow is the single live
+ * source of truth, so there is no store to read). `null` = no canvas mounted, which sizes new nodes
+ * by the default. Only `terminalNodeSize` reads it, for `newNodeSize: 'matchLargest'`.
+ */
+let liveCanvasNodes: (() => readonly CanvasNode[]) | null = null
+
+export function setLiveCanvasNodesSource(source: (() => readonly CanvasNode[]) | null): void {
+  liveCanvasNodes = source
+}
+
+/** A live node's NORMAL size: a maximized node's pre-maximize rect, a collapsed node's expanded
+ *  height — so neither a viewport-filling node nor a collapsed strip sets the size of new ones. */
+function sizedFlowNode(n: CanvasNode): SizedNode {
+  const kind: NodeKind = (n.type as NodeKind) ?? 'terminal'
+  const premax = n.data.premaxRect
+  if (premax) return { kind, size: { width: premax.width, height: premax.height } }
+  const width = n.measured?.width ?? n.width ?? NaN
+  const height = n.data.collapsed
+    ? n.data.expandedHeight ?? NaN
+    : n.measured?.height ?? n.height ?? NaN
+  return { kind, size: { width, height } }
 }
 
 /**
