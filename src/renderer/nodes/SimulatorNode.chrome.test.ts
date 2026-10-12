@@ -77,3 +77,24 @@ describe('motion and colour discipline', () => {
     expect(noComments).toContain('var(--state-working)')
   })
 })
+
+describe('platform switch (iOS simulator / Android emulator)', () => {
+  it('takes its header buttons from the platform table, not a fixed iPhone list', () => {
+    expect(tsx).toContain('PLATFORM_BUTTONS[platform].map')
+    expect(tsx).not.toMatch(/const BUTTONS\b/)
+  })
+  it('sizes and rounds the screen from the reported device and the platform, never iPhone constants', () => {
+    expect(tsx).toContain('fallbackDeviceBox(platform)')
+    expect(tsx).toContain('screenCornerFraction(platform, deviceBox)')
+    expect(tsx).not.toMatch(/393|852/)
+    expect(tsx).not.toContain('cornerRadiusFraction(')
+  })
+  it('sends the iOS edge flag only through the platform rule', () => {
+    expect(tsx).toContain('touchEdge(platform, p, deviceBox)')
+    expect(tsx).not.toContain('edgeFor(')
+  })
+  it('builds the picker from the sectioned rows and says what a boot is doing', () => {
+    expect(tsx).toContain('pickerRows({ devices, current: udid, error, availability })')
+    expect(tsx).toContain('bootingTitle(platform)')
+  })
+})

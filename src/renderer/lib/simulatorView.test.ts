@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { SimAvailability, SimDeviceInfo, SimStatus } from '@shared/sim'
-import { desiredStreamScale, simPickerRows, simView, simulatorUnavailableReason, viewLevel } from './simulatorView'
+import { desiredStreamScale, simView, simulatorUnavailableReason, viewLevel } from './simulatorView'
 
 const UDID = 'AE342EEF-B624-4060-B9E6-AE6E9EAAC24A'
 const OK: SimAvailability = { ok: true }
@@ -41,6 +41,25 @@ describe('simView', () => {
       action: 'boot',
       detail: expect.stringContaining('iPhone 15')
     })
+  })
+  it('says a boot is in progress instead of a bare "Connecting…", per platform', () => {
+    expect(view({ phase: 'connecting', device: device({ state: 'Booting', ready: false }) })).toMatchObject({
+      kind: 'connecting',
+      title: 'Booting simulator…',
+      action: null
+    })
+    const avd = 'android:Nexus_7'
+    expect(view({ phase: 'connecting', device: device({ udid: avd, platform: 'android', state: 'Booting', ready: false }) }, avd)).toMatchObject({
+      kind: 'connecting',
+      title: 'Booting emulator…',
+      detail: expect.stringContaining('20 seconds')
+    })
+    // A plain connect (no boot) still reads as one.
+    expect(view({ phase: 'connecting', device: device({ state: 'Booted', ready: false }) })).toMatchObject({ title: 'Connecting…' })
+  })
+  it('calls an Android device an emulator when it is shut down', () => {
+    expect(view({ phase: 'shutdown' }, 'android:Nexus_7')).toMatchObject({ detail: 'This emulator is not running.' })
+    expect(view({ phase: 'shutdown' })).toMatchObject({ detail: 'This simulator is not running.' })
   })
   it('offers Reconnect after a crash or a refused attach', () => {
     for (const code of ['helper-exited', 'spawn-failed', 'already-attached', 'stream-failed'] as const) {
@@ -106,23 +125,6 @@ describe('simulatorUnavailableReason', () => {
       expect(r).not.toMatch(/this Mac/i)
     }
     expect(new Set(reasons).size).toBe(3)
-  })
-})
-
-describe('simPickerRows', () => {
-  const ios = { udid: 'AE342EEF-B624-4060-B9E6-AE6E9EAAC24A', name: 'iPhone 15', runtime: 'iOS 26.5', booted: false, platform: 'ios' as const }
-  const pixel = { udid: 'android:Pixel_6', name: 'Pixel 6', runtime: 'Android 14', booted: false, platform: 'android' as const }
-  const n7 = { udid: 'android:Nexus_7', name: 'Nexus 7', runtime: 'Android 11', booted: true }
-  it('groups by platform under headers only when both are present, booted first, current ticked', () => {
-    expect(simPickerRows([pixel, ios, n7], 'android:Pixel_6').map((r) => r.label)).toEqual([
-      'iOS simulators',
-      'iPhone 15 · iOS 26.5',
-      'Android emulators',
-      'Nexus 7 · Android 11 · running',
-      '✓ Pixel 6 · Android 14'
-    ])
-    expect(simPickerRows([ios], undefined).map((r) => r.kind)).toEqual(['device'])
-    expect(simPickerRows([], undefined)).toEqual([])
   })
 })
 

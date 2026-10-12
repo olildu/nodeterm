@@ -18199,7 +18199,7 @@ export function Canvas() {
       // The palette has no disabled state, so an unavailable row is omitted (like New file…).
       ...(simulatorUnavailable
         ? []
-        : [{ id: 'new-simulator', label: 'New simulator', icon: <IconSimulator />, run: () => addSimulator() }]),
+        : [{ id: 'new-simulator', label: 'New simulator / emulator', icon: <IconSimulator />, run: () => addSimulator() }]),
       { id: 'open-file', label: 'Open file…', icon: <IconEditor />, run: () => void openFileDialog() },
       // "New file…" needs a project folder to create into — hidden when the project has no cwd.
       ...(newFileHasCwd

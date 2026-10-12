@@ -127,7 +127,7 @@ export interface AddHandlers {
   sticky: (at?: AddPos) => void
   files: (at?: AddPos) => void
   dino: (at?: AddPos) => void
-  /** Adds a simulator node: the host's iOS Simulator drawn inside the canvas (desktop, macOS). */
+  /** Adds a simulator node: an iOS Simulator or Android emulator of this host, drawn inside the canvas (desktop, macOS). */
   simulator: (at?: AddPos) => void
   /** Adds a trigger node (issue #493) — a canvas-owned schedule that fires into another node. */
   trigger: (at?: AddPos) => void
@@ -223,7 +223,7 @@ export function contentAddItemsToMenuItems(
         break
       case 'simulator':
         out.push({
-          label: 'New simulator',
+          label: 'New simulator / emulator',
           icon: <IconSimulator />,
           disabled: !!ctx.simulatorUnavailable,
           hint: ctx.simulatorUnavailable,
@@ -340,7 +340,7 @@ export function contentAddItemsToDockRows(
       case 'simulator':
         out.push({
           kind: 'simulator',
-          label: 'Simulator',
+          label: 'Simulator / emulator',
           icon: <IconSimulator />,
           disabled: !!ctx.simulatorUnavailable,
           hint: ctx.simulatorUnavailable,

@@ -61,13 +61,13 @@ describe('Simulator row', () => {
   const reason = 'Simulators run in the desktop app on macOS'
   it('is offered, enabled, by default — the node explains a missing helper itself', () => {
     const [row] = contentAddItemsToMenuItems([{ kind: 'simulator' }], handlers(), { hasCwd: false, isSshProject: false })
-    expect(row).toMatchObject({ label: 'New simulator' })
+    expect(row).toMatchObject({ label: 'New simulator / emulator' })
     expect((row as { disabled?: boolean }).disabled).toBeFalsy()
   })
   it('is disabled with its reason on the menu and the Dock alike (browser tab, team tab, not macOS)', () => {
     const ctx = { hasCwd: true, isSshProject: false, simulatorUnavailable: reason }
     const [row] = contentAddItemsToMenuItems([{ kind: 'simulator' }], handlers(), ctx)
-    expect(row).toMatchObject({ label: 'New simulator', disabled: true, hint: reason })
+    expect(row).toMatchObject({ label: 'New simulator / emulator', disabled: true, hint: reason })
     const [dock] = contentAddItemsToDockRows([{ kind: 'simulator' }], handlers(), ctx)
     expect(dock).toMatchObject({ kind: 'simulator', disabled: true, hint: reason })
   })
@@ -115,7 +115,7 @@ describe('contentAddItemsToMenuItems', () => {
       'New sticky note',
       'New file manager',
       'New dino game',
-      'New simulator',
+      'New simulator / emulator',
       'New trigger…',
       'Open file…',
       'New file…',
@@ -349,7 +349,7 @@ describe('buildGroupedAddMenu', () => {
       'New sticky note',
       'New file manager',
       'New dino game',
-      'New simulator'
+      'New simulator / emulator'
     ])
     expect(children(ADD_GROUP_LABEL.files)).toEqual(['Open file…', 'New file…'])
     expect(children(ADD_GROUP_LABEL.orchestrate)).toEqual([

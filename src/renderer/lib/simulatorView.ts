@@ -1,8 +1,9 @@
+import { bootingTitle, deviceTerm } from './simPlatform'
 import {
+  simPlatformOf,
   SIM_SCALE_DEFAULT,
   SIM_SCALE_MIN,
   type SimAvailability,
-  type SimDeviceEntry,
   type SimErrorCode,
   type SimStatus,
   type SimViewLevel
@@ -100,10 +101,22 @@ export function simView(input: {
         kind: 'shutdown',
         title: 'Device shut down',
         // A failed boot (android-helper's boot-failed) says why; Boot is still the way forward.
-        detail: status.error?.message ?? `${status.device?.name ?? 'This simulator'} is not running.`,
+        detail: status.error?.message ?? `${status.device?.name ?? `This ${deviceTerm(simPlatformOf(udid))}`} is not running.`,
         action: 'boot'
       }
     case 'connecting':
+      // A boot in progress says so: an Android cold boot takes ~20 s, and "Connecting…" for that
+      // long reads as a hang.
+      if (status.device?.state === 'Booting') {
+        const android = simPlatformOf(udid) === 'android'
+        return {
+          kind: 'connecting',
+          title: bootingTitle(simPlatformOf(udid)),
+          ...(android ? { detail: 'A cold boot takes about 20 seconds.' } : {}),
+          action: null,
+          ...(status.error ? { notice: status.error.message } : {})
+        }
+      }
       return {
         kind: 'connecting',
         title: 'Connecting…',
@@ -121,30 +134,6 @@ export function simView(input: {
       }
     }
   }
-}
-
-export type SimPickerRow = { kind: 'header'; label: string } | { kind: 'device'; label: string; device: SimDeviceEntry }
-
-/**
- * The device picker's rows: iOS simulators, then Android emulators, each platform under its own
- * header when both are present, booted devices first within a platform. The current device is
- * ticked. Empty = one disabled row saying so (`error` when the listing failed).
- */
-export function simPickerRows(devices: readonly SimDeviceEntry[], current: string | undefined): SimPickerRow[] {
-  const platformOf = (d: SimDeviceEntry): 'ios' | 'android' => d.platform ?? (d.udid.startsWith('android:') ? 'android' : 'ios')
-  const groups: Array<{ label: string; list: SimDeviceEntry[] }> = [
-    { label: 'iOS simulators', list: devices.filter((d) => platformOf(d) === 'ios') },
-    { label: 'Android emulators', list: devices.filter((d) => platformOf(d) === 'android') }
-  ].filter((g) => g.list.length > 0)
-  const rows: SimPickerRow[] = []
-  for (const g of groups) {
-    if (groups.length > 1) rows.push({ kind: 'header', label: g.label })
-    const sorted = [...g.list].sort((a, b) => Number(b.booted) - Number(a.booted))
-    for (const d of sorted) {
-      rows.push({ kind: 'device', device: d, label: `${d.udid === current ? '✓ ' : ''}${d.name} · ${d.runtime}${d.booted ? ' · running' : ''}` })
-    }
-  }
-  return rows
 }
 
 /**
@@ -172,8 +161,8 @@ export function desiredStreamScale(cssWidth: number, dpr: number, devicePixelWid
 
 /** Why the Add rows are disabled, or undefined when a simulator node can be added. */
 export function simulatorUnavailableReason(input: { browser: boolean; relay: boolean; mac: boolean }): string | undefined {
-  if (input.browser) return 'Simulators run in the desktop app on macOS — not in a browser tab'
+  if (input.browser) return 'Simulators and emulators run in the desktop app on macOS — not in a browser tab'
   if (input.relay) return 'A team tab shows the host’s canvas — add the simulator on the host'
-  if (!input.mac) return 'The iOS Simulator needs macOS with Xcode'
+  if (!input.mac) return 'Simulator and emulator nodes run in the desktop app on macOS'
   return undefined
 }

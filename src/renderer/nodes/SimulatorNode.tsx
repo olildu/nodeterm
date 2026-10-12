@@ -1,11 +1,13 @@
 /**
- * The simulator node: the host's iOS Simulator, drawn and driven inside a canvas node, with
- * Simulator.app never opened.
+ * The simulator node: the host's iOS Simulator or an Android emulator (AVD), drawn and driven
+ * inside a canvas node, with Simulator.app / the emulator window never opened.
  *
- * The pixels come from `sim-helper` (core/sim) as JPEG frames pushed over a per-device channel and
+ * The pixels come from `sim-helper` / `android-helper` (core/sim) as JPEG frames pushed over a per-device channel and
  * drawn to a <canvas>; input goes back as touches in device POINTS. All the decisions live in pure
  * modules — `lib/simulatorView` (what to show), `lib/simPointer` (geometry), `lib/simKeyboard`
- * (keys), `lib/simFramePump` (newest-frame decoding) — so this file is wiring.
+ * (keys), `lib/simFramePump` (newest-frame decoding), `lib/simPlatform` (what differs between iOS
+ * and Android: header buttons, frame shape, the edge flag, the picker sections) — so this file is
+ * wiring. Nothing here may assume an iPhone: the shape comes from the device's reported size.
  *
  * **Who may drive it: the hover guard, exactly like a terminal.** A touch surface and a canvas both
  * answer to a drag, so the body is covered by the same `HoverGuard` a terminal uses until the user
@@ -40,10 +42,10 @@ import { useEdgeAnchorInsets } from '../state/edgeAnchorInsets'
 import {
   normalizeSimUdid,
   parseSimFrame,
-  simPlatformOf,
   type SimAvailability,
   type SimButton,
   type SimDeviceEntry,
+  type SimPlatform,
   type SimStatus,
   type SimViewOptions
 } from '@shared/sim'
@@ -61,12 +63,10 @@ import {
   pointerLeaveRearmsGuard,
   resolveFocusFollowsPointer
 } from '../lib/terminalFocusMode'
-import { desiredStreamScale, simPickerRows, simView, viewLevel } from '../lib/simulatorView'
+import { desiredStreamScale, simView, viewLevel } from '../lib/simulatorView'
 import {
   clientToDevice,
-  cornerRadiusFraction,
   createMoveThrottle,
-  edgeFor,
   fitScreen,
   pinchFor,
   wheelSwipe,
@@ -74,6 +74,16 @@ import {
   type Point
 } from '../lib/simPointer'
 import { mapKeyEvent, textFromInput } from '../lib/simKeyboard'
+import {
+  PLATFORM_BUTTONS,
+  bootingTitle,
+  deviceTerm,
+  fallbackDeviceBox,
+  nodePlatform,
+  pickerRows,
+  screenCornerFraction,
+  touchEdge
+} from '../lib/simPlatform'
 import { createFramePump } from '../lib/simFramePump'
 import {
   SIM_BORDER_TOP,
@@ -87,8 +97,6 @@ import {
   rootBox
 } from '../lib/simNodeChrome'
 
-/** Layout fallback until the device reports its size (an iPhone 15, the common case). */
-const FALLBACK_DEVICE: Box = { width: 393, height: 852 }
 /** Wheel deltas are gathered this long, then sent as ONE swipe (a swipe occupies the input queue). */
 const WHEEL_GATHER_MS = 70
 const WHEEL_SWIPE_MS = 140
@@ -97,68 +105,54 @@ const FLASH_MS = 3500
 const ICON = { width: 13, height: 13, viewBox: '0 0 16 16', 'aria-hidden': true } as const
 const stroke = { stroke: 'currentColor', strokeWidth: 1.5, fill: 'none', strokeLinecap: 'round', strokeLinejoin: 'round' } as const
 
-/** Hardware buttons in the header, in the order the design shows them. */
-const IOS_BUTTONS: Array<{ name: SimButton; title: string; icon: JSX.Element }> = [
-  { name: 'home', title: 'Home', icon: <svg {...ICON}><rect x="3" y="3" width="10" height="10" rx="3" {...stroke} /></svg> },
-  {
-    name: 'lock',
-    title: 'Lock',
-    icon: (
-      <svg {...ICON}>
-        <rect x="3.5" y="7" width="9" height="6.5" rx="1.5" {...stroke} />
-        <path d="M5.5 7V5a2.5 2.5 0 015 0v2" {...stroke} />
-      </svg>
-    )
-  },
-  {
-    name: 'voldown',
-    title: 'Volume down',
-    icon: (
-      <svg {...ICON}>
-        <path d="M2.5 6h2.5l3-2.5v9L5 10H2.5z" {...stroke} strokeWidth={1.4} />
-        <path d="M10 8h3.5" {...stroke} />
-      </svg>
-    )
-  },
-  {
-    name: 'volup',
-    title: 'Volume up',
-    icon: (
-      <svg {...ICON}>
-        <path d="M2.5 6h2.5l3-2.5v9L5 10H2.5z" {...stroke} strokeWidth={1.4} />
-        <path d="M11.75 6v4M9.75 8h4" {...stroke} />
-      </svg>
-    )
-  },
-  {
-    name: 'siri',
-    title: 'Siri',
-    icon: (
-      <svg {...ICON}>
-        <rect x="5.5" y="2" width="5" height="8" rx="2.5" {...stroke} />
-        <path d="M3.5 8a4.5 4.5 0 009 0M8 12.5V14" {...stroke} />
-      </svg>
-    )
+const VOLUME = <path d="M2.5 6h2.5l3-2.5v9L5 10H2.5z" {...stroke} strokeWidth={1.4} />
+
+/**
+ * Header button icons. Which buttons a node shows, and in what order, is the platform's
+ * (`PLATFORM_BUTTONS`); this is only how each one looks. Android's home is the navigation bar's
+ * circle, iOS's the rounded square it always was.
+ */
+function buttonIcon(name: SimButton, platform: SimPlatform): JSX.Element {
+  switch (name) {
+    case 'home':
+      return platform === 'android' ? (
+        <svg {...ICON}><circle cx="8" cy="8" r="4.75" {...stroke} /></svg>
+      ) : (
+        <svg {...ICON}><rect x="3" y="3" width="10" height="10" rx="3" {...stroke} /></svg>
+      )
+    case 'back':
+      return <svg {...ICON}><path d="M11 3.5L5 8l6 4.5z" {...stroke} /></svg>
+    case 'recents':
+      return <svg {...ICON}><rect x="3.75" y="3.75" width="8.5" height="8.5" rx="1" {...stroke} /></svg>
+    case 'power':
+      return (
+        <svg {...ICON}>
+          <path d="M8 2.5v5" {...stroke} />
+          <path d="M5 4.5a4.75 4.75 0 106 0" {...stroke} />
+        </svg>
+      )
+    case 'lock':
+      return (
+        <svg {...ICON}>
+          <rect x="3.5" y="7" width="9" height="6.5" rx="1.5" {...stroke} />
+          <path d="M5.5 7V5a2.5 2.5 0 015 0v2" {...stroke} />
+        </svg>
+      )
+    case 'voldown':
+      return <svg {...ICON}>{VOLUME}<path d="M10 8h3.5" {...stroke} /></svg>
+    case 'volup':
+      return <svg {...ICON}>{VOLUME}<path d="M11.75 6v4M9.75 8h4" {...stroke} /></svg>
+    case 'siri':
+      return (
+        <svg {...ICON}>
+          <rect x="5.5" y="2" width="5" height="8" rx="2.5" {...stroke} />
+          <path d="M3.5 8a4.5 4.5 0 009 0M8 12.5V14" {...stroke} />
+        </svg>
+      )
+    default:
+      return <svg {...ICON}><circle cx="8" cy="8" r="2" fill="currentColor" /></svg>
   }
-]
-const VOLUME_BUTTONS = IOS_BUTTONS.filter((b) => b.name === 'voldown' || b.name === 'volup')
-/** Android's navigation bar (back, home, recents) and its power + volume keys. */
-const ANDROID_BUTTONS: Array<{ name: SimButton; title: string; icon: JSX.Element }> = [
-  { name: 'back', title: 'Back', icon: <svg {...ICON}><path d="M11 3L5 8l6 5z" {...stroke} /></svg> },
-  { name: 'home', title: 'Home', icon: <svg {...ICON}><circle cx="8" cy="8" r="4.5" {...stroke} /></svg> },
-  { name: 'recents', title: 'Recent apps', icon: <svg {...ICON}><rect x="4" y="4" width="8" height="8" rx="1" {...stroke} /></svg> },
-  {
-    name: 'power',
-    title: 'Power',
-    icon: (
-      <svg {...ICON}>
-        <path d="M8 2.5V7.5" {...stroke} />
-        <path d="M5 4.5a4.5 4.5 0 106 0" {...stroke} />
-      </svg>
-    )
-  },
-  ...VOLUME_BUTTONS
-]
+}
 const SHOT_ICON = (
   <svg {...ICON}>
     <path d="M2.5 5.5V4a1.5 1.5 0 011.5-1.5h1.5M10.5 2.5H12A1.5 1.5 0 0113.5 4v1.5M13.5 10.5V12a1.5 1.5 0 01-1.5 1.5h-1.5M5.5 13.5H4A1.5 1.5 0 012.5 12v-1.5" {...stroke} />
@@ -180,8 +174,6 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
   const sim = api.sim
 
   const udid = useMemo(() => normalizeSimUdid(data.simUdid), [data.simUdid])
-  const platform = udid ? simPlatformOf(udid) : 'ios'
-  const buttons = platform === 'android' ? ANDROID_BUTTONS : IOS_BUTTONS
   const collapsed = !!data.collapsed
   const focusFollowsPointer = resolveFocusFollowsPointer(
     useSettings((s) => s.settings.terminalFocusFollowsPointer)
@@ -259,10 +251,12 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
   }, [collapsed])
 
   const device = status?.device
+  const platform = nodePlatform(udid, device)
+  const term = deviceTerm(platform)
   const deviceBox: Box =
     device && device.pointWidth > 0 && device.pointHeight > 0
       ? { width: device.pointWidth, height: device.pointHeight }
-      : FALLBACK_DEVICE
+      : fallbackDeviceBox(platform)
   const screenBox = useMemo(() => fitScreen(bodySize, deviceBox), [bodySize, deviceBox.width, deviceBox.height]) // eslint-disable-line react-hooks/exhaustive-deps
   const dpr = typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1
   const scale = desiredStreamScale(screenBox.width * zoom, dpr, device?.pixelWidth ?? 0)
@@ -318,9 +312,11 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
 
   // A Reconnect or a different device is a new session: a booting flag from the last one is stale.
   useEffect(() => setBooting(false), [udid, attachNonce])
+  // A boot we asked for stays "Booting…" through the helper's connecting phase (an Android cold boot
+  // is ~20 s of it) and ends when the device is live, the helper failed, or the boot itself did.
   useEffect(() => {
-    if (status?.phase === 'connecting' || status?.phase === 'live') setBooting(false)
-  }, [status?.phase])
+    if (status?.phase === 'live' || status?.phase === 'error' || status?.error?.code === 'boot-failed') setBooting(false)
+  }, [status?.phase, status?.error?.code])
 
   const flashRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const say = useCallback((text: string) => {
@@ -373,7 +369,9 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
     keysRef.current?.focus({ preventScroll: true })
     if (e.altKey) return // a pinch is decided on release
     throttle.reset()
-    sim.input(udid, { cmd: 'touch', phase: 'down', x: p.x, y: p.y, ...(edgeFor(p, deviceBox) ? { edge: edgeFor(p, deviceBox) } : {}) })
+    // The edge flag is the iOS helper's (the home-indicator swipe); Android reads raw edge touches.
+    const edge = touchEdge(platform, p, deviceBox)
+    sim.input(udid, { cmd: 'touch', phase: 'down', x: p.x, y: p.y, ...(edge ? { edge } : {}) })
   }
   const onPointerMove = (e: React.PointerEvent<HTMLDivElement>): void => {
     const t = touch.current
@@ -484,23 +482,21 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
       let error = ''
       try {
         const res = await sim.devices()
-        devices = res.devices
+        devices = Array.isArray(res.devices) ? res.devices : []
         error = res.error ?? ''
       } catch {
-        error = 'Could not list simulators.'
+        error = 'Could not list devices.'
       }
-      const rows = simPickerRows(devices, udid)
-      const items: MenuItem[] =
-        rows.length === 0
-          ? [{ label: error || 'No simulators or emulators found', onClick: () => undefined, disabled: true }]
-          : rows.map((r) =>
-              r.kind === 'header'
-                ? { label: r.label, onClick: () => undefined, disabled: true }
-                : { label: r.label, onClick: () => pickDevice(r.device) }
-            )
+      const items: MenuItem[] = pickerRows({ devices, current: udid, error, availability }).map((row) =>
+        row.kind === 'label'
+          ? { type: 'label', label: row.label }
+          : row.kind === 'empty'
+            ? { label: row.label, onClick: () => undefined, disabled: true }
+            : { label: row.label, onClick: () => pickDevice(row.device) }
+      )
       setMenu({ x: r.left, y: r.bottom + 4, items })
     },
-    [sim, udid, pickDevice]
+    [sim, udid, pickDevice, availability]
   )
   const boot = async (): Promise<void> => {
     if (!udid || booting) return
@@ -524,7 +520,7 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
     // Saved where a pasted screenshot is (the swept upload area), and the PATH goes to the
     // clipboard — the same hand-off a screenshot paste into a terminal makes, which is what an agent
     // can read. Nothing lands in the project folder: a screenshot is not repository content.
-    const name = `simulator-${new Date().toISOString().replace(/[:.]/g, '-')}.png`
+    const name = `${term}-${new Date().toISOString().replace(/[:.]/g, '-')}.png`
     const saved = await api.files.saveUpload(name, bytesToBase64(shot.data)).catch(() => null)
     if (!saved) {
       say('Could not save the screenshot.')
@@ -541,7 +537,7 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
     ? ((getNode(driving.ownerNodeId)?.data.title as string | undefined) || 'An agent')
     : ''
   const dot = isLive ? 'live' : view.kind === 'connecting' ? 'wait' : view.kind === 'error' ? 'error' : 'off'
-  const radius = screenBox.width * cornerRadiusFraction(deviceBox, platform)
+  const radius = screenBox.width * screenCornerFraction(platform, deviceBox)
 
   // ─── chrome: open while the user works in it or the node needs them, else folded into the phone ──
   const pinned = chromePinnedOpen({
@@ -654,7 +650,7 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
               setEditingTitle(true)
             }}
           >
-            {(data.title as string) || 'Simulator'}
+            {(data.title as string) || (platform === 'android' ? 'Emulator' : 'Simulator')}
           </span>
         )}
         <button
@@ -670,7 +666,7 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
           </svg>
         </button>
         {!editingTitle && <span className="term-node__spacer" />}
-        {buttons.map((b) => (
+        {PLATFORM_BUTTONS[platform].map((b) => (
           <button
             key={b.name}
             className="term-node__refresh sim-node__tool nodrag"
@@ -679,7 +675,7 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
             disabled={!isLive}
             onClick={() => press(b.name)}
           >
-            {b.icon}
+            {buttonIcon(b.name, platform)}
           </button>
         ))}
         <button
@@ -759,7 +755,10 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
           {!isLive && (
             <div className="sim-node__overlay">
               <div className="sim-node__card">
-                <div className="sim-node__card-title">{booting ? 'Booting…' : view.title}</div>
+                <div className="sim-node__card-title">{booting ? bootingTitle(platform) : view.title}</div>
+                {booting && platform === 'android' && (
+                  <div className="sim-node__card-detail">A cold boot takes about 20 seconds.</div>
+                )}
                 {view.detail && !booting && <div className="sim-node__card-detail">{view.detail}</div>}
                 {view.action === 'pick' && (
                   <button className="sim-node__action nodrag" onClick={(e) => void openPicker(e.currentTarget)}>
@@ -789,7 +788,7 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
           <textarea
             ref={keysRef}
             className="sim-node__keys nokey"
-            aria-label="Simulator keyboard input"
+            aria-label={`${platform === 'android' ? 'Emulator' : 'Simulator'} keyboard input`}
             spellCheck={false}
             autoCapitalize="off"
             autoCorrect="off"
