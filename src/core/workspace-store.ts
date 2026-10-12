@@ -2302,6 +2302,24 @@ export class WorkspaceStore {
   }
 
   /**
+   * The folder a LOCAL project lives in (a folder ref's `cwd`, an inline project's own `cwd` if it
+   * has one) — undefined for an SSH project (that folder is on the host) and for a cwd-less canvas.
+   * The `sim` verb jails `--screenshot` to it. Same three-entry-kind scan and id semantics as
+   * `projectMetaFor`.
+   */
+  projectCwdFor(projectId: string): string | undefined {
+    if (!projectId) return undefined
+    for (const e of this.index?.entries ?? []) {
+      if (e.project) {
+        if (e.project.id === projectId) return e.project.ssh ? undefined : e.project.cwd || undefined
+        continue
+      }
+      if (e.id === projectId) return e.ssh ? undefined : e.cwd || undefined
+    }
+    return undefined
+  }
+
+  /**
    * The capability view of one project, for `projectCapabilityGrantedFor`: the STRICT capability
    * flags from the shared file (`readProjectCapabilities` — literal `true`, known keys only) plus
    * this machine's recorded answers from the INDEX ENTRY. Same three-entry-kind scan and same id

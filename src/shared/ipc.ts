@@ -391,6 +391,27 @@ export const IPC = {
   runStop: 'run:stop',
   runSignal: 'run:signal',
   runWatch: 'run:watch',
+  // Simulator node (core/sim/): the iOS Simulator drawn and driven inside a canvas node. Every
+  // channel starts with `sim:`, which HOST_ONLY_CHANNEL_PREFIXES covers — a relay peer must never
+  // drive the host's simulator. Per-device push channels are the two functions below.
+  simAvailability: 'sim:availability',
+  simDevices: 'sim:devices',
+  simAttach: 'sim:attach',
+  simDetach: 'sim:detach',
+  simView: 'sim:view',
+  simBoot: 'sim:boot',
+  simCommand: 'sim:command',
+  simScreenshot: 'sim:screenshot',
+  simInput: 'sim:input',
+  simFrameAck: 'sim:frame-ack',
+  // Main → renderer: what an agent's `sim` call did that the canvas shows (a driving highlight, a
+  // link to create). Renderer → main: the user removed an agent↔device link (the auto-link ledger
+  // then never re-creates it this run). Both are `sim:`, so host-only.
+  simAgentEvent: 'sim:agent-event',
+  simLinkRemoved: 'sim:link-removed',
+  /** Binary JPEG frames (a Uint8Array: `u64 µs | u16 w | u16 h | JPEG`) for one device, to every window watching it. */
+  simFrame: (udid: string) => `sim:frame:${udid}`,
+  simStatus: (udid: string) => `sim:status:${udid}`,
   // Trigger nodes (issue #493): machine-local arm/disarm + the card's status/run-now.
   triggersArm: 'triggers:arm',
   triggersDisarm: 'triggers:disarm',

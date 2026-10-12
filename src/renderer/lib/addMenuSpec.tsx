@@ -35,6 +35,7 @@ import {
   IconBranch,
   IconCanvasView,
   IconDino,
+  IconSimulator,
   IconEditor,
   IconExplorer,
   IconGroup,
@@ -63,6 +64,7 @@ export type AddItem =
   | { kind: 'sticky' }
   | { kind: 'files' } // requiresCwd
   | { kind: 'dino' }
+  | { kind: 'simulator' } // disabled unless the desktop app on macOS
   | { kind: 'trigger' }
   | { kind: 'open-file' }
   | { kind: 'new-file' } // requiresCwd
@@ -85,6 +87,7 @@ export const CONTENT_ADD_ITEMS: readonly AddItem[] = [
   { kind: 'sticky' },
   { kind: 'files' },
   { kind: 'dino' },
+  { kind: 'simulator' },
   { kind: 'trigger' },
   { kind: 'open-file' },
   { kind: 'new-file' },
@@ -98,6 +101,12 @@ export interface AddCtx {
   hasCwd: boolean
   /** Whether the active project is an SSH project. Disables "New worktree…". */
   isSshProject: boolean
+  /**
+   * Why a simulator node cannot be added here (browser tab, team tab, not macOS), or undefined when
+   * it can. Optional so a surface that has not been taught about simulators offers the row as
+   * available — the node explains itself if the helper turns out to be missing.
+   */
+  simulatorUnavailable?: string
 }
 
 /**
@@ -118,6 +127,8 @@ export interface AddHandlers {
   sticky: (at?: AddPos) => void
   files: (at?: AddPos) => void
   dino: (at?: AddPos) => void
+  /** Adds a simulator node: the host's iOS Simulator drawn inside the canvas (desktop, macOS). */
+  simulator: (at?: AddPos) => void
   /** Adds a trigger node (issue #493) — a canvas-owned schedule that fires into another node. */
   trigger: (at?: AddPos) => void
   openFile: (at?: AddPos) => void
@@ -209,6 +220,15 @@ export function contentAddItemsToMenuItems(
         break
       case 'dino':
         out.push({ label: 'New dino game', icon: <IconDino />, onClick: () => handlers.dino(at) })
+        break
+      case 'simulator':
+        out.push({
+          label: 'New simulator',
+          icon: <IconSimulator />,
+          disabled: !!ctx.simulatorUnavailable,
+          hint: ctx.simulatorUnavailable,
+          onClick: () => handlers.simulator(at)
+        })
         break
       case 'trigger':
         out.push({ label: 'New trigger…', icon: <IconBellFilled />, onClick: () => handlers.trigger(at) })
@@ -317,6 +337,16 @@ export function contentAddItemsToDockRows(
       case 'dino':
         out.push({ kind: 'dino', label: 'Dino Game', icon: <IconDino />, onClick: () => handlers.dino() })
         break
+      case 'simulator':
+        out.push({
+          kind: 'simulator',
+          label: 'Simulator',
+          icon: <IconSimulator />,
+          disabled: !!ctx.simulatorUnavailable,
+          hint: ctx.simulatorUnavailable,
+          onClick: () => handlers.simulator()
+        })
+        break
       case 'trigger':
         out.push({ kind: 'trigger', label: 'Trigger', icon: <IconBellFilled />, onClick: () => handlers.trigger() })
         break
@@ -392,6 +422,7 @@ export const ADD_ITEM_GROUP: Record<AddItem['kind'], AddGroupId> = {
   sticky: 'view',
   files: 'view',
   dino: 'view',
+  simulator: 'view',
   'open-file': 'files',
   'new-file': 'files',
   'spawn-team': 'orchestrate',

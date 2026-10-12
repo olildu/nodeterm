@@ -57,3 +57,49 @@ describe('buildBackgroundLinkMaps direction', () => {
     expect(Object.keys(map).sort()).toEqual(['a', 'c', 'd'])
   })
 })
+
+describe('a Simulator node in the link map', () => {
+  const sim = { udid: 'AE342EEF-B624-4060-B9E6-AE6E9EAAC24A', name: 'iPhone 15' }
+  const infoWithSim = (id: string): LinkNodeInfo =>
+    id === 'dev' ? { id, title: 'Phone', sticky: false, simulator: sim } : { id, title: id.toUpperCase(), cwd: `/w/${id}`, sticky: false, agentId: 'claude' }
+
+  it('the AGENT gets a simulator entry (no transcript fields); the device gets nothing — it cannot read', () => {
+    const map = buildLinkMap([{ source: 'dev', target: 'a' }], infoWithSim)
+    expect(map).toEqual({ a: [{ id: 'dev', title: 'Phone', simulator: sim }] })
+    expect(map.dev).toBeUndefined()
+  })
+  it('still maps the entry when the stored direction is agent → device', () => {
+    expect(buildLinkMap([{ source: 'a', target: 'dev' }], infoWithSim)).toEqual({
+      a: [{ id: 'dev', title: 'Phone', simulator: sim }]
+    })
+  })
+  it('two passive nodes (a device and a note) never link', () => {
+    const map = buildLinkMap([{ source: 'dev', target: 'sn' }], (id) =>
+      id === 'dev' ? infoWithSim('dev') : { id, title: 'N', sticky: true, note: 'x' }
+    )
+    expect(map).toEqual({})
+  })
+  it('a device link beside a context link does not disturb it', () => {
+    const map = buildLinkMap(
+      [
+        { source: 'dev', target: 'a' },
+        { source: 'a', target: 'b' }
+      ],
+      infoWithSim
+    )
+    expect(map.a?.map((e) => e.id)).toEqual(['dev', 'b'])
+    expect(map.b?.map((e) => e.id)).toEqual(['a'])
+  })
+  it('background projects build it from the serialized node (udid + name, no agent, no account)', () => {
+    const nodes = [
+      { id: 'dev', kind: 'simulator', title: 'Phone', simUdid: sim.udid, simName: sim.name, accountId: 'x' },
+      { id: 'a', kind: 'terminal', title: 'A', agentId: 'claude' }
+    ] as unknown as CanvasNodeState[]
+    const map = buildBackgroundLinkMaps(
+      [{ id: 'p', nodes, bridges: [{ id: 'b1', source: 'dev', target: 'a' }] }],
+      null,
+      () => 's1'
+    )
+    expect(map.a).toEqual([{ id: 'dev', title: 'Phone', simulator: sim }])
+  })
+})

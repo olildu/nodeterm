@@ -708,3 +708,10 @@ only exercises the HTTP/auth surface). With `npm run server:dev` running:
     parent node; click it to watch its live transcript stream.
 13. **Context meter (Phase 3b)** — as a Claude session accumulates transcript, the node's
     **context-window meter** should fill.
+
+## Not served by the Server Edition: the simulator node
+
+The `simulator` node (the host's iOS Simulator, driven by the native `sim-helper`) is a
+desktop-macOS feature. The server never registers `core/sim`, the browser bridge answers
+`unsupported`, and the Add rows are disabled with a reason in a browser tab. The `sim`
+canvas-control verb is refused by name (`control-unsupported-on-this-edition`, permanent).

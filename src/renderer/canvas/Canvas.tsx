@@ -13,7 +13,7 @@ import { arrangeArgsRefusal, isTopLevelGroupArg, TOP_ARRANGE_LAYOUTS } from '@sh
 import { createControlOpenBatch } from '../lib/controlOpenBatch'
 import { commitOwnedLaunchAttempt, registerLaunchCommit } from '../terminal/launch-attempt'
 import { hasLaunchWriter, launchCommand } from '../terminal/launch-command'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import { useContextLinkSync } from './useContextLinkSync'
 import { useMirrorIdentitySeed } from './useMirrorIdentitySeed'
 import { useShallow } from 'zustand/react/shallow'
@@ -103,6 +103,8 @@ import { StickyNode } from '../nodes/StickyNode'
 import { GroupNode, setWorktreeActionHandler } from '../nodes/GroupNode'
 import { LazyEditorNode, LazyDiffNode } from '../nodes/lazyMonacoNodes'
 import { DinoNode } from '../nodes/DinoNode'
+import { SimulatorNode } from '../nodes/SimulatorNode'
+import { simulatorUnavailableReason } from '../lib/simulatorView'
 import { TriggerNode } from '../nodes/TriggerNode'
 import BrowserNode from '../nodes/BrowserNode'
 import { FilesNode } from '../nodes/FilesNode'
@@ -139,6 +141,7 @@ import {
   IconClose,
   IconCollapse,
   IconDino,
+  IconSimulator,
   IconDuplicate,
   IconEditor,
   IconExplorer,
@@ -484,6 +487,7 @@ import { hostChatSend, hostChatSession, hostChatStatus } from '../lib/hostChatQu
 import { chatPaneRefusal } from '../lib/chatPaneGate'
 import { useLaunchDelivery } from '../state/launchDelivery'
 import { useBrowserLease, drivingNodeIds } from '../state/browserLease'
+import { drivenPairs, useSimDriving } from '../state/simDriving'
 import { useTerminalFocus } from '../state/terminalFocus'
 import { useCodexIdentity, codexFallbackText } from '../state/codexIdentity'
 import { useTeamAccessEvents } from '../state/teamAccess'
@@ -631,7 +635,7 @@ import { answerHostedRequest, type HostedAnswer } from '../lib/hostedOwner'
 import { headRequest, type QueuedRequest } from '../lib/hostedPendingQueue'
 import { useHostedPending } from '../state/hostedPending'
 import { hostedInfoFor, isHostedReadOnly, useHostedTeams } from '../state/hostedTeams'
-import { appendBridgeEdges, bridgeToEdge, buildContextLinkNote, contextLinkForEdge, buildNotePushMessage, classifyLink, edgeToBridge, gainedReaders, hiddenLinkIds, isCurrentLinkDirection, linkIdsCoveredByRopes, linkReadPairs, pairKey, planBridges, withLinkReader, type LinkEndpoint } from '../lib/noteLink'
+import { appendBridgeEdges, bridgeToEdge, buildContextLinkNote, buildSimLinkNote, contextLinkForEdge, buildNotePushMessage, classifyLink, edgeToBridge, gainedReaders, hiddenLinkIds, isCurrentLinkDirection, linkIdsCoveredByRopes, linkReadPairs, pairKey, planBridges, withLinkReader, type LinkEndpoint } from '../lib/noteLink'
 import {
   deliveriesToRetire,
   launchesToFire,
@@ -871,6 +875,7 @@ import {
   createAgentNode,
   createBrowserNode,
   createDinoNode,
+  createSimulatorNode,
   createTriggerNode,
   createFilesNode,
   createRunNode,
@@ -2272,6 +2277,7 @@ export function Canvas() {
       subagent: withNodeBoundary(SubagentNode),
       loop: withNodeBoundary(LoopNode),
       dino: withNodeBoundary(DinoNode),
+      simulator: withNodeBoundary(SimulatorNode),
       trigger: withNodeBoundary(TriggerNode),
       video: withNodeBoundary(VideoNode),
       web: withNodeBoundary(WebNode),
@@ -2819,6 +2825,28 @@ export function Canvas() {
         .join('|'),
     [nodes]
   )
+  // The same for Simulator nodes: an edge whose source is one is a sim link (label + driving look).
+  const simSig = useMemo(
+    () =>
+      nodes
+        .filter((n) => n.type === 'simulator')
+        .map((n) => n.id)
+        .sort()
+        .join('|'),
+    [nodes]
+  )
+  // Which Simulator nodes an agent is driving through `sim` right now (bounded entries, see
+  // state/simDriving.ts). The tick re-derives the edges once when the latest window lapses, so the
+  // flowing look ends on its own instead of waiting for an unrelated render.
+  const simDriveEntries = useSimDriving((s) => s.entries)
+  const [simDriveTick, bumpSimDriveTick] = useReducer((n: number) => n + 1, 0)
+  useEffect(() => {
+    const last = Math.max(0, ...Object.values(simDriveEntries).map((e) => e.until))
+    const wait = last - Date.now()
+    if (wait <= 0) return
+    const t = setTimeout(bumpSimDriveTick, wait + 20)
+    return () => clearTimeout(t)
+  }, [simDriveEntries])
   // The part of `nodes` the edge layer reads, reduced to a SIGNATURE so a drag frame does not
   // rebuild every styled edge (same discipline as stickySig/loopSig): which nodes are armed on
   // which deps (the waiting look), which agent each runs (the rope colour), and whose eye is
@@ -2856,7 +2884,9 @@ export function Canvas() {
   const drivenLeaseEntries = useBrowserLease((s) => s.entries)
   const displayEdges = useMemo(() => {
     const stickyIds = new Set(stickySig ? stickySig.split('|') : [])
+    const simIds = new Set(simSig ? simSig.split('|') : [])
     const drivenTargets = drivingNodeIds(drivenLeaseEntries, Date.now())
+    const drivenSims = drivenPairs(simDriveEntries, Date.now())
     // Endpoint facts the rope look derives from — read off the render-time ref, keyed by edgeSig.
     // The SAME builder the delete paths use (`nonWaitingRopeIds`), so what a rope's label promises
     // is exactly what removing it does.
@@ -2875,14 +2905,21 @@ export function Canvas() {
     const hiddenLinks = hiddenLinkIds(linkEdges, controlEdges)
     const decorated = linkEdges.filter((e) => !hiddenLinks.has(e.id)).map((e) => {
       const sel = !!e.selected
-      const isNote = stickyIds.has(e.source)
-      const stroke = sel ? '#ffffff' : accent
+      const isSim = simIds.has(e.source)
+      // Passive-source links (a note, a device) read one way: the agent at the target end.
+      const isNote = isSim || stickyIds.has(e.source)
+      // Driven: an agent is acting on this device RIGHT NOW. The same clay and flow as the driven
+      // browser rope; it ends with the entry's `until` (bounded, nothing infinite).
+      const driven = isSim && drivenSims.has(`${e.source}>${e.target}`)
+      const stroke = sel ? '#ffffff' : driven ? '#d97757' : accent
       const arrow = { type: MarkerType.ArrowClosed, color: stroke, width: 14, height: 14 }
       // Arrowheads point at the side that READS, as a note link's does (it ends at the terminal).
       // A context link is two-way unless it names a one-way reader (issue #852).
       const readers = isNote ? [e.target] : linkReadPairs(edgeToBridge(e)).map((p) => p.reader)
       const oneWay = !isNote && readers.length < 2
-      const baseLabel = isNote
+      const baseLabel = isSim
+        ? driven ? '📱 driving' : '📱 simulator'
+        : isNote
         ? '🗒 note'
         : readers.length === 0
           ? '⊘ context (invalid direction)'
@@ -2898,7 +2935,10 @@ export function Canvas() {
           : baseLabel,
         labelStyle: { fill: stroke, fontSize: 11, fontWeight: 600 },
         ...labelBg,
-        style: { stroke, strokeWidth: sel ? 3.5 : 2 },
+        // Flowing dashes while an agent drives the device: a FINITE CSS animation on `.sim-driven`
+        // (a few cycles, then still), not React Flow's infinite `animated` — Idle energy.
+        ...(driven ? { className: 'sim-driven' } : {}),
+        style: { stroke, strokeWidth: sel ? 3.5 : driven ? 2.5 : 2 },
         ...(readers.includes(e.target) ? { markerEnd: arrow } : {}),
         ...(readers.includes(e.source) ? { markerStart: arrow } : {})
       }
@@ -2966,7 +3006,7 @@ export function Canvas() {
     // A closed eye hides every edge touching its node — data untouched, pixels gone.
     return hidden.size ? all.filter((e) => !edgeHidden(e, hidden)) : all
     // eslint-disable-next-line react-hooks/exhaustive-deps -- edgeSig stands in for nodesRef
-  }, [linkEdges, ephemeralEdges, controlEdges, accent, stickySig, edgeSig, trigEdges, drivenLeaseEntries])
+  }, [linkEdges, ephemeralEdges, controlEdges, accent, stickySig, simSig, edgeSig, trigEdges, drivenLeaseEntries, simDriveEntries, simDriveTick])
 
   // Header pin button (and ⌘⇧L): toggle the persisted pin preference. Clears the transient
   // dismiss so (re)pinning shows the docked panel; unpinning collapses it to hover-peek.
@@ -4799,9 +4839,12 @@ export function Canvas() {
       if (!se || !te) return
       const kind = classifyLink(se, te)
       if (!kind) return
-      // Note edges are stored sticky→terminal regardless of drag direction, so styling and
-      // the link map can key off "source is sticky".
-      const source = kind === 'note' && te.kind === 'sticky' ? c.target : c.source
+      // Note edges are stored sticky→terminal and sim edges device→agent regardless of drag
+      // direction, so styling and the link map can key off "the source is passive".
+      const source =
+        (kind === 'note' && te.kind === 'sticky') || (kind === 'sim' && te.kind === 'simulator')
+          ? c.target
+          : c.source
       const target = source === c.source ? c.target : c.source
       // No duplicate link (in either direction).
       const exists = linkEdgesRef.current.some(
@@ -4820,6 +4863,15 @@ export function Canvas() {
         // don't interrupt it). Claude gets the skill pointer; codex/gemini get the CLI inline.
         void announceContextLink(source, target)
         void announceContextLink(target, source)
+        return
+      }
+      if (kind === 'sim') {
+        // The device is now this agent's default `sim` target. One idle-gated discovery line, like a
+        // context link's (the agent is context-capable by construction — classifyLink refused a
+        // plain shell — and a node mid-turn is not interrupted).
+        if (status[target]?.state === 'working') return
+        const simTitle = (nodesRef.current.find((n) => n.id === source)?.data.title as string) || 'Simulator'
+        void api.pty.sendText(target, buildSimLinkNote(simTitle)).then(reportTextDelivery)
         return
       }
       // Note link: push the note text once into the terminal — agent sessions only.
@@ -4853,7 +4905,11 @@ export function Canvas() {
       if (!link) return
       const viaRope = link.id !== edge.id
       const nodeOf = (id: string) => nodesRef.current.find((n) => n.id === id)
-      if (nodeOf(link.source)?.type === 'sticky' || nodeOf(link.target)?.type === 'sticky') return
+      const passiveType = (id: string): boolean => {
+        const t = nodeOf(id)?.type
+        return t === 'sticky' || t === 'simulator'
+      }
+      if (passiveType(link.source) || passiveType(link.target)) return
       e.preventDefault()
       const titleOf = (id: string) => (nodeOf(id)?.data.title as string) || id
       const current = edgeToBridge(link)
@@ -4990,6 +5046,74 @@ export function Canvas() {
   // edge.data on the canvas.
   const linkBridges = useMemo(() => linkEdges.map(edgeToBridge), [linkEdges])
   useContextLinkSync({ projectId: renderedProjectId, nodes, edges: linkBridges })
+
+  // A `sim` call from an agent that is not yet linked to the device it resolved to asks for the
+  // link a manual drag would make (core decided it: same project, linkable agent, not removed by
+  // the user this run). No discovery note — the agent is already using the device. The planner
+  // dedupes, so a drag a moment earlier is a no-op. A project that is not on screen is written
+  // through the store, like every other off-canvas link (`appendCanvasLinks`).
+  const applySimAutoLink = useCallback(
+    (ev: { projectId: string; ownerNodeId: string; simNodeId: string }) => {
+      const live = liveCanvasHolds(nodesProjectIdRef.current, useProjects.getState().activeProjectId, ev.projectId)
+      if (live) {
+        const plan = planBridges(ev.simNodeId, [ev.ownerNodeId], linkEndpointOf, linkEdgesRef.current)
+        if (plan.edges.length) {
+          setLinkEdges((es) => appendBridgeEdges(es, plan.edges))
+          markDirty()
+        }
+        return
+      }
+      const proj = useProjects.getState().projects.find((p) => p.id === ev.projectId)
+      if (!proj) return
+      const endpoint = (id: string): LinkEndpoint | null => {
+        const n = proj.nodes.find((x) => x.id === id)
+        if (!n) return null
+        const a = (n.agentId as AgentId | undefined) ?? useAgentStatus.getState().byId[id]?.agentId
+        return { kind: n.kind ?? 'terminal', contextCapable: !!a && canContextLink(a) }
+      }
+      const plan = planBridges(ev.simNodeId, [ev.ownerNodeId], endpoint, proj.bridges ?? [])
+      if (plan.edges.length) {
+        useProjects.getState().appendCanvasLinks(proj.id, { bridges: plan.edges })
+        void writeDisk()
+      }
+    },
+    [linkEndpointOf, setLinkEdges, markDirty, writeDisk]
+  )
+  const applySimAutoLinkRef = useRef(applySimAutoLink)
+  applySimAutoLinkRef.current = applySimAutoLink
+  useEffect(
+    () =>
+      window.nodeTerminal.sim?.onAgentEvent?.((ev) => {
+        if (ev.kind === 'auto-link') applySimAutoLinkRef.current(ev)
+      }),
+    []
+  )
+
+  // Tell core when the user removes an agent↔device link, so the agent's next `sim` call does not
+  // quietly re-create it. ONE diff of the link set (every removal path — Delete, double-click, the
+  // menu, undo — ends in `linkEdges`), judged only within one project and only when both nodes
+  // still exist (a deleted node is not a removed link).
+  const simLinkPairsRef = useRef<{ project: string | null; pairs: Map<string, [string, string]> }>({
+    project: null,
+    pairs: new Map()
+  })
+  useEffect(() => {
+    const types = new Map(nodesRef.current.map((n) => [n.id, n.type]))
+    const pairs = new Map<string, [string, string]>()
+    for (const e of linkEdges) {
+      const s = types.get(e.source)
+      const t = types.get(e.target)
+      if (s === 'simulator' && t === 'terminal') pairs.set(e.id, [e.target, e.source])
+      else if (t === 'simulator' && s === 'terminal') pairs.set(e.id, [e.source, e.target])
+    }
+    const prev = simLinkPairsRef.current
+    if (prev.project === renderedProjectId) {
+      for (const [id, [agent, sim]] of prev.pairs) {
+        if (!pairs.has(id) && types.has(agent) && types.has(sim)) window.nodeTerminal.sim?.linkRemoved?.(agent, sim)
+      }
+    }
+    simLinkPairsRef.current = { project: renderedProjectId, pairs }
+  }, [linkEdges, renderedProjectId])
   // Phone chat: tell the core's agent-status mirror which session each node was last running, for
   // nodes it learned nothing about this run (see useMirrorIdentitySeed).
   useMirrorIdentitySeed()
@@ -6210,6 +6334,34 @@ export function Canvas() {
       markDirty()
     },
     [setNodes, markDirty, viewCenter, activeProjectId]
+  )
+
+  /**
+   * A simulator node. Placement only: which device it shows is the node's own picker's business,
+   * so adding one never boots, attaches or starts anything. The rows that reach here are disabled
+   * with a reason where it cannot work (`simulatorUnavailable`), so this does not re-check.
+   */
+  const addSimulator = useCallback(
+    (center?: { x: number; y: number }, groupId?: string) => {
+      setNodes((ns) => {
+        const node = createSimulatorNode(ns.length, center ?? emptyNodePos())
+        return [...ns, groupId ? parentInto(node, groupId) : node]
+      })
+      markDirty()
+    },
+    [setNodes, markDirty, emptyNodePos, parentInto]
+  )
+
+  // The simulator is this Mac's Xcode device: not from a browser tab (the Server Edition never
+  // registers the helper) and not from a team tab (it would be the HOST's canvas).
+  const simulatorUnavailable = useMemo(
+    () =>
+      simulatorUnavailableReason({
+        browser: isBrowserRuntime(),
+        relay: activeSession.source === 'relay',
+        mac: isMacPlatform()
+      }),
+    [activeSession.source]
   )
 
   const addTrigger = useCallback(
@@ -10115,6 +10267,12 @@ export function Canvas() {
       // keystroke was consumed by us and must not fall through to the platform.
       'node.newWebView': () => { void addWebView(); return true },
       'node.newDino': () => { addDino(); return true },
+      // Same gate as the add rows: a refused chord falls through rather than being swallowed.
+      'node.newSimulator': () => {
+        if (simulatorUnavailable) return false
+        addSimulator()
+        return true
+      },
       'node.newFile': () => {
         // Same gate the pane menu / ⌘K use for their "New file…" row: the file is created UNDER
         // the project folder, so a cwd-less (inline) project has nowhere to put it. Refuse rather
@@ -10821,9 +10979,10 @@ export function Canvas() {
     () => ({
       hasCwd: !!(useProjects.getState().getProject(activeProjectId)?.ssh?.remoteCwd ??
         useProjects.getState().getProject(activeProjectId)?.cwd),
-      isSshProject
+      isSshProject,
+      simulatorUnavailable
     }),
-    [activeProjectId, isSshProject]
+    [activeProjectId, isSshProject, simulatorUnavailable]
   )
   const addHandlers = useMemo<AddHandlers>(
     () => ({
@@ -10835,6 +10994,7 @@ export function Canvas() {
       files: (at) => addFiles(at),
       run: (at) => void addRun(at),
       dino: (at) => addDino(at),
+      simulator: (at) => addSimulator(at),
       trigger: (at) => addTrigger(at),
       openFile: (at) => void openFileDialog(at),
       newFile: (at) => void newProjectFile(at),
@@ -10850,6 +11010,7 @@ export function Canvas() {
       addWebView,
       addSticky,
       addDino,
+      addSimulator,
       addTrigger,
       openFileDialog,
       newProjectFile,
@@ -14357,6 +14518,50 @@ export function Canvas() {
             // and keys it to the verified caller — these fields are descriptive (release-by-project,
             // the indicator), never the authorization boundary.
             reply({ ok: true, message: `opened browser ${id}`, result: { id, projectId: ctlProject?.id, partition } })
+            return
+          }
+          case 'open-simulator': {
+            // main already validated --udid, bound the single Booted device when none was named, and
+            // put the device name in `device-name`. A Simulator node is inert until mounted, so this
+            // works off screen too (addAndConnect stages it in the owning project).
+            if (args.group && offCanvas) {
+              reply({ ok: false, error: 'open-simulator: --group works only for the project on screen; omit it for a background project' })
+              return
+            }
+            let intoGroupId: string | undefined
+            if (args.group) {
+              const g = nodesRef.current.find((nd) => nd.id === args.group)
+              if (!g || g.type !== 'group') {
+                reply({ ok: false, error: 'open-simulator: --group must name an existing group frame' })
+                return
+              }
+              intoGroupId = g.id
+            }
+            const simDevice = args.udid ? { udid: args.udid, name: args['device-name'] } : undefined
+            let simNode = createSimulatorNode(nodeCount(), placeBelow(), simDevice)
+            if (intoGroupId) simNode = parentInto(simNode, intoGroupId)
+            const id = addAndConnect(simNode)
+            // The device link: the caller's default `sim` target (planBridges 'sim'). Silent, like
+            // every control-drawn link; the sim edge needs both ends in THIS project's lookup.
+            const simLookup = (nid: string): LinkEndpoint | null =>
+              nid === id
+                ? { kind: 'simulator', contextCapable: false }
+                : ctlLinkEndpointOf(nid)
+            const linkedToCaller = ctlLinkEndpointOf(sourceNodeId)?.contextCapable === true
+            if (linkedToCaller) bridgeTo(sourceNodeId, [id], simLookup)
+            const shown = simNode.data.simUdid
+              ? `${simNode.data.simName ? JSON.stringify(simNode.data.simName) + ' ' : ''}${simNode.data.simUdid}`
+              : null
+            reply({
+              ok: true,
+              message:
+                `opened Simulator node ${id}` +
+                (shown ? ` showing device ${shown}` : ' with no device chosen yet (the user picks one in the node)') +
+                (linkedToCaller
+                  ? '; it is linked to you, so `sim` with no flags now drives it, and the user can watch it.'
+                  : '; you are not a context-capable agent, so it is NOT linked — pass --node ' + id + ' to `sim`.'),
+              result: { id, ...(shown ? { udid: simNode.data.simUdid } : {}) }
+            })
             return
           }
           case 'group': {
@@ -17991,6 +18196,10 @@ export function Canvas() {
         ? []
         : [{ id: 'new-run', label: 'New run configuration', icon: <IconPlay />, run: () => void addRun() }]),
       { id: 'new-dino', label: 'New dino game', icon: <IconDino />, run: () => addDino() },
+      // The palette has no disabled state, so an unavailable row is omitted (like New file…).
+      ...(simulatorUnavailable
+        ? []
+        : [{ id: 'new-simulator', label: 'New simulator', icon: <IconSimulator />, run: () => addSimulator() }]),
       { id: 'open-file', label: 'Open file…', icon: <IconEditor />, run: () => void openFileDialog() },
       // "New file…" needs a project folder to create into — hidden when the project has no cwd.
       ...(newFileHasCwd
@@ -18299,6 +18508,8 @@ export function Canvas() {
     addSticky,
     addRun,
     addDino,
+    addSimulator,
+    simulatorUnavailable,
     addWebView,
     addBrowser,
     openFileDialog,
@@ -19618,6 +19829,7 @@ export function Canvas() {
         onAddSticky={addSticky}
         onSpawnTeam={() => setSpawnTeamDialog({})}
         onAddDino={addDino}
+        onAddSimulator={addSimulator}
         onAddTrigger={addTrigger}
         onAddFiles={() => addFiles()}
         onAddRun={() => void addRun()}

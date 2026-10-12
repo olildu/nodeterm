@@ -16569,6 +16569,537 @@ body.focus-mode .dock:hover {
   border-bottom: none;
 }
 
+/* ── Simulator node ────────────────────────────────────────────────────────────────────────
+   The host's iOS Simulator drawn into a canvas. Until the pointer (or focus) enters, ONLY the phone
+   shows: the frame, its shadow and the terminal-style header are clipped away by a clip-path
+   hugging the screen (`--sim-clip-folded`, computed from the measured screen box in
+   lib/simNodeChrome), and on hover the clip grows out to the whole frame, the header rolls open and
+   its buttons pop in. The header strip is absolutely positioned and its height is ALWAYS reserved
+   (`--sim-header-h`), so opening it never moves the screen. A clip-path also clips hit-testing, so a
+   folded node answers only over the phone: hover it, then drag the header.
+   Every motion is a transition or a FINITE animation, gated by --nt-anim-state, and off under Reduce
+   Motion. Deliberately NOT blurred while folded (a live screen is the last thing to put a blur
+   behind); the open frame takes the glass fill at the end of this block. */
+.sim-node {
+  --sim-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --sim-spring: cubic-bezier(0.34, 1.45, 0.64, 1);
+  position: relative;
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  border: 1px solid transparent;
+  border-top: 3px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  box-shadow: 0 0 0 transparent;
+  clip-path: var(--sim-clip-folded);
+  transition:
+    clip-path 520ms var(--sim-ease),
+    background-color 420ms ease,
+    border-color 420ms ease,
+    box-shadow 520ms ease;
+}
+
+.sim-node:hover,
+.sim-node:focus-within,
+.sim-node.is-open {
+  background: rgba(var(--card-rgb), 0.96);
+  border-color: var(--border);
+  border-top-color: var(--sim-color, var(--accent));
+  box-shadow: 0 8px 28px rgba(0, 0, 0, calc(0.35 * var(--shadow-k)));
+  clip-path: var(--sim-clip-open);
+  transition:
+    clip-path 560ms var(--sim-ease),
+    background-color 420ms ease,
+    border-color 420ms ease,
+    box-shadow 560ms ease;
+}
+
+.sim-node.selected {
+  box-shadow: 0 0 0 1px var(--accent), 0 8px 28px rgba(0, 0, 0, calc(0.4 * var(--shadow-k)));
+}
+
+/* The keyboard is on the phone: say so, the way a focused terminal does. */
+.sim-node.keyed {
+  box-shadow: 0 0 0 2px var(--accent), 0 8px 28px rgba(0, 0, 0, calc(0.4 * var(--shadow-k)));
+}
+
+/* The header: the terminal node's header metrics (`term-node__header` is on the element), a strip
+   that is always reserved and rolls open from the top. */
+.sim-node__header {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 4;
+  box-sizing: border-box;
+  height: var(--sim-header-h);
+  gap: 6px;
+  border-radius: 9px 9px 0 0;
+  clip-path: inset(0 0 100% 0);
+  transition: clip-path 300ms var(--sim-ease);
+}
+:is(.sim-node:hover, .sim-node:focus-within, .sim-node.is-open) .sim-node__header {
+  clip-path: inset(0 0 0 0);
+  transition: clip-path 420ms var(--sim-ease) 60ms;
+}
+
+/* Its items pop in with a spring, staggered left to right; leaving is quick and un-staggered. */
+.sim-node__header > * {
+  opacity: 0;
+  transform: translateY(-10px) scale(0.7);
+  transition:
+    opacity 160ms ease,
+    transform 200ms var(--sim-ease),
+    background-color 120ms ease,
+    color 120ms ease;
+}
+:is(.sim-node:hover, .sim-node:focus-within, .sim-node.is-open) .sim-node__header > * {
+  opacity: 1;
+  transform: none;
+  transition:
+    opacity 220ms ease,
+    transform 380ms var(--sim-spring),
+    background-color 120ms ease,
+    color 120ms ease;
+}
+:is(.sim-node:hover, .sim-node:focus-within, .sim-node.is-open) .sim-node__header > :nth-child(1) { transition-delay: 180ms, 180ms, 0s, 0s; }
+:is(.sim-node:hover, .sim-node:focus-within, .sim-node.is-open) .sim-node__header > :nth-child(2) { transition-delay: 225ms, 225ms, 0s, 0s; }
+:is(.sim-node:hover, .sim-node:focus-within, .sim-node.is-open) .sim-node__header > :nth-child(3) { transition-delay: 270ms, 270ms, 0s, 0s; }
+:is(.sim-node:hover, .sim-node:focus-within, .sim-node.is-open) .sim-node__header > :nth-child(4) { transition-delay: 315ms, 315ms, 0s, 0s; }
+:is(.sim-node:hover, .sim-node:focus-within, .sim-node.is-open) .sim-node__header > :nth-child(5) { transition-delay: 360ms, 360ms, 0s, 0s; }
+:is(.sim-node:hover, .sim-node:focus-within, .sim-node.is-open) .sim-node__header > :nth-child(6) { transition-delay: 405ms, 405ms, 0s, 0s; }
+:is(.sim-node:hover, .sim-node:focus-within, .sim-node.is-open) .sim-node__header > :nth-child(7) { transition-delay: 450ms, 450ms, 0s, 0s; }
+:is(.sim-node:hover, .sim-node:focus-within, .sim-node.is-open) .sim-node__header > :nth-child(8) { transition-delay: 495ms, 495ms, 0s, 0s; }
+:is(.sim-node:hover, .sim-node:focus-within, .sim-node.is-open) .sim-node__header > :nth-child(9) { transition-delay: 540ms, 540ms, 0s, 0s; }
+:is(.sim-node:hover, .sim-node:focus-within, .sim-node.is-open) .sim-node__header > :nth-child(10) { transition-delay: 585ms, 585ms, 0s, 0s; }
+:is(.sim-node:hover, .sim-node:focus-within, .sim-node.is-open) .sim-node__header > :nth-child(11) { transition-delay: 630ms, 630ms, 0s, 0s; }
+:is(.sim-node:hover, .sim-node:focus-within, .sim-node.is-open) .sim-node__header > :nth-child(12) { transition-delay: 675ms, 675ms, 0s, 0s; }
+:is(.sim-node:hover, .sim-node:focus-within, .sim-node.is-open) .sim-node__header > :nth-child(13) { transition-delay: 720ms, 720ms, 0s, 0s; }
+:is(.sim-node:hover, .sim-node:focus-within, .sim-node.is-open) .sim-node__header > :nth-child(n + 14) { transition-delay: 765ms, 765ms, 0s, 0s; }
+/* The colour popover is a header child but not a header item: it must not pop. */
+.sim-node__header > .color-popover {
+  opacity: 1;
+  transform: none;
+  transition: none;
+}
+.sim-node__header > .term-node__spacer {
+  transition: none;
+}
+.sim-node__header .term-node__title-text {
+  min-width: 0;
+  flex-shrink: 1;
+}
+.sim-node__tool:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* The device chip: status dot + runtime + caret; opens the device picker. */
+.sim-node__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 20px;
+  min-width: 0;
+  padding: 0 7px 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(var(--tint-rgb), 0.06);
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  white-space: nowrap;
+  flex-shrink: 1;
+  overflow: hidden;
+  cursor: pointer;
+}
+.sim-node__chip:hover {
+  background: rgba(var(--tint-rgb), 0.12);
+  color: var(--text);
+}
+
+.sim-node__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--muted);
+}
+.sim-node__dot--live {
+  background: var(--state-success);
+}
+.sim-node__dot--wait {
+  background: var(--state-warning);
+}
+.sim-node__dot--error {
+  background: var(--state-error);
+}
+
+/* The body fills the node below the reserved header strip; the screen is letterboxed inside it. */
+.sim-node__body {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  top: var(--sim-header-h);
+  overflow: hidden;
+  background: transparent;
+  transition: background-color 420ms ease;
+}
+:is(.sim-node:hover, .sim-node:focus-within, .sim-node.is-open) .sim-node__body {
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.sim-node__screen {
+  position: absolute;
+  /* theme-exempt: the device's screen is content (an unlit iPhone is black in both themes). */
+  background: #000;
+  box-shadow: 0 0 0 transparent;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  transition:
+    transform 520ms var(--sim-spring),
+    box-shadow 520ms ease;
+}
+/* The bezel, its shadow and the 2px lift exist only while the chrome is open. */
+:is(.sim-node:hover, .sim-node:focus-within, .sim-node.is-open) .sim-node__screen {
+  transform: translateY(-2px);
+  box-shadow: 0 0 0 1px rgba(var(--tint-rgb), 0.14), 0 18px 44px rgba(0, 0, 0, 0.55);
+}
+
+.sim-node__canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  /* The screen wrapper owns the pointer; the bitmap must not start an image drag. */
+  pointer-events: none;
+}
+
+/* ── An agent is driving this device ─────────────────────────────────────────────────────────
+   A clay ring around the phone (three pulses, then it rests as a thin line), the agent's touch at
+   the real point, a short swipe trail, and a chip above the node. All finite. */
+@keyframes sim-ring {
+  0% {
+    box-shadow: 0 0 0 1px var(--state-working), 0 0 0 0 color-mix(in srgb, var(--state-working) 45%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 1px var(--state-working), 0 0 0 14px transparent;
+  }
+}
+.sim-node.driving .sim-node__screen {
+  box-shadow: 0 0 0 1px var(--state-working);
+  animation: sim-ring 1100ms ease-out 3;
+  animation-play-state: var(--nt-anim-state);
+}
+
+.sim-node__tap {
+  position: absolute;
+  width: 0;
+  height: 0;
+  z-index: 4;
+  pointer-events: none;
+}
+@keyframes sim-tap-dot {
+  0% {
+    transform: scale(0);
+    opacity: 1;
+  }
+  15% {
+    transform: scale(1.15);
+  }
+  25%,
+  85% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 0;
+  }
+}
+@keyframes sim-tap-ripple {
+  0% {
+    transform: scale(0.2);
+    opacity: 0.9;
+  }
+  100% {
+    transform: scale(2.6);
+    opacity: 0;
+  }
+}
+.sim-node__tap-dot {
+  position: absolute;
+  left: -7px;
+  top: -7px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--state-working) 85%, transparent);
+  animation: sim-tap-dot 1500ms var(--sim-spring) both;
+  animation-play-state: var(--nt-anim-state);
+}
+.sim-node__tap-ripple {
+  position: absolute;
+  left: -17px;
+  top: -17px;
+  width: 34px;
+  height: 34px;
+  box-sizing: border-box;
+  border-radius: 50%;
+  border: 2px solid var(--state-working);
+  opacity: 0;
+  animation: sim-tap-ripple 700ms ease-out 2 both;
+  animation-play-state: var(--nt-anim-state);
+}
+.sim-node__tap-ripple--2 {
+  animation-delay: 180ms;
+}
+
+@keyframes sim-swipe-trail {
+  0% {
+    stroke-dashoffset: 1;
+    opacity: 1;
+  }
+  45% {
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+  100% {
+    stroke-dashoffset: 0;
+    opacity: 0;
+  }
+}
+.sim-node__swipe {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 4;
+  pointer-events: none;
+}
+.sim-node__swipe line {
+  stroke: var(--state-working);
+  stroke-width: 4;
+  stroke-linecap: round;
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: sim-swipe-trail 1100ms ease-out forwards;
+  animation-play-state: var(--nt-anim-state);
+}
+.sim-node__swipe circle {
+  fill: color-mix(in srgb, var(--state-working) 85%, transparent);
+  opacity: 0;
+  animation: sim-swipe-trail 1100ms ease-out 250ms forwards;
+  animation-play-state: var(--nt-anim-state);
+}
+
+@keyframes sim-chip-in {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, 8px) scale(0.9);
+  }
+  100% {
+    opacity: 1;
+    transform: translate(-50%, 0) scale(1);
+  }
+}
+@keyframes sim-live-blink {
+  50% {
+    opacity: 0.35;
+  }
+}
+/* Sibling of the node root, positioned against the React Flow wrapper: above the node, outside the clip. */
+.sim-node__drivechip {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 6px);
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 92%;
+  padding: 4px 10px 4px 8px;
+  border-radius: 999px;
+  background: var(--panel-header);
+  border: 1px solid color-mix(in srgb, var(--state-working) 55%, transparent);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, calc(0.45 * var(--shadow-k)));
+  font-size: 11.5px;
+  color: var(--text);
+  white-space: nowrap;
+  pointer-events: none;
+  transform: translateX(-50%);
+  animation: sim-chip-in 320ms cubic-bezier(0.34, 1.45, 0.64, 1) both;
+  animation-play-state: var(--nt-anim-state);
+}
+/* Folded, the frame and header are invisible, so the chip sits just above the PHONE; once the
+   chrome opens it rides above the frame (the header now fills the space above the phone). */
+.sim-node__drivechip {
+  bottom: calc(100% - var(--sim-phone-top, 0px) + 6px);
+  transition: bottom 420ms cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+.sim-node:is(:hover, :focus-within, .is-open) ~ .sim-node__drivechip {
+  bottom: calc(100% + 6px);
+}
+.sim-node__drivechip-live {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--state-working);
+  animation: sim-live-blink 900ms ease-in-out 4;
+  animation-play-state: var(--nt-anim-state);
+}
+.sim-node__drivechip-who {
+  font-weight: 600;
+  flex-shrink: 0;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sim-node__drivechip-what {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--muted);
+}
+
+/* The flowing link while an agent drives (class set from Canvas on the driven edge): a few cycles, then still. */
+@keyframes sim-edge-flow {
+  to {
+    stroke-dashoffset: -11;
+  }
+}
+.react-flow__edge.sim-driven .react-flow__edge-path {
+  stroke-dasharray: 6 5;
+  animation: sim-edge-flow 600ms linear 6;
+  animation-play-state: var(--nt-anim-state);
+}
+
+/* The links stay visible even while the chrome is folded. */
+.react-flow__handle.bridge-handle.bridge-handle--sim {
+  opacity: 0.85;
+}
+
+/* Reduce Motion: show and hide instantly, nothing pulses or flows. */
+@media (prefers-reduced-motion: reduce) {
+  .sim-node,
+  .sim-node__drivechip,
+  .sim-node__header,
+  .sim-node__header > *,
+  .sim-node__body,
+  .sim-node__screen {
+    transition: none !important;
+  }
+  .sim-node.driving .sim-node__screen,
+  .sim-node__tap-dot,
+  .sim-node__tap-ripple,
+  .sim-node__swipe line,
+  .sim-node__swipe circle,
+  .sim-node__drivechip,
+  .sim-node__drivechip-live,
+  .react-flow__edge.sim-driven .react-flow__edge-path {
+    animation: none !important;
+  }
+  .sim-node__swipe line {
+    stroke-dashoffset: 0;
+  }
+  .sim-node__tap-ripple {
+    display: none;
+  }
+}
+
+/* States that need the user: the card sits inside the expanded frame, in the app's own look. */
+.sim-node__overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(var(--card-rgb), 0.82);
+  pointer-events: none;
+}
+.sim-node__card {
+  max-width: 260px;
+  text-align: center;
+  color: var(--text);
+}
+.sim-node__card-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+.sim-node__card-detail {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--muted);
+}
+.sim-node__action {
+  margin-top: 12px;
+  pointer-events: auto;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: rgba(var(--tint-rgb), 0.1);
+  color: var(--text);
+}
+.sim-node__action:hover {
+  background: rgba(var(--tint-rgb), 0.18);
+}
+
+/* One unobtrusive toast over the bottom of the glass: the flash ("Screenshot saved") and the
+   helper's non-fatal notice. */
+.sim-node__toast {
+  position: absolute;
+  z-index: 5;
+  box-sizing: border-box;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  text-align: center;
+  color: var(--text);
+  background: var(--panel-header);
+  border: 1px solid var(--border);
+  pointer-events: none;
+}
+
+/* The key-capture field: editable (an IME, dictation and ⌘V need that) but never seen or hit. */
+.sim-node__keys {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  resize: none;
+  pointer-events: none;
+}
+
+/* Liquid Glass: the OPEN frame takes the chrome fill like the other nodes; folded, the phone stands
+   alone with no blur behind it. The header is a lift over the glass, not a second solid band. */
+:root[data-nt-glass='on'] :is(.sim-node:hover, .sim-node:focus-within, .sim-node.is-open) {
+  background: var(--glass-chrome-bg);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border-color: var(--glass-edge);
+  border-top-color: var(--glass-edge);
+}
+:root[data-nt-glass='on'] .sim-node__header {
+  background: var(--glass-lift);
+}
+:root[data-nt-glass='on'] .canvas-moving .sim-node {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
 /* ==== Liquid Glass appearance (Settings → Appearance → Liquid Glass) ===========================
    Everything below is scoped to `:root[data-nt-glass='on']`, which App.tsx sets only for that
    appearance, so the default look is untouched. `--glass-chrome-bg` is the ONE chrome fill: the

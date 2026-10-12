@@ -6167,6 +6167,277 @@ project's existing ControlMaster, so the URL the tool itself printed just works 
   container) finds listeners but no owner, so nothing is attributed; the Mac leg (lsof, the local
   bind/connect probes under BSD socket rules) has not been run on a Mac — device checklist in the PR.
 
+## Simulator node (the iOS Simulator inside a canvas node)
+
+A `simulator` node (`NodeKind`, persisted) shows one iOS Simulator device and lets you drive it —
+touch, buttons, keyboard, screenshots — with **Simulator.app never opened**. Add menu ▸ New view ▸
+"New simulator", ⌘K, and the `node.newSimulator` registry command (ships unbound). Pieces:
+`native/sim-helper` (Objective-C; `PROTOCOL.md` is the wire contract, `npm run build:sim-helper`
+builds `resources/bin/sim-helper`), `core/sim/` (service), `shared/sim.ts` (types, validation),
+`renderer/nodes/SimulatorNode.tsx` + `lib/sim*.ts`.
+
+- **Why a native helper.** The screen, HID input and accessibility tree are only reachable through
+  CoreSimulator / SimulatorKit / AccessibilityPlatformTranslation (private; the same ones idb uses).
+  One `sim-helper attach <udid>` process per device speaks length-prefixed frames on stdout and JSON
+  on stdin, so the main process never links private API. A future Xcode can change selectors: the
+  helper checks and fails with a named error (`no-xcode`, `setup-failed`), never crashes. Located
+  like the bundled tmux (`core/sim/helper-path.ts`: `Resources/bin/sim-helper`, else
+  `<repo>/resources/bin/sim-helper`); missing ⇒ the node says so (`no-helper`).
+- **One helper per DEVICE, refcounted** (`core/sim/service.ts`). The first viewer (any node, any
+  window) starts it, the last leaving stops it after `SIM_GRACE_MS` (4 s: a project switch
+  unmounts and remounts the node within seconds and a respawn is ~1 s of black). The helper holds a
+  per-device `flock`, so a restart **waits for the old process to be gone** (`entry.gone`) —
+  starting early would exit `already-attached`. Stop is `quit` → SIGTERM → SIGKILL at 1.5 s steps;
+  stdin EOF also ends it, so a crashed app leaks nothing. A crash is reported
+  (`helper-exited` + stderr tail) and **never auto-restarted**: the node's Reconnect re-attaches.
+- **Frames are pushed, never queued.** Binary JPEG (`u64 µs | u16 w | u16 h | bytes`) on
+  `sim:frame:<udid>`; each window may hold `SIM_MAX_IN_FLIGHT` (2) unacknowledged frames, the rest
+  collapse to the newest and go out on the next `sim:frame-ack` (`lib/simFramePump.ts` acks even a
+  frame it drops, or credit would leak); a lost ack is forgiven after `ACK_STALL_MS`. A window that
+  vanished from `clientIds()` has its viewers pruned at the next send.
+- **Stream policy** (`SimViewLevel`): `active` (node on screen, window focused) 60 fps, `background`
+  (window unfocused, still visible — a second monitor) 8 fps, `off` (offscreen, collapsed, document
+  hidden) stream stopped; the busiest viewer of a device decides. Scale follows the drawn size ×
+  canvas zoom × dpr, quantized to 0.1 so a resize drag does not reconfigure the encoder. The helper
+  sends a first frame at once when the stream is switched back on, and a viewer joining a static
+  screen is sent the last frame by core.
+- **Validation is core's, and the renderer is untrusted.** `sanitizeSimCommand` rebuilds every
+  request from known fields (finite, bounded numbers; `button`/`edge`/`mods` from closed sets; HID
+  usage 0x04–0xE7; text ≤ 4000), refuses `quit`/`stream` (core owns those), and nothing is ever put
+  in a shell: the helper takes JSON on stdin and `simctl boot` is the only `simctl` call, argv fixed.
+  A sender may drive only a device it is itself viewing. `text` with a non-ASCII character makes
+  the helper **overwrite the device pasteboard** (it pastes) — inherent, and documented here so
+  nobody is surprised.
+- **Boot is explicit and headless.** The Boot button calls `bootSimulatorHeadless` (`simctl boot`
+  only). `run-service`'s `bootSimulator` still runs `open -a Simulator` for the run node — do not
+  merge them. Attaching to a Shutdown device is fine; the helper reports `device-state` and the
+  node shows "Device shut down" + Boot.
+- **Who may drive it: the hover guard, like a terminal.** The body is covered by `HoverGuard` until
+  a click or (sloppy focus, default) a `panHoverDelay` dwell, decided by the same
+  `terminalFocusMode` helpers and settings as terminals; then a drag is a swipe and the wheel
+  scrolls the phone. The click that disarms the guard is **not** forwarded as a tap. Touches are in
+  device POINTS (`info` point size), the `edge` flag is set within 10 pt of left/right/top (20 pt
+  bottom — the home-indicator swipe, measured with the spike viewer), moves are throttled to 16 ms
+  with `quiet: true`, the pointer is captured and a lost capture always sends `up`. Alt+drag is a
+  pinch around the drag start (Shift: squeeze), one `pinch` on release. The wheel gathers 70 ms of
+  deltas into ONE short swipe and drops bursts while one runs (a swipe occupies the input queue);
+  it is coarse (no inertia), a live-drag mapping would be better.
+- **Keyboard** goes through a hidden `<textarea>` inside the node (an IME, dictation, the emoji
+  picker and ⌘V all need an editable element), focused when the guard drops. ⌘/Ctrl chords are
+  never claimed, so ⌘K/⌘W/⌘M still reach the dispatcher; Escape hands the keyboard back to the
+  canvas. Plain keys → `text`, named keys → HID `key`, IME commits and pastes → `text`. Rotation is
+  out of scope (landscape is untested in the helper too). **Known limits:** because every ⌘/Ctrl
+  chord bubbles to the app, Ctrl combinations (Ctrl+A/E…) cannot be typed into the device; an
+  Option-composed or non-ASCII character goes as `text`, which makes the helper paste it and so
+  overwrites the device pasteboard. Fire-and-forget input is dropped once more than
+  `FIRE_BACKLOG_MAX` (256 KB) is queued in the helper's stdin, so a wedged helper cannot grow
+  main's memory without bound; requests and `quit` are never dropped.
+- **Persistence.** `data.simUdid` is validated as a UUID at **both** serializer seams
+  (`normalizeSimUdid`; `simName` is dropped with it), so a hostile `project.json` can never put a
+  string in front of the helper; whether the device exists *here* is the node's question at mount
+  (`device-not-found` ⇒ picker). Restorable (`reopenNode` has a `case`), collapsible, breadcrumb
+  label. **Not a kanban card** (no session, no text — see `toKanbanSession.ts`). Not in the Liquid
+  Glass lists: a live screen is the last thing to put a blur behind. No infinite CSS animation
+  (Idle energy): status is a static dot.
+- **Flutter and the guest accessibility preference.** Flutter (and other lazy frameworks) build their
+  tree only when the guest says an assistive technology is on. On attach the helper (once, in the
+  background) reads `com.apple.Accessibility ApplicationAccessibilityEnabled` via `simctl spawn … defaults`
+  and, unless it is `1`, writes `ApplicationAccessibilityEnabled` and `AccessibilityEnabled` to true — XCUITest/Maestro
+  leave explicit zeros that nothing else overrides, which made every Flutter app describe empty. Side
+  effects: none visible (no VoiceOver); it persists in the device. Apps read it at launch, so the
+  `describe` reply carries `axPref: "enabled-now"` and `sim` tells the agent to relaunch an app that was
+  already running. Measured (iPhone 15 / iOS 26.5): Posha dev welcome screen 3 labelled elements, Settings 14.
+- **`--screenshot` may write inside the project OR the OS temp dir** (`core/sim/screenshot-path.ts`;
+  real paths, symlink escapes refused, `.png` only); with no path it writes a fresh `nodeterm-sim-<uuid>.png`
+  in the temp dir and prints it. A relative path the project jail refuses is never retried against temp.
+- **A reloaded page cannot detach its viewers**, so main calls `SimService.dropSender(webContentsId)` on
+  window close / render-process-gone / did-navigate (same signals as the GitHub board release).
+- **Screenshot** → `files.saveUpload` (the swept upload area, like a pasted screenshot) and the
+  **path** is copied to the clipboard; nothing is written into the project folder.
+- **Surfaces.** Desktop on macOS only. Every `sim:` channel is host-only (`HOST_ONLY_CHANNEL_PREFIXES`
+  `'sim:'`). The Server Edition does not register the service (`registerSimIpc` is desktop-main
+  only); browser and relay tabs get the `unsupported` stub (`relay-api` sets `sim: stub.sim`
+  explicitly — `...local` would aim a foreign UDID at this Mac), and the Add rows are **disabled
+  with a reason** there and on a non-Mac desktop (`simulatorUnavailableReason`). SSH projects are
+  fine: the device is this machine's, not the project host's. Mobile: N/A (no canvas).
+- **Packaging.** `build.mac.extraResources` carries `resources/bin/sim-helper` → `Resources/bin/`;
+  `npm run dist` builds it first and `release.yml` has its own step (a missing extraResources source
+  is only a warning). It is signed with the app's hardened-runtime identity like tmux; it only
+  `dlopen`s Apple's frameworks and the app already disables library validation.
+- **Measured / verified.** `core/sim/service.realhelper.test.ts` (skipped without
+  `NODETERM_TEST_SIM_UDID=<booted udid>`) drives the real service against the real helper on
+  Xcode 26.6 / iOS 26.5: live status, JPEG frames with credit, home/tap/touch, describe, PNG
+  screenshot, stream off ⇒ no frames, last viewer leaves ⇒ process gone ⇒ re-attach works.
+  **Not run by anyone yet:** the node UI in a real Electron window (pointer feel, IME, guard
+  dwell), Intel Macs, packaged/notarized builds, Xcode other than 26.x.
+- **Out of scope:** rotation, multiple displays, Android.
+
+### The node's chrome folds into the phone (hover to open)
+
+Until the pointer or focus enters, only the phone shows. `.sim-node` is clipped by a `clip-path`
+hugging the screen (`lib/simNodeChrome.collapsedClip`, computed from the MEASURED screen box, never
+hard-coded) and on `:hover` / `:focus-within` / `.is-open` the clip grows to the frame (~520 ms), the
+terminal-style header rolls open and its items spring in, staggered. Rules a refactor must keep:
+- **The header strip is absolutely positioned and its height is always reserved**
+  (`--sim-header-h`, body starts below it), so opening the chrome never moves or resizes the screen
+  or the stream canvas. Only the clip, background, border and shadow animate.
+- **`chromePinnedOpen`** keeps it open while selected, maximized, renaming, a menu/colour picker is
+  up, and for every state that needs the user (no device, shut down, connecting, error, node
+  collapsed); those cards render inside the expanded frame.
+- **A clip-path also clips hit-testing**: a folded node answers only over the phone. Move it by
+  hovering (the chrome opens) and dragging the header. Handles and the driving chip are siblings
+  OUTSIDE the root, so they are never clipped; handles stay on the frame's sides (FloatingEdge meets
+  a node's side midpoints), so a folded node's link ends a letterbox short of the phone rather than
+  jumping between anchors.
+- **Driving look**: core publishes a sanitized `action` per `sim` call on the `drive` event
+  (`describeDriveAction`; `--type` shows only a character count, never the text) plus the real tap
+  point / swipe endpoints in device points (`deviceToScreenPx` maps them). The chip above the node,
+  the pulsing ring (3 iterations, then a resting thin line), the tap marker and swipe trail, and the
+  clay flowing link (`.sim-driven`, 6 cycles) are all FINITE, gated by `--nt-anim-state`, and off
+  under Reduce Motion. The flash and helper notice share one small toast over the glass.
+- Liquid Glass: only the OPEN frame takes the glass fill; folded, no blur sits behind the phone.
+- Default size is now 400×780 (min 340 wide) so the 13-item header fits.
+- Not verified without a real window: the feel of the transitions, hover hit-testing at the clip
+  edge on a Retina display, and the glass look.
+
+### Agents drive it too: the `sim` canvas-control verb (and testing an iOS app)
+
+`sim <one action> [--node <Simulator node> | --udid <device>]` lets an agent LOOK at the screen
+(`--describe`, `--point`, `--screenshot`) and DRIVE it (`--tap`, `--tap-label`, `--swipe`, `--type`,
+`--key`, `--press`, `--boot`, `--wait-idle`; `--list` first). Grammar and rendering are the pure
+`core/sim/verb.ts`, the run is `core/sim/control.ts`, the shell wiring is `handleSimVerb` in
+`src/main/index.ts`. The agent-facing text (both generated bodies) is rendered from the constants in
+`verb.ts` and pinned by `main/canvas-control-sim.test.ts`, per the sync rule under Canvas control.
+Rules a refactor must not undo:
+- **One controller per device, and the agent SHARES it.** The verb never spawns a helper: it takes
+  an INTERNAL viewer lease on the service (`SimService.agentRun`) that counts in the refcount, gets no
+  frames and is never pruned with `clientIds()`. Calls on a device run one at a time (`agentTail`).
+  The lease keeps the helper alive `AGENT_LINGER_MS` (30 s) after the last call with the stream OFF,
+  so a script of calls pays one ~1 s helper start, not one per call. The user watching the node sees
+  every action live.
+- **Disposition: store-answered** (`STORE_ANSWERED_VERBS`). A device is a machine fact; no canvas is
+  needed and a background agent testing an app must never travel the user's view. Verified-only
+  (`requiresVerified`, refusal `Simulator control refused.`), answered in main before any forward,
+  refused by name on the Server Edition (not in `SERVER_V1_VERBS`), not a request-id verb (reads +
+  input, like `browser`), `--dry-run` refused by the generic gate.
+- **No per-project consent switch (unlike `browser`) — decided, not forgotten.** A browser node holds
+  the user's logged-in sessions; a simulator is a throwaway device holding nothing of the host's, and
+  the user watches every action. What an agent CAN reach: the app under test and its data, the device
+  pasteboard (`--type` with a character a keyboard cannot type makes the helper PASTE the whole string,
+  which OVERWRITES it — the reply says so), and files it writes under the project (`--screenshot`,
+  jailed). If a reviewer judges that too much, the switch belongs beside `browserControl` in
+  `project-capabilities.ts`; nothing here would need to change but the gate in `handleSimVerb`.
+- **`--node` is a Simulator node in the CALLER's project** (resolved from main's persisted store, so a
+  node created inside the 800 ms save debounce is "not a Simulator node here" for a moment);
+  `--udid` is any device on the Mac. `--list` shows only the caller's own project's nodes. A device no
+  node of the caller's project shows works, and the reply says once per device that the user cannot
+  watch it.
+- **Settled means measured, not assumed.** Every input waits for the screen to stop changing before
+  it replies (`--no-wait true` skips), from the live frame stream (the helper drops byte-identical
+  frames, so no frame = no change). MEASURED on an iPhone 15 / iOS 26.5: the first changed frame
+  arrives ~110 ms after a tap and ~480 ms after a Home press, and an app launch can pause ~1 s
+  mid-animation. So a bare 300 ms quiet window answered "settled" before the screen had begun to move
+  (seen in the first end-to-end run). The wait counts frames from the moment the input was SENT, gives
+  the screen `SIM_REACTION_MS` (800) to start, and reports "no visible change" when it never does; the
+  docs tell the agent a slow load can still pause longer and to `--wait-idle --quiet 1000`. The first
+  frame the helper sends when the stream is switched on is waited for before the first command
+  (`firstFrame`, ≤ 400 ms, skipped when a node already streams) so it cannot read as a reaction.
+- **Coordinates are device points and are checked** against the helper's `info` before anything
+  reaches it (`sim-out-of-bounds`). `--tap-label` resolves from a fresh `--describe`: exact label, then
+  case-insensitive, then id; a row and its caption count as one target; two distinct targets are
+  REFUSED with the candidates listed (the home screen has a Calendar widget AND icon — measured).
+- **`--describe` text is the app's words**: labels pass `cleanUiText` (one line, no control/bidi/
+  zero-width characters, capped), the output opens with an untrusted-data note, unlabelled containers
+  are counted not listed, and the listing is cut at 300 lines. The helper's `PARTIAL` (hit-test grid)
+  flag is shown, never hidden: it is the common case on the home screen and in Settings (measured), and
+  costs 1.5–3.5 s.
+- **`--screenshot` shares `browser`'s path jail** (`resolveScreenshotPath`) and adds
+  `prepareScreenshotParent`: the jail realpaths the PARENT, so the first shot into a new `.maestro/`
+  was refused as "outside the project". The missing folders are created only after the deepest
+  EXISTING ancestor canonicalises inside the project (a committed symlink out of the repo creates
+  nothing), and only the symlink-free remainder is made.
+- **Testing an iOS app (step 4).** `simTestingDocLines` gives the loop: `sim --list` → describe →
+  act → re-describe → write a Maestro flow under `.maestro/` → `maestro --device <udid> test <file>` in
+  a terminal node → fix until green. MEASURED: a 4-command Settings flow passes in 28 s cold and
+  16 s warm, and an attached, streaming helper does not disturb it. NOT measured: `sim` input or
+  `--describe` DURING a Maestro run (the docs forbid interleaving as a precaution, and say so).
+  Flutter widgets without `Semantics` are invisible to `--describe` and to Maestro's text selectors.
+- **Not run by anyone yet:** the verb through the shim in the built app (the user builds first), an
+  SSH host's older shim loop (the grammar accepts both spellings of a bare switch), a real shut-down
+  device (`--boot` is unit-tested; the only available device was the user's booted one).
+
+### `open-simulator`: agents add the node
+
+`open-simulator [--udid <id>] [--group <frame id>] [--request-id <id>]` creates a Simulator node
+(`createSimulatorNode`), draws the opener rope (`openedBy` stamped by `addAndConnect`) AND the
+device↔agent `sim` link (`planBridges`), so the new device is the caller's default `sim` target.
+Rules: **(1)** main prepares, the renderer places (`createOpenSimulatorPrep`, `core/sim/control.ts`):
+verified-only, macOS + helper (`sim-unavailable` otherwise), `--udid` validated by `normalizeSimUdid`
+and refused by name when malformed; with no `--udid` exactly ONE Booted device is bound, otherwise the
+node starts unbound (its picker). A UDID not on this Mac is stored as given. **(2)** Disposition:
+`OFF_CANVAS_VERBS` (inert display node, never travels the user's view; off screen it is written into the
+owning project's stored nodes); `--group` works only for the project on screen and is refused by name
+off screen. **(3)** In `REQUEST_ID_VERBS`; refused by name on the Server Edition. **(4)** The link is
+drawn only when the caller is context-capable; otherwise the reply says it is NOT linked. **(5)** The
+agent docs teach device choice from `SIM_PICK_DEVICE_RULES` (`core/sim/verb.ts`): `sim --list` first, use
+a linked node, else a Booted device, newest iPhone when none, never a second node for a device that has
+one. Pinned in `main/canvas-control-sim.test.ts`. Not verified in a running app.
+
+### Links: an agent and a Simulator node (the default `sim` target)
+
+A Simulator node takes the same left/right link handles as a terminal or sticky node, and a link
+between it and a **context-capable agent** (`classifyLink` → `'sim'`) MEANS something: the device is
+that agent's default `sim` target. It is the sticky-note precedent, one step further. Pieces:
+`shared/canvas-link.ts` (planner), `shared/context-link-map.ts` (read side), `core/sim/links.ts`
+(resolution + the per-run ledger), `core/sim/control.ts` (the verb), `renderer/state/simDriving.ts`.
+Rules a refactor must not undo:
+- **Stored device → agent whichever way it was dragged** (`planBridges`; a hand-edited agent → device
+  file is read both ways by `linkedSimulatorIds`). Both ends must be in ONE project — the planner's
+  lookup only knows the caller's project, and the verb only consults that project's persisted
+  bridges. A plain shell, a note, another device and `--one-way` are refused/ignored by name
+  (`LINK_NOT_LINKABLE`): a device cannot read, so there is no direction to choose and the edge gets
+  no direction menu.
+- **Link-map entry** (`ContextLinkInfo.simulator {udid?, name?}`): the AGENT gets it, the device gets
+  nothing. No transcript, no tmux — every transcript resolver skips an entry with `simulator` exactly
+  as it skips a `note`. `get-linked-context list` prints `(simulator: iPhone 15)`; `summary` /
+  `transcript` print the device, runtime and booted/shut-down state read at call time through the
+  injected `simulatorLine` (main supplies one `simctl` listing; unreadable → "state could not be
+  read", never a guess); `terminal` says there is none.
+- **Default target** (`sim` with neither `--node` nor `--udid`; the parser now leaves `target` null
+  and the shell resolves it): exactly ONE linked → used; SEVERAL → `sim-ambiguous-target` with the
+  list; NONE → `sim-no-target` naming the ways out. An explicit flag always wins. `sim --list` marks
+  `(linked to you)` and prints the default. Links come from the project's PERSISTED bridges, so a drag
+  made inside the autosave debounce is seen a moment late; the ledger below covers the one case that
+  matters (this run's own auto-link).
+- **Auto-link on use.** Any `sim` call that resolves to a Simulator node the caller is not linked to
+  (`--node`, or `--udid` when EXACTLY ONE node of the caller's project shows that device — two is a
+  choice the agent has not made) makes the link a drag would, once, silently (no discovery push: the
+  agent is already using it) and says so in the reply. A device no node shows links nothing and the
+  existing "ask the user to add a Simulator node" hint stays. Same project only; the caller must be
+  context-capable (`canContextLink`, checked in main from the node's agent or the mirror), otherwise it
+  just drives. Main only REQUESTS (`sim:agent-event {auto-link}`); the renderer plans with the same
+  `planBridges` (live canvas via `setLinkEdges`, an off-screen project via `appendCanvasLinks`, never a
+  tab switch), so a duplicate is a no-op.
+- **The user's removal wins for the run** (`SimLinkLedger`, in memory, never persisted — a new run is a
+  new conversation about their canvas). Canvas diffs the link set once (every delete path ends there),
+  and when a device↔agent link disappears while both nodes still exist it sends `sim:link-removed`;
+  main's handler is guarded to the main window and feeds the ledger, after which that agent+node is
+  neither auto-linked nor counted as linked. A drag the user makes later simply creates a normal link.
+- **Driving look = the driven-browser precedent, bounded.** Input actions only (tap, tap-label, swipe,
+  type, key, press — reads and boot link but do not animate) push `sim:agent-event {drive}` twice: at
+  the start (a ceiling, `SIM_DRIVE_MAX_MS`) and at the end (`SIM_DRIVE_LINGER_MS` = 4 s), the second
+  REPLACING the first. The renderer store paints only what main pushed (a hand-edited project can fake
+  nothing), the sim edge goes clay + `animated` while its `device>agent` pair is in the store, a header
+  chip names the driver, and ONE timeout re-derives the edges when the last window lapses — nothing
+  loops (idle-energy rule). A device the agent is not linked to still gets the chip when exactly the
+  nodes showing it are addressed; with no edge there is nothing else to draw (the browser precedent: the
+  rope highlight needs an existing rope). `link --to` is silent like every `link`; a hand-drawn link
+  sends the one idle-gated line (`buildSimLinkNote`), plain terminals none.
+- **Surfaces.** Desktop macOS only, like the node. Server Edition: no simulator service, the `sim`
+  verb is refused by name there; the planner is shared so a persisted sim link is harmless and inert.
+  Relay tabs: `sim:` is host-only, the stub's two new members are inert. Kanban: not a card, so no
+  link UI (links are a canvas concept). Mobile: N/A (no canvas, no simulator).
+
 ## Node colors (one palette, two sections)
 
 `src/shared/node-colors.ts` is the palette AND the control boundary — the picker's list and the

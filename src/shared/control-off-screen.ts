@@ -96,7 +96,12 @@ const STORE_ANSWERED_VERBS: ReadonlySet<string> = new Set([
   // (core/github/control-read.ts). A read needs no canvas at either end, and a background
   // orchestrator polling `prs` must never travel the user's view.
   'issues',
-  'prs'
+  'prs',
+  // A device is a machine fact, not a canvas one: `sim` looks at and drives the Mac's iOS Simulator
+  // through core's one helper process per device (core/sim/control.ts), answered in the shell's
+  // control handler and never forwarded. A background agent testing an app must never travel the
+  // user's view to its project.
+  'sim'
 ])
 
 /**
@@ -167,15 +172,20 @@ export function canColdOpen(verb: string): boolean {
  * `<webview>` guest to do it. `open-browser` merely places the node; the guest is created when
  * that project is next shown, exactly as a cold-opened terminal's PTY is.
  *
- * None of the four takes `--group`, which is why this set owes no worktree question. A verb
- * joining it that does would: `cwdForNewNodeIn` subtracts the worktree store's `staleGroupIds`,
+ * None of the others takes `--group`, which is why this set owes no worktree question.
+ * `open-simulator` takes it, but a Simulator node has no cwd, so there is no worktree question either;
+ * its `--group` is honoured only for the project on screen and refused by name off screen. A verb
+ * joining it that takes a cwd-inheriting `--group` would owe the question: `cwdForNewNodeIn` subtracts the worktree store's `staleGroupIds`,
  * which is epoch-scoped to the ACTIVE project, so off canvas that subtraction cannot be made.
  */
 const OFF_CANVAS_VERBS: ReadonlySet<string> = new Set([
   'show-image',
   'show-video',
   'show-web',
-  'open-browser'
+  'open-browser',
+  // A Simulator node is inert until mounted (the helper starts only when it is on screen), so
+  // writing it into the owning project's stored nodes is the whole effect.
+  'open-simulator'
 ])
 
 export function answersOffCanvas(verb: string): boolean {

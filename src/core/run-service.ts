@@ -119,7 +119,7 @@ async function shellEnv(): Promise<NodeJS.ProcessEnv> {
   return p ? { ...process.env, PATH: p } : process.env
 }
 
-async function listSimulators(): Promise<RunDevice[]> {
+export async function listSimulators(): Promise<RunDevice[]> {
   if (process.platform !== 'darwin') return []
   try {
     const { stdout } = await run('/usr/bin/xcrun', ['simctl', 'list', 'devices', 'available', '-j'], {
@@ -202,6 +202,26 @@ export async function listDevices(refresh = false): Promise<RunDevicesResult> {
     devicesInFlight = null
   })
   return devicesInFlight
+}
+
+/**
+ * `simctl boot` and nothing else: no Simulator.app. The simulator node draws the device itself, so
+ * the app window is exactly what it exists to avoid. Returns the reason on failure so the node can
+ * say it. {@link bootSimulator} (the run node's) is unchanged and still opens the app.
+ */
+export async function bootSimulatorHeadless(udid: unknown): Promise<{ ok: boolean; error?: string }> {
+  if (process.platform !== 'darwin') return { ok: false, error: 'Simulators need macOS.' }
+  if (typeof udid !== 'string' || !SIMULATOR_UDID.test(udid)) return { ok: false, error: 'Not a simulator id.' }
+  try {
+    await run('/usr/bin/xcrun', ['simctl', 'boot', udid], { timeout: 60_000 })
+  } catch (e) {
+    const text = String((e as { stderr?: string }).stderr ?? (e as Error).message)
+    if (!/current state: Booted/i.test(text)) {
+      return { ok: false, error: text.split('\n').find((l) => l.trim()) ?? 'simctl boot failed.' }
+    }
+  }
+  devicesCache = null
+  return { ok: true }
 }
 
 export async function bootSimulator(udid: unknown): Promise<boolean> {

@@ -41,6 +41,7 @@ export function useContextLinkSync(live: LiveContextLinks): void {
         Object.assign(map, buildLinkMap(edges, (id) => {
           const n = byId.get(id)!
           const sticky = n.type === 'sticky'
+          const simulator = n.type === 'simulator'
           const agentId = n.type !== 'terminal' ? undefined : (
             n.data.agentId as string | undefined ??
             ((n.data.tags as string[] | undefined)?.includes('claude') ? 'claude' : undefined) ??
@@ -49,8 +50,12 @@ export function useContextLinkSync(live: LiveContextLinks): void {
           return {
             id, title: n.data.title as string || id, cwd: n.data.cwd as string || '', sticky,
             note: sticky ? (n.data.text as string ?? '') : undefined,
+            ...(simulator ? { simulator: {
+              ...(n.data.simUdid ? { udid: n.data.simUdid as string } : {}),
+              ...(n.data.simName ? { name: n.data.simName as string } : {})
+            } } : {}),
             agentId, sessionId: agentId ? statuses[id]?.sessionId : undefined,
-            accountId: sticky ? undefined : n.data.accountId as string | undefined
+            accountId: sticky || simulator ? undefined : n.data.accountId as string | undefined
           }
         }))
       }

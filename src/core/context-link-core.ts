@@ -38,7 +38,7 @@ export type TranscriptLocator = (sessionId: string, accountId?: string) => Promi
  * the reader then prints a clear "no transcript yet" message).
  */
 export async function resolveLinkTranscript(
-  link: { id: string; title?: string; agentId?: string; sessionId?: string; accountId?: string; note?: string },
+  link: { id: string; title?: string; agentId?: string; sessionId?: string; accountId?: string; note?: string; simulator?: unknown },
   deps: {
     hooked: (id: string) => string
     locators: Record<string, TranscriptLocator>
@@ -46,7 +46,7 @@ export async function resolveLinkTranscript(
     isRemote?: (id: string) => boolean
   }
 ): Promise<string> {
-  if (link.note != null) return ''
+  if (link.note != null || link.simulator) return ''
   const agent = link.agentId ?? 'claude'
   if (agent === 'claude') {
     const hooked = deps.hooked(link.id)
@@ -152,6 +152,8 @@ export interface LinkDocEntry {
   sessionId?: string
   /** Present when this entry is a sticky note: its text. Note entries have no transcript/terminal. */
   note?: string
+  /** Present when this entry is a Simulator node: the device it shows. No transcript/terminal either. */
+  simulator?: { udid?: string; name?: string }
 }
 export interface LinkDoc {
   self: { id: string }
@@ -170,16 +172,19 @@ export function buildLinkDoc(
     self: { id: nodeId },
     links: links.map((n) => {
       const isNote = n.note != null
+      // A note and a Simulator node are both passive entries: no transcript, no tmux session.
+      const passive = isNote || !!n.simulator
       const entry: LinkDocEntry = {
         id: n.id,
         title: n.title,
         cwd: n.cwd ?? '',
-        transcriptPath: isNote ? '' : ctx.transcriptOf(n.id),
-        tmux: isNote ? '' : sessionName(n.id)
+        transcriptPath: passive ? '' : ctx.transcriptOf(n.id),
+        tmux: passive ? '' : sessionName(n.id)
       }
-      if (!isNote && n.agentId) entry.agent = n.agentId
-      if (!isNote && n.sessionId) entry.sessionId = n.sessionId
+      if (!passive && n.agentId) entry.agent = n.agentId
+      if (!passive && n.sessionId) entry.sessionId = n.sessionId
       if (isNote) entry.note = n.note
+      if (n.simulator) entry.simulator = { ...n.simulator }
       return entry
     }),
     tmuxBin: ctx.tmuxBin,
@@ -380,6 +385,11 @@ Commands:
 Linked sticky notes appear in \`list\` marked \`(note)\`; \`summary\` or \`transcript\` on a note
 prints its **current** text (the note is read live from the canvas, so it may have changed
 since it was first linked).
+
+A linked **Simulator node** appears in \`list\` marked \`(simulator: <device>)\`; \`summary\` prints
+the device, its runtime and whether it is booted. It has no transcript and no terminal. It is also
+your default \`sim\` target: drive it with the \`sim\` canvas-control verb (see the
+manage-nodeterm-canvas skill), no \`--node\` needed while it is the only one you are linked to.
 
 \`--node\` is optional when you are linked to exactly one node; otherwise pass the id or title
 from \`list\`. If the CLI says "Not a nodeterm session" or "No linked nodes", there is nothing

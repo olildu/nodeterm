@@ -88,6 +88,8 @@ export interface ContextLinkDeps {
   readRemoteFile?: (nodeId: string, filePath: string, maxBytes: number) => Promise<string | null>
   /** Run one command on a remote node's host and return stdout. null = it failed. */
   runRemoteCommand?: (nodeId: string, command: string) => Promise<string | null>
+  /** One line about an iOS Simulator device ("iPhone 15 · iOS 26.5 · booted"); null = unknown. */
+  simulatorLine?: (udid: string) => Promise<string | null>
 }
 
 // Remote transcripts are read from the END: a long-running session's file reaches tens of MB,
@@ -122,7 +124,7 @@ async function writeLinkFiles(map: ContextLinkMap, revision: number): Promise<vo
   const verified = new Map<string, string>()
   for (const links of Object.values(map)) {
     for (const n of links) {
-      if (n.note != null || resolved.has(n.id)) continue
+      if (n.note != null || n.simulator || resolved.has(n.id)) continue
       const identity = transcriptIdentity(n)
       resolved.set(
         n.id,
@@ -217,7 +219,8 @@ const fetchers: ContextLinkFetch = {
   // captureSession already knows a remote node's tmux lives on the host, so this one call
   // covers both surfaces.
   terminal: async (node) => (pty ? await pty.captureSession(node.id) : ''),
-  opencodeExport: fetchOpencodeExport
+  opencodeExport: fetchOpencodeExport,
+  simulator: async (node) => (node.simulator?.udid && deps.simulatorLine ? await deps.simulatorLine(node.simulator.udid) : null)
 }
 
 /**
@@ -268,7 +271,7 @@ export function setContextLinks(map: ContextLinkMap): Promise<void> {
   const paths = new Map<string, string>()
   for (const links of Object.values(snapshot)) {
     for (const n of links) {
-      if (n.note != null) continue
+      if (n.note != null || n.simulator) continue
       // Dependency lookup can fail; leave discovery to report the failure asynchronously.
       try {
         const identity = transcriptIdentity(n)

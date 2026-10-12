@@ -190,4 +190,43 @@ describe('recreateNodeFromSnapshot', () => {
     expect(snapshot).not.toBeNull()
     expect(snapshot!.type).toBe('files')
   })
+  // Same pairing as the files node above, from both ends: a simulator is restorable (its whole
+  // state is the device it shows), so it must have a buildBase case and must not be UNRESTORABLE.
+  it('recreates a simulator node on the device it showed, under a NEW id', () => {
+    const udid = 'AE342EEF-B624-4060-B9E6-AE6E9EAAC24A'
+    const node = recreateNodeFromSnapshot(
+      snap({
+        type: 'simulator',
+        data: { title: 'iPhone 15', color: '#6ac4dc', group: null, simUdid: udid, simName: 'iPhone 15' }
+      }),
+      baseCtx()
+    )
+    expect(node).not.toBeNull()
+    expect(node!.type).toBe('simulator')
+    expect(node!.data.simUdid).toBe(udid)
+    expect(node!.data.simName).toBe('iPhone 15')
+    expect(node!.id).toMatch(/^sim-/)
+  })
+
+  it('reopens a simulator whose stored device id is not a UUID as one that asks for a device', () => {
+    const node = recreateNodeFromSnapshot(
+      snap({
+        type: 'simulator',
+        data: { title: 'x', color: '#6ac4dc', group: null, simUdid: '$(touch /tmp/pwn)', simName: 'x' }
+      }),
+      baseCtx()
+    )
+    expect(node).not.toBeNull()
+    expect(node!.data.simUdid).toBeUndefined()
+    expect(node!.data.simName).toBeUndefined()
+  })
+
+  it('snapshots a simulator node rather than treating it as unrestorable', () => {
+    const snapshot = snapshotNode(
+      { type: 'simulator', position: { x: 0, y: 0 }, width: 320, height: 740, data: { title: 'Simulator', color: '#6ac4dc', group: null } },
+      []
+    )
+    expect(snapshot).not.toBeNull()
+    expect(snapshot!.type).toBe('simulator')
+  })
 })

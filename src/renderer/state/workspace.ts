@@ -34,6 +34,7 @@ import { codexApprovalCaps } from './codexCli'
 import { folderTitle } from '../lib/explorerCreate'
 import { sshHostKey } from '@shared/ssh'
 import { normalizeNodeIcon } from '@shared/node-icon'
+import { normalizeSimName, normalizeSimUdid } from '@shared/sim'
 import { normalizeIssueRef, type IssueRef } from '@shared/github-issue-ref'
 import { isSafeNodeId } from '@shared/safe-id'
 import { openerByTarget, recordedOpenerOf } from '../lib/teamProgress'
@@ -72,6 +73,9 @@ const BROWSER_SIZE = { width: 800, height: 560 }
 // Tall and narrow: a file manager is a LIST, and the thing that runs out first is vertical room
 // for entries, not horizontal room for names (which ellipsize).
 const FILES_SIZE = { width: 340, height: 460 }
+// Phone-shaped: an iPhone's screen is ~0.46 wide-to-tall, plus a header and a button row. Narrow on
+// purpose — the canvas is zoomable, and the node is a handheld, not a window.
+const SIMULATOR_SIZE = { width: 400, height: 780 }
 
 /** Height of a node when collapsed (header only). */
 export const COLLAPSED_HEIGHT = 40
@@ -79,7 +83,7 @@ export const COLLAPSED_HEIGHT = 40
 /** The node kinds that render a header-only collapsed state. Any other kind squashed to
  *  COLLAPSED_HEIGHT crushes its content (a group frame strands its children outside it), so
  *  neither the menu nor the toggle offers collapse to them. */
-export const COLLAPSIBLE_KINDS: ReadonlySet<string> = new Set(['terminal', 'sticky', 'files'])
+export const COLLAPSIBLE_KINDS: ReadonlySet<string> = new Set(['terminal', 'sticky', 'files', 'simulator'])
 export const isCollapsible = (n: Pick<CanvasNode, 'type'>): boolean =>
   COLLAPSIBLE_KINDS.has(n.type ?? 'terminal')
 /** Whether the collapse toggle may act on `n`: a collapsible kind either way, or ANY node that is
@@ -192,6 +196,10 @@ export interface NodeData {
   commitOid?: string
   /** dino-only: best score reached in the T-Rex Runner game. */
   highScore?: number
+  /** simulator-only: the iOS Simulator device (UDID) this node shows. Validated at both serializer seams. */
+  simUdid?: string
+  /** simulator-only: the device's name when picked — display only, the UDID is the identity. */
+  simName?: string
   /** Which agent runs in this terminal node (claude/codex/gemini/custom). */
   agentId?: AgentId
   /** Model selected for this node through the shared model gateway. */
@@ -1258,6 +1266,35 @@ export function createFilesNode(
       group: null,
       cwd,
       ...(sshFs ? { sshFs: true } : {})
+    }
+  }
+}
+
+/**
+ * Creates a simulator node: the host's iOS Simulator drawn and driven inside the canvas. Born with
+ * no device unless one is given — the node's own picker chooses, and the choice is persisted as
+ * `simUdid`. The device is a MACHINE fact (does this Mac have it?), so the node checks it at mount
+ * rather than trusting a UDID that arrived in a shared project file.
+ */
+export function createSimulatorNode(
+  index: number,
+  center?: { x: number; y: number },
+  device?: { udid: string; name?: string }
+): CanvasNode {
+  const simUdid = normalizeSimUdid(device?.udid)
+  const simName = normalizeSimName(device?.name)
+  return {
+    id: nextId('sim'),
+    type: 'simulator',
+    ...placeNode('simulator', center, index, SIMULATOR_SIZE.width, SIMULATOR_SIZE.height),
+    data: {
+      title: simName ?? 'Simulator',
+      // Tracks the device's name until the user renames it (same contract as an agent's session name).
+      titleAuto: true,
+      color: '#6ac4dc',
+      group: null,
+      ...(simUdid ? { simUdid } : {}),
+      ...(simUdid && simName ? { simName } : {})
     }
   }
 }
@@ -2853,6 +2890,10 @@ export function nodeStatesToFlow(states: CanvasNodeState[]): CanvasNode[] {
         diffStaged: n.diffStaged,
         commitOid: n.commitOid,
         highScore: n.highScore,
+        // Same seam rule as the icon: a git-shared file becoming live data. A value that is not a
+        // UUID becomes "no device chosen" (the node is kept — it just asks for one).
+        simUdid: normalizeSimUdid(n.simUdid),
+        simName: normalizeSimUdid(n.simUdid) ? normalizeSimName(n.simName) : undefined,
         agentId,
         agentModel: n.agentModel,
         // Same seam rule as the icon: a git-shared file becoming live data. A malformed or hostile
@@ -2901,7 +2942,9 @@ export function flowToNodeStates(nodes: CanvasNode[], retainInitialCommand = tru
                       ? TRIGGER_SIZE
                       : kind === 'files'
                         ? FILES_SIZE
-                        : TERMINAL_SIZE
+                        : kind === 'simulator'
+                          ? SIMULATOR_SIZE
+                          : TERMINAL_SIZE
   return nodes
     .map((n) => {
       const kind: NodeKind = (n.type as NodeKind) ?? 'terminal'
@@ -2944,6 +2987,9 @@ export function flowToNodeStates(nodes: CanvasNode[], retainInitialCommand = tru
         diffStaged: n.data.diffStaged,
         commitOid: n.data.commitOid,
         highScore: n.data.highScore,
+        // Re-validated on the way OUT as well — whatever we write is what the next machine trusts.
+        simUdid: normalizeSimUdid(n.data.simUdid),
+        simName: normalizeSimUdid(n.data.simUdid) ? normalizeSimName(n.data.simName) : undefined,
         agentId: n.data.agentId,
         agentModel: n.data.agentModel,
         // Re-validated on the way OUT as well — the file is only as trustworthy as its last writer.

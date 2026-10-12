@@ -17,6 +17,7 @@ import {
   isCurrentLinkDirection
 } from './noteLink'
 import type { CanvasNodeState } from '@shared/types'
+import { LINK_NOT_LINKABLE } from '@shared/canvas-link'
 
 const term = (contextCapable = false) => ({ kind: 'terminal', contextCapable })
 const sticky = () => ({ kind: 'sticky', contextCapable: false })
@@ -64,7 +65,7 @@ describe('planBridges', () => {
     const plan = planBridges('n1', ['p1', 'n2'], lookup, [])
     expect(plan.linked).toEqual(['n2'])
     expect(plan.skipped).toEqual([
-      { id: 'p1', why: 'not linkable (needs two context-capable agents, or a sticky + terminal)' }
+      { id: 'p1', why: LINK_NOT_LINKABLE }
     ])
   })
 

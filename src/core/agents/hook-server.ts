@@ -1,4 +1,5 @@
 import { REPORT_OUTCOME_CONTROL_REFUSAL } from '../../shared/station-outcome'
+import { SIM_CONTROL_REFUSAL } from '../sim/verb'
 import { sessionContextWindow } from '../model-window'
 import { labelHeldForRevision } from './permission-decision'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'http'
@@ -303,7 +304,14 @@ export const requiresVerified: ReadonlySet<string> = new Set([
   // CALLER's node, so a caller nobody can verify could name any node and read another project's
   // lane — bound sessions and dispatch state included. NEW verbs: fail-closed strands nobody.
   'issues',
-  'prs'
+  'prs',
+  // Drives a device the user may be watching, and its input reaches the app under test and the
+  // device pasteboard. `legacy` means "we cannot judge this caller"; an unjudgeable caller does
+  // not get a finger on the user's simulator.
+  'sim',
+  // Adds a Simulator node and links it to the caller as its default `sim` target; the link is the
+  // grant, so the caller must be provably the node it names.
+  'open-simulator'
 ])
 
 /**
@@ -362,6 +370,7 @@ export function verifiedRefusalFor(verb: string): string {
   if (verb === 'run') return RUN_CONTROL_REFUSAL
   if (verb === 'report-outcome') return REPORT_OUTCOME_CONTROL_REFUSAL
   if (verb === 'issues' || verb === 'prs') return GITHUB_READ_CONTROL_REFUSAL
+  if (verb === 'sim' || verb === 'open-simulator') return SIM_CONTROL_REFUSAL
   return MESSAGING_CONTROL_REFUSAL
 }
 

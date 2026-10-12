@@ -180,6 +180,10 @@ export function buildRelayApi(
     // `...local` (a v1 degrade: they read/write on this machine, not the host). boardLog is now
     // bridged to the host (see above) — it no longer rides `...local`.
     chat: stub.chat,
+    // The simulator is THIS machine's Xcode device, driven by the desktop's native helper. A relay
+    // tab's simulator node names a device on the HOST's Mac, so `...local` would aim a foreign UDID
+    // at this machine's simulator (and its pasteboard). The stub answers `unsupported`.
+    sim: stub.sim,
     // `recentConversations` stays on `...local` ON PURPOSE: "Open recent" lists THIS machine's agent
     // histories and resumes them into this machine's local projects only. The host's list is
     // host-only (`HOST_ONLY_CHANNELS`) — a peer never reads the host's conversation titles.

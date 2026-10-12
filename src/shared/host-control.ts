@@ -66,6 +66,9 @@ export const HOST_ONLY_CHANNEL_PREFIXES: readonly string[] = [
   // may create, list (every link's URL carries its secret), stop, kick or chat as the owner. The
   // viewer's own protocol is `watch:*`, which this prefix deliberately does not match.
   'watchLink:',
+  // The simulator node: frames, touch and keyboard input, and booting a device on the host's own
+  // Xcode. A relay peer driving it would be driving this machine's simulator (and its pasteboard).
+  'sim:',
   // Agent-integration consent status: paths in the host's home it kept or wrote. The consent itself
   // is in settings (already host-only).
   'integrations:'

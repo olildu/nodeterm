@@ -395,7 +395,7 @@ export interface RecycledInfo {
 // 'subagent' and 'loop' are render-only (ephemeral hook-driven viz) and never persisted.
 // 'trigger' is a first-class PERSISTED kind (issue #493) — the canvas-owned schedule node; its
 // spec rides `CanvasNodeState.trigger` and is sanitized on every load path (@shared/trigger).
-export type NodeKind = 'terminal' | 'sticky' | 'group' | 'editor' | 'diff' | 'video' | 'web' | 'browser' | 'files' | 'subagent' | 'loop' | 'dino' | 'trigger'
+export type NodeKind = 'terminal' | 'sticky' | 'group' | 'editor' | 'diff' | 'video' | 'web' | 'browser' | 'files' | 'simulator' | 'subagent' | 'loop' | 'dino' | 'trigger'
 
 /** Persisted state of a single canvas node (terminal, sticky note, group frame, or editor). */
 /**
@@ -577,6 +577,15 @@ export interface CanvasNodeState {
   textUpdatedBy?: string
   // dino-only: best score reached in the T-Rex Runner game.
   highScore?: number
+  /**
+   * simulator-only: the iOS Simulator device (CoreSimulator UDID) this node shows. Git-shared and
+   * hand-editable, so it is validated as a UUID at BOTH serializer seams (`normalizeSimUdid`) — a
+   * malformed value is "no device chosen", never passed to the helper. Machine-local reality
+   * (does the device exist HERE?) is the node's own question at mount time.
+   */
+  simUdid?: string
+  /** simulator-only: the device's name when it was picked. Display only; the UDID is the identity. */
+  simName?: string
   // editor / diff
   filePath?: string
   /**
@@ -2894,6 +2903,9 @@ export interface ContextLinkInfo {
   cwd?: string
   /** Set when the linked node is a sticky note: its current text. Note entries have no transcript/terminal. */
   note?: string
+  /** Set when the linked node is a Simulator node: the device it shows. The entry has no transcript
+   *  or terminal; the device's live state is read when the entry is printed. */
+  simulator?: { udid?: string; name?: string }
   /** The linked node's agent CLI ('claude' | 'codex' | 'gemini') — selects the CLI transcript parser. */
   agentId?: string
   /** Latest known provider session id — lets main resolve the transcript via the per-agent locators. */
@@ -4262,6 +4274,9 @@ export interface NodeTerminalApi {
   usage: UsageApi
   sessionMemory: SessionMemoryApi
   devPorts: import('./dev-ports').DevPortsApi
+  /** Simulator node: the host's iOS Simulator drawn and driven by `sim-helper`. Desktop macOS only —
+   *  the Server Edition and relay tabs answer `unsupported`. */
+  sim: import('./sim').SimApi
   /** "Open recent" — the newest agent conversations in this machine's CLI histories. */
   recentConversations: import('./recent-conversations').RecentConversationsApi
   wallpaper: import('./wallpaper').WallpaperApi

@@ -292,3 +292,43 @@ describe('the control shim translates flags', () => {
     ])
   })
 })
+
+// The `sim` verb's flags, through the REAL loop. The grammar (core/sim/verb.ts) is written to parse
+// the same under the current loop and the older one an SSH host may still run, so the shapes that
+// matter are pinned here: a value with spaces, a comma list, a value that starts with `-`, and a
+// bare switch before and after other flags. `parseSimArgs` is then run on what the shim built.
+describe('the sim verb parses through the shim (current loop)', () => {
+  const UDID = 'AE342EEF-B624-4060-B9E6-AE6E9EAAC24A'
+  const toArgs = (pairs: string[]): Record<string, string> =>
+    Object.fromEntries(pairs.map((p) => [p.slice(4, p.indexOf('=')), p.slice(p.indexOf('=') + 1)]))
+
+  it('carries labels with spaces, comma lists and bare switches intact', () => {
+    expect(run(['sim', '--udid', UDID, '--tap-label', 'Wi-Fi Settings'])).toEqual([`arg.udid=${UDID}`, 'arg.tap-label=Wi-Fi Settings'])
+    expect(run(['sim', '--udid', UDID, '--swipe', '196,700,196,200', '--ms', '400'])).toEqual([
+      `arg.udid=${UDID}`,
+      'arg.swipe=196,700,196,200',
+      'arg.ms=400'
+    ])
+    // A bare switch anywhere on the line: valueless, and the NEXT flag survives (the peek).
+    expect(run(['sim', '--describe', '--udid', UDID])).toEqual(['arg.describe=', `arg.udid=${UDID}`])
+    expect(run(['sim', '--udid', UDID, '--describe'])).toEqual([`arg.udid=${UDID}`, 'arg.describe='])
+    expect(run(['sim', '--udid', UDID, '--describe', 'true'])).toEqual([`arg.udid=${UDID}`, 'arg.describe=true'])
+  })
+
+  it('a value that starts with -- needs the = form, exactly like every other verb', () => {
+    expect(run(['sim', '--udid', UDID, '--type=--help'])).toEqual([`arg.udid=${UDID}`, 'arg.type=--help'])
+  })
+
+  it('what the shim built is a valid call', async () => {
+    const { parseSimArgs } = await import('../core/sim/verb')
+    for (const argv of [
+      ['--udid', UDID, '--describe'],
+      ['--list'],
+      ['--udid', UDID, '--tap-label', 'Wi-Fi Settings', '--no-wait', 'true'],
+      ['--udid', UDID, '--key', 'Enter', '--mods', 'cmd,shift']
+    ]) {
+      const built = toArgs(run(['sim', ...argv]))
+      expect(parseSimArgs(built), argv.join(' ')).not.toHaveProperty('error')
+    }
+  })
+})

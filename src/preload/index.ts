@@ -550,6 +550,39 @@ const api: NodeTerminalApi = {
     forward: (req: DevPortForwardRequest) => ipcRenderer.invoke(IPC.devPortsForward, req),
     unforward: (req: { projectId: string; localPort: number }) => ipcRenderer.invoke(IPC.devPortsUnforward, req)
   },
+  // The simulator node. Frames arrive as binary (a Uint8Array) on a per-device channel, are
+  // acknowledged one by one (`ackFrame`) so core never queues frames for a slow window, and every
+  // request is forwarded verbatim: core validates it (`sanitizeSimCommand`), this layer never does.
+  sim: {
+    availability: () => ipcRenderer.invoke(IPC.simAvailability),
+    devices: () => ipcRenderer.invoke(IPC.simDevices),
+    attach: (udid, viewerId, view) => ipcRenderer.invoke(IPC.simAttach, udid, viewerId, view),
+    detach: (udid, viewerId) => ipcRenderer.send(IPC.simDetach, udid, viewerId),
+    setView: (udid, viewerId, view) => ipcRenderer.send(IPC.simView, udid, viewerId, view),
+    boot: (udid) => ipcRenderer.invoke(IPC.simBoot, udid),
+    command: (udid, cmd) => ipcRenderer.invoke(IPC.simCommand, udid, cmd),
+    screenshot: (udid) => ipcRenderer.invoke(IPC.simScreenshot, udid),
+    input: (udid, cmd) => ipcRenderer.send(IPC.simInput, udid, cmd),
+    ackFrame: (udid) => ipcRenderer.send(IPC.simFrameAck, udid),
+    onFrame: (udid, listener) => {
+      const channel = IPC.simFrame(udid)
+      const handler = (_e: unknown, data: Uint8Array) => listener(data)
+      ipcRenderer.on(channel, handler)
+      return () => ipcRenderer.removeListener(channel, handler)
+    },
+    onStatus: (udid, listener) => {
+      const channel = IPC.simStatus(udid)
+      const handler = (_e: unknown, status: Parameters<typeof listener>[0]) => listener(status)
+      ipcRenderer.on(channel, handler)
+      return () => ipcRenderer.removeListener(channel, handler)
+    },
+    onAgentEvent: (listener) => {
+      const handler = (_e: unknown, event: Parameters<typeof listener>[0]) => listener(event)
+      ipcRenderer.on(IPC.simAgentEvent, handler)
+      return () => ipcRenderer.removeListener(IPC.simAgentEvent, handler)
+    },
+    linkRemoved: (ownerNodeId, simNodeId) => ipcRenderer.send(IPC.simLinkRemoved, ownerNodeId, simNodeId)
+  },
   recentConversations: {
     list: (req?: RecentConversationsRequest) =>
       ipcRenderer.invoke(IPC.recentConversationsList, req)

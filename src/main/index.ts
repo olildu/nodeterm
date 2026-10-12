@@ -8,9 +8,9 @@ import { join, resolve, posix } from 'path'
 import { startSessionNameSweep, displayNodeTitle } from '../core/session-name-sweep'
 import { startTriggerService } from '../core/trigger-service'
 import { readAgentSessionName, type AgentSessionNameDeps } from '../core/agent-session-name'
-import { readFile, realpath as fsRealpath, lstat as fsLstat, writeFile as fsWriteFile } from 'fs/promises'
+import { readFile, realpath as fsRealpath, lstat as fsLstat, writeFile as fsWriteFile, mkdir as fsMkdir } from 'fs/promises'
 import { existsSync, statSync, openSync, fstatSync, readFileSync, closeSync } from 'fs'
-import { homedir, hostname } from 'os'
+import { homedir, hostname, tmpdir } from 'os'
 import { randomUUID } from 'crypto'
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, Notification, powerMonitor, safeStorage, screen, shell, systemPreferences, webContents } from 'electron'
 import { IPC } from '../shared/ipc'
@@ -352,6 +352,11 @@ import { refreshCodexIdentityCaps, registerCodexIdentityIpc } from '../core/code
 import { codexCliCaps, registerCodexCliIpc } from '../core/codex-cli'
 import { registerWallpaperIpc } from '../core/wallpaper'
 import { registerRunConfigIpc, stopAllRunWatches } from '../core/run-service'
+import { disposeSim, registerSimIpc } from '../core/sim/service'
+import { createOpenSimulatorPrep, createSimControl } from '../core/sim/control'
+import { createSimLinkLedger } from '../core/sim/links'
+import { canContextLink } from '../shared/agents/config'
+import { resolveSimScreenshotPath } from '../core/sim/screenshot-path'
 import {
   bindCodexThreadIdentity,
   setCodexThreadIdentityAuthSecret,
@@ -545,6 +550,7 @@ const speechService = new SpeechService({ models: whisperModels, isPremium })
 // Releases a departed client's GitHub issue subscriptions (and the 60 s poll they keep alive).
 // Relay peers call it from onPeerGone; the app window from releaseOnRendererDeparture.
 let dropGitHubClient: ((id: number) => void) | undefined
+let dropSimSender: ((id: number) => void) | undefined
 wirePeerRegistry({
   setFlow: (id, sid, resume, owner) => ptyManager.setFlow(id, sid, resume, owner),
   captureForResync: (sid) => ptyManager.captureForResync(sid),
@@ -1160,6 +1166,8 @@ function createWindow(): BrowserWindow {
   // The GitHub board's subscriptions, released on every way this page can go: closed, crashed,
   // or replaced by a reload (which reuses this webContents id with nothing subscribed).
   releaseOnRendererDeparture(win, win.webContents, () => dropGitHubClient?.(presenceId))
+  // The simulator node's viewers too: a reload gives the page new viewer ids and never detaches the old ones.
+  releaseOnRendererDeparture(win, win.webContents, () => dropSimSender?.(presenceId))
   win.on('closed', () => {
     presenceHub.leave(presenceId)
     // This webContents is a pty SUBSCRIBER (co-attach: one pty, N subscribers, keyed by the
@@ -1524,6 +1532,9 @@ app.whenReady().then(async () => {
   registerCodexCliIpc()
   registerWallpaperIpc(settingsStore)
   registerRunConfigIpc()
+  // The simulator node's host side (macOS only; the Server Edition deliberately does not register it).
+  const simService = registerSimIpc()
+  dropSimSender = (id) => simService.dropSender(id)
   // Warm the `claude --version` probe now (it spawns a login shell + node, ~sub-second) so the
   // renderer's first `claude.cliCaps()` — awaited on the launch path of a cold-restored agent
   // node — resolves from cache instead of racing the probe into a conservative "no auto".
@@ -3995,6 +4006,9 @@ app.whenReady().then(async () => {
     // Reload-on-save watchers die with the app; the runs themselves live on in tmux.
     stopAllRunWatches()
   })
+  // Simulator helpers: one per device in use. `will-quit` (not `before-quit`, which a deferred quit
+  // can abandon) — they would also end on stdin EOF when we exit, so this only makes it prompt.
+  app.on('will-quit', () => disposeSim())
   ipcMain.on(
     IPC.agentControlResult,
     (
@@ -4171,6 +4185,49 @@ app.whenReady().then(async () => {
         : { ok: false, error: result.error, message: result.message }
     )
   }
+  // `sim` — an agent looks at and drives the iOS Simulator through core's one helper per device
+  // (core/sim/control.ts). Answered in MAIN like `browser`: the device, the helper process and the
+  // screenshot write are all host-side. No consent switch (the device holds nothing of the host's
+  // and the user watches the node); verified identity is the gate. The shell supplies what core
+  // cannot reach: the persisted nodes and the SAME screenshot path jail `browser` uses.
+  // The per-run memory of agent↔device links this run auto-created and the ones the user removed;
+  // shared with the removal IPC below so a deleted link is not re-created by the agent's next call.
+  const simLinkLedger = createSimLinkLedger()
+  ipcMain.on(IPC.simLinkRemoved, (event, ownerNodeId: unknown, simNodeId: unknown) => {
+    // Main window only (a <webview> guest is a webContents in this process); both must be strings.
+    if (getMainWindow()?.webContents.id !== event.sender.id) return
+    if (typeof ownerNodeId === 'string' && typeof simNodeId === 'string') {
+      simLinkLedger.noteRemoved(ownerNodeId, simNodeId)
+    }
+  })
+  const handleSimVerb = createSimControl({
+    service: simService,
+    projectIdOfNode,
+    ledger: simLinkLedger,
+    // Links are the caller's own project's persisted bridges (an unsaved drag lands within the
+    // autosave debounce; an auto-link of this run is covered by the ledger).
+    bridges: (projectId) => workspaceStore.persistedCanvases().find((c) => c.id === projectId)?.bridges ?? [],
+    canAutoLink: (nodeId) => {
+      const agentId = workspaceStore.getNodeResolved(nodeId)?.agentId ?? mirrorEntry(nodeId)?.agentId
+      return !!agentId && canContextLink(agentId)
+    },
+    emit: (event) => getMainWindow()?.webContents.send(IPC.simAgentEvent, event),
+    simulatorNodes: (projectId) =>
+      (workspaceStore.persistedCanvases().find((c) => c.id === projectId)?.nodes ?? [])
+        .filter((n) => n.kind === 'simulator')
+        .map((n) => ({ id: n.id, title: n.title ?? '', ...(n.simUdid ? { udid: n.simUdid } : {}) })),
+    projectCwd: (projectId) => workspaceStore.projectCwdFor(projectId),
+    tempDir: () => tmpdir(),
+    // Inside the project OR the OS temp area (core/sim/screenshot-path.ts); real paths, symlink escapes refused.
+    resolvePath: (cwd, raw) =>
+      resolveSimScreenshotPath(cwd, process.platform === 'win32' ? [tmpdir()] : [tmpdir(), '/tmp'], raw, {
+        realpath: (p) => fsRealpath(p),
+        lstat: (p) => fsLstat(p),
+        mkdir: (p, o) => fsMkdir(p, o)
+      }),
+    writeFile: (p, d) => fsWriteFile(p, d)
+  })
+  const prepOpenSimulator = createOpenSimulatorPrep({ service: simService })
   hookServer.setControlHandler(async ({ verb, nodeId, args, verified, onLateAnswer }) => {
     // When the request ARRIVED — before a `write` / `run` typed anything. The hand-over tracker
     // stamps the new work with it, so a turn the typed text starts is always later.
@@ -4220,6 +4277,15 @@ app.whenReady().then(async () => {
     // the debugger handle and the CDP allowlist are main-side, and the renderer is the more
     // attackable half. Every other verb still round-trips to the renderer below.
     if (verb === 'browser') return handleBrowserVerb(nodeId, args, verified)
+    // Answered in MAIN as well (see handleSimVerb); never forwarded to the renderer.
+    if (verb === 'sim') return handleSimVerb({ nodeId, args, verified })
+    // `open-simulator`: main binds the device (it owns the simctl listing) and then FORWARDS the
+    // resolved args; the renderer creates the node and the links.
+    if (verb === 'open-simulator') {
+      const prep = await prepOpenSimulator({ args, verified })
+      if ('args' in prep) args = prep.args
+      else return prep
+    }
     // Answered in MAIN for the same reasons as `browser`; see handleReportIssueVerb.
     if (verb === 'report-issue') return handleReportIssueVerb(nodeId, args, verified)
     // ── `open-project` + `--project` targeting, gated in MAIN before anything is forwarded
@@ -4355,6 +4421,12 @@ app.whenReady().then(async () => {
   // These three deps are the whole of what `src/core` cannot answer for itself. Fail-open
   // throughout — a failed remote read renders as "no transcript yet", never as an error.
   initContextLink(ptyManager, {
+    // A linked Simulator node's device line for `get-linked-context summary` (one `simctl` listing).
+    simulatorLine: async (udid) => {
+      const found = await simService.devices()
+      const d = found.devices.find((x) => x.udid === udid)
+      return d ? `${d.name} · ${d.runtime} · ${d.booted ? 'booted' : 'shut down'}` : null
+    },
     isRemoteNode: (nodeId) => !!ptyManager.sshRemoteForNode(nodeId),
     readRemoteFile: async (nodeId, filePath, maxBytes) => {
       const rt = ptyManager.sshRemoteForNode(nodeId)

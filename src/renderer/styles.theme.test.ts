@@ -122,7 +122,12 @@ describe('every CSS variable resolves', () => {
     '--cmascot-h',
     '--cmascot-sheet-w',
     '--cmascot-sheet-h', // notch HUD sprite sheets
-    '--swimlane-color' // GlobalKanbanView swimlane left border, per project
+    '--swimlane-color', // GlobalKanbanView swimlane left border, per project
+    '--sim-clip-folded', // SimulatorNode, clip-path hugging the measured phone (lib/simNodeChrome)
+    '--sim-clip-open',
+    '--sim-color', // SimulatorNode, the node colour edge
+    '--sim-header-h', // SimulatorNode, the reserved header strip
+    '--sim-phone-top' // SimulatorNode, the driving chip sits just above the phone while folded
   ])
 
   it('references no variable that is never defined', () => {

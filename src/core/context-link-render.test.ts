@@ -14,7 +14,8 @@
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'fs'
 import path from 'path'
-import { linesFromGrok, renderTranscriptLines } from './context-link-render'
+import { linesFromGrok, renderContextLink, renderTranscriptLines, type ContextLinkFetch } from './context-link-render'
+import type { LinkDoc, LinkDocEntry } from './context-link-core'
 
 const buf = readFileSync(path.join(__dirname, '__fixtures__/grok/chat_history.jsonl'), 'utf8')
 
@@ -104,5 +105,54 @@ describe('linesFromGrok over a real chat_history.jsonl', () => {
 
   it('is routed by agent id, with no call-site comparison', () => {
     expect(renderTranscriptLines('grok', buf)).toEqual(linesFromGrok(buf))
+  })
+})
+
+describe('a linked Simulator node', () => {
+  const entry = (over: Partial<LinkDocEntry> = {}): LinkDocEntry => ({
+    id: 'dev',
+    title: 'Phone',
+    cwd: '',
+    transcriptPath: '',
+    tmux: '',
+    simulator: { udid: 'AE342EEF-B624-4060-B9E6-AE6E9EAAC24A', name: 'iPhone 15' },
+    ...over
+  })
+  const doc = (links: LinkDocEntry[]): LinkDoc => ({ self: { id: 'a' }, links, tmuxBin: null, tmuxSocket: 's' })
+  const noFetch: ContextLinkFetch = {
+    transcript: async () => { throw new Error('a device has no transcript') },
+    terminal: async () => { throw new Error('a device has no terminal') },
+    opencodeExport: async () => { throw new Error('not opencode') }
+  }
+
+  it('list marks it with the device', async () => {
+    const out = await renderContextLink(doc([entry()]), 'list', {}, noFetch)
+    expect(out).toContain('- Phone (simulator: iPhone 15) (id: dev)')
+  })
+  it('summary prints the device state the shell read — and never touches a transcript', async () => {
+    const out = await renderContextLink(doc([entry()]), 'summary', {}, {
+      ...noFetch,
+      simulator: async () => 'iPhone 15 · iOS 26.5 · booted'
+    })
+    expect(out).toContain('=== Phone — simulator ===')
+    expect(out).toContain('iPhone 15 · iOS 26.5 · booted')
+    expect(out).toMatch(/default target/)
+  })
+  it('transcript prints the same; terminal says there is none', async () => {
+    const f = { ...noFetch, simulator: async () => 'iPhone 15 · iOS 26.5 · shut down' }
+    expect(await renderContextLink(doc([entry()]), 'transcript', {}, f)).toContain('shut down')
+    expect(await renderContextLink(doc([entry()]), 'terminal', {}, f)).toMatch(/no terminal/)
+  })
+  it('degrades honestly when the state cannot be read or no device is chosen', async () => {
+    expect(await renderContextLink(doc([entry()]), 'summary', {}, noFetch)).toContain('state could not be read')
+    const bare = entry({ simulator: {} })
+    expect(await renderContextLink(doc([bare]), 'summary', {}, noFetch)).toContain('No device is chosen')
+    expect(await renderContextLink(doc([bare]), 'list', {}, noFetch)).toContain('- Phone (simulator) (id: dev)')
+  })
+  it('is picked by --node like any other entry, and several linked nodes still need --node', async () => {
+    const agent = entry({ id: 'x', title: 'Other', simulator: undefined, agent: 'claude' })
+    const multi = await renderContextLink(doc([entry(), agent]), 'summary', {}, noFetch)
+    expect(multi).toContain('Several linked nodes')
+    expect(multi).toContain('Phone (simulator: iPhone 15)')
   })
 })

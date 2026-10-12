@@ -1,7 +1,7 @@
 // Issue #852: a context link may be one-way. These pin the pure "who reads whom" rule that both
 // shells (desktop renderer, Server Edition) derive the read-authorization map from.
 import { describe, it, expect } from 'vitest'
-import { gainedReaders, linkReadPairs, planBridges, withLinkReader } from './canvas-link'
+import { classifyLink, gainedReaders, LINK_NOT_LINKABLE, linkReadPairs, planBridges, withLinkReader, type LinkEndpoint } from './canvas-link'
 
 describe('linkReadPairs', () => {
   it('a link without a reader is bidirectional (every link persisted before #852)', () => {
@@ -89,5 +89,67 @@ describe('planBridges oneWay', () => {
   it('note links are one-way by nature and never carry a reader', () => {
     const plan = planBridges('n1', ['s1'], lookup, [], { oneWay: true })
     expect(plan.edges).toEqual([{ id: 'bridge-s1-n1', source: 's1', target: 'n1' }])
+  })
+})
+
+const agent = (contextCapable = true): LinkEndpoint => ({ kind: 'terminal', contextCapable })
+const device: LinkEndpoint = { kind: 'simulator', contextCapable: false }
+const note: LinkEndpoint = { kind: 'sticky', contextCapable: false }
+
+describe('classifyLink — Simulator nodes', () => {
+  it('a Simulator node + a context-capable agent is a sim link, in either order', () => {
+    expect(classifyLink(device, agent())).toBe('sim')
+    expect(classifyLink(agent(), device)).toBe('sim')
+  })
+  it('refuses every other pairing with a device', () => {
+    expect(classifyLink(device, agent(false))).toBeNull() // a plain shell has nothing to drive it with
+    expect(classifyLink(device, device)).toBeNull()
+    expect(classifyLink(device, note)).toBeNull()
+    expect(classifyLink(note, device)).toBeNull()
+    expect(classifyLink(device, { kind: 'editor', contextCapable: false })).toBeNull()
+  })
+  it('leaves the existing kinds alone', () => {
+    expect(classifyLink(agent(), agent())).toBe('context')
+    expect(classifyLink(note, agent(false))).toBe('note')
+  })
+})
+
+describe('planBridges — Simulator nodes', () => {
+  const nodes: Record<string, LinkEndpoint> = { a: agent(), b: agent(), s: device, t: agent(false), n: note }
+  const lookup = (id: string) => nodes[id] ?? null
+
+  it('normalizes to device → agent whichever way the caller names them', () => {
+    const fromAgent = planBridges('a', ['s'], lookup, [])
+    expect(fromAgent.edges).toEqual([{ id: 'bridge-s-a', source: 's', target: 'a' }])
+    expect(fromAgent.linked).toEqual(['s'])
+    const fromDevice = planBridges('s', ['a'], lookup, [])
+    expect(fromDevice.edges).toEqual([{ id: 'bridge-s-a', source: 's', target: 'a' }])
+  })
+  it('one-way never applies: a device cannot read, so no reader is stamped', () => {
+    expect(planBridges('a', ['s'], lookup, [], { oneWay: true }).edges).toEqual([
+      { id: 'bridge-s-a', source: 's', target: 'a' }
+    ])
+  })
+  it('dedupes in either direction, within the batch and against existing edges', () => {
+    expect(planBridges('a', ['s'], lookup, [{ source: 'a', target: 's' }]).skipped).toEqual([
+      { id: 's', why: 'already linked' }
+    ])
+    const batch = planBridges('a', ['s', 's'], lookup, [])
+    expect(batch.edges).toHaveLength(1)
+    expect(batch.skipped).toEqual([{ id: 's', why: 'already linked' }])
+  })
+  it('keeps the matrix for everything it must still refuse', () => {
+    const plan = planBridges('s', ['t', 'n', 's', 'a'], lookup, [])
+    expect(plan.linked).toEqual(['a'])
+    expect(plan.skipped).toEqual([
+      { id: 't', why: LINK_NOT_LINKABLE },
+      { id: 'n', why: LINK_NOT_LINKABLE },
+      { id: 's', why: 'same node' }
+    ])
+  })
+  it('an agent may have several devices (the verb then asks for --node)', () => {
+    const two: Record<string, LinkEndpoint> = { ...nodes, s2: device }
+    const plan = planBridges('a', ['s', 's2'], (id) => two[id] ?? null, [])
+    expect(plan.edges.map((e) => e.id)).toEqual(['bridge-s-a', 'bridge-s2-a'])
   })
 })

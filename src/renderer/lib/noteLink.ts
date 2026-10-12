@@ -177,6 +177,17 @@ export function buildContextLinkNote(
   return `[nodeterm] You are now linked to "${other}". When you need its context (and only then) run: sh "${shimPath}" list — then summary | transcript | terminal --node <id>. Details are in the get-linked-context section of your global agent instructions. No action needed now — acknowledge briefly and do not run these commands yet.`
 }
 
+/**
+ * The one-shot message injected into an agent when a Simulator node is linked to it (drawn by the
+ * user or created by `link`). Same rules as the other discovery notes: single-line (sendText
+ * appends Enter), the title is quoted through `oneLine` (a node title is agent-settable), and it
+ * defuses itself — it names the verb, it does not ask for anything. The auto-link made by the
+ * agent's own `sim` call sends NO such note: the agent is already using the device.
+ */
+export function buildSimLinkNote(simTitle: string): string {
+  return `[nodeterm] Simulator node "${oneLine(simTitle)}" is now linked to you: it is your default target for the sim canvas-control verb (no --node needed while it is the only one you are linked to). See the manage-nodeterm-canvas skill. No action needed now — just acknowledge briefly.`
+}
+
 // The link-map builders moved to @shared: the Server Edition derives the same map from persisted
 // project files, and it may not import renderer code. Re-exported here so this module stays the
 // one place the canvas asks about link edges.

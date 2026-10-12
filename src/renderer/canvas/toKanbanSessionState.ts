@@ -40,6 +40,7 @@ export function toKanbanSessionState(n: CanvasNodeState): KanbanSession | null {
       spawn: {} as ModalSpawn
     }
   }
+  // `simulator` and `files` are not cards (see toKanbanSession.ts): they fall through to null here.
   if (n.kind !== 'terminal') return null
   // pendingLaunch is the --after DAG launch — it must fire only when dependencies report done,
   // not when a card modal opens. Mapping it to initialCommand would fire it early. And

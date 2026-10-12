@@ -14,6 +14,8 @@ export interface LinkNodeInfo {
   cwd?: string
   note?: string
   sticky: boolean
+  /** Set for a Simulator node: the device it shows (UDID may be unset until one is picked). */
+  simulator?: { udid?: string; name?: string }
   agentId?: string
   sessionId?: string
   accountId?: string
@@ -33,6 +35,7 @@ export function buildLinkMap(
   const map: ContextLinkMap = {}
   const entryOf = (n: LinkNodeInfo): ContextLinkInfo => {
     if (n.sticky) return { id: n.id, title: n.title, note: n.note ?? '' }
+    if (n.simulator) return { id: n.id, title: n.title, simulator: n.simulator }
     const e: ContextLinkInfo = { id: n.id, title: n.title, cwd: n.cwd ?? '' }
     if (n.agentId) e.agentId = n.agentId
     if (n.sessionId) e.sessionId = n.sessionId
@@ -42,10 +45,14 @@ export function buildLinkMap(
   for (const e of edges) {
     const s = infoOf(e.source)
     const t = infoOf(e.target)
-    if (s.sticky && t.sticky) continue
-    if (s.sticky) {
+    // A sticky note and a Simulator node are PASSIVE: they cannot read, so the agent side gets the
+    // entry and they get nothing. Two passive nodes are never linked.
+    const sp = s.sticky || !!s.simulator
+    const tp = t.sticky || !!t.simulator
+    if (sp && tp) continue
+    if (sp) {
       ;(map[t.id] ??= []).push(entryOf(s))
-    } else if (t.sticky) {
+    } else if (tp) {
       ;(map[s.id] ??= []).push(entryOf(t))
     } else {
       for (const { reader } of linkReadPairs(e)) {
@@ -87,16 +94,18 @@ export function buildBackgroundLinkMaps(
     const infoOf = (id: string): LinkNodeInfo => {
       const n = byId.get(id)!
       const sticky = n.kind === 'sticky'
-      const agentId = sticky ? undefined : (n.agentId ?? agentIdOf?.(id))
+      const simulator = n.kind === 'simulator'
+      const agentId = sticky || simulator ? undefined : (n.agentId ?? agentIdOf?.(id))
       return {
         id,
         title: n.title || id,
         cwd: n.cwd ?? '',
         note: sticky ? (n.text ?? '') : undefined,
         sticky,
+        ...(simulator ? { simulator: { ...(n.simUdid ? { udid: n.simUdid } : {}), ...(n.simName ? { name: n.simName } : {}) } } : {}),
         agentId,
         sessionId: agentId ? sessionIdOf(id) : undefined,
-        accountId: sticky ? undefined : n.accountId
+        accountId: sticky || simulator ? undefined : n.accountId
       }
     }
     Object.assign(map, buildLinkMap(edges, infoOf))

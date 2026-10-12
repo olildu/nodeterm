@@ -40,6 +40,9 @@ export function toKanbanSession(n: CanvasNode): KanbanSession | null {
       spawn: {}
     }
   }
+  // A simulator node (like a files node) is deliberately NOT a card: it has no session to co-attach
+  // and no text to edit, and its value is a live screen the board's column layout would discard.
+  // It falls through to `null` here by the same rule as every kind outside this list.
   if (n.type !== 'terminal') return null
   return {
     id: n.id,

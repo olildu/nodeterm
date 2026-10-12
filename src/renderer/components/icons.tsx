@@ -51,6 +51,15 @@ export const IconDino = () => (
   </svg>
 )
 
+/** A phone: rounded body, speaker slot, home bar. */
+export const IconSimulator = () => (
+  <svg {...S}>
+    <rect x="7" y="2.5" width="10" height="19" rx="2.5" />
+    <path d="M10.5 5.2h3" />
+    <path d="M10.5 19h3" />
+  </svg>
+)
+
 export const IconChat = () => (
   <svg {...S}>
     <path d="M4 5h16v11H9l-4 3v-3H4z" />

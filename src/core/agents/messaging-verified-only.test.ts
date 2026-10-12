@@ -199,10 +199,13 @@ describe('where the verbs sit in the routing tables', () => {
     // `--after-success`: only a verified caller is provably the station the report is about.
     // `issues` / `prs` resolve the project to read from the CALLER's node, so a forgeable caller
     // could read any project's GitHub lane (bound sessions, dispatch state); new verbs.
+    // `sim` puts input on a device the user is watching (and, for non-ASCII `--type`, overwrites its
+    // pasteboard): an unjudgeable `legacy` caller does not get that; new verb, strands nobody.
     expect([...requiresVerified].sort()).toEqual([
       'issues',
       'notify',
       'open-project',
+      'open-simulator',
       'prs',
       'reply',
       'report-issue',
@@ -210,8 +213,14 @@ describe('where the verbs sit in the routing tables', () => {
       'run',
       'send',
       'settings',
+      'sim',
       'sticky'
     ])
+  })
+
+  it('the sim refusal is its own flat sentence, not the messaging one', () => {
+    expect(verifiedRefusalFor('sim')).toBe('Simulator control refused.')
+    expect(verifiedRefusalFor('sim')).not.toBe(MESSAGING_CONTROL_REFUSAL)
   })
 
   it('the issues / prs refusal is its own flat sentence, not the messaging one', () => {

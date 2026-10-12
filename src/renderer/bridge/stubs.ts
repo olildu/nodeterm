@@ -314,6 +314,36 @@ export function buildStubApi(): Omit<
         Promise.resolve({ ok: false, reason: 'unsupported', message: 'Port forwarding is not available here.' }),
       unforward: () => Promise.resolve(false)
     },
+    sim: {
+      // Deliberately NOT superseded by a WS namespace, and never served by the Server Edition: the
+      // simulator is the DESKTOP's macOS Xcode device, driven by a native helper that only the
+      // desktop shell registers. A browser tab would be driving the server's simulator (a Linux box
+      // has none) and a relay tab the host's. `unsupported` is the honest answer on both: the add
+      // rows are disabled with a reason, and a persisted simulator node explains itself.
+      availability: () =>
+        Promise.resolve({
+          ok: false as const,
+          code: 'unsupported' as const,
+          message: 'The simulator node runs in the desktop app on macOS.'
+        }),
+      devices: () => Promise.resolve({ devices: [] }),
+      attach: () =>
+        Promise.resolve({
+          phase: 'error' as const,
+          error: { code: 'unsupported' as const, message: 'The simulator node runs in the desktop app on macOS.' }
+        }),
+      detach: () => undefined,
+      setView: () => undefined,
+      boot: () => Promise.resolve({ ok: false, error: 'The simulator node runs in the desktop app on macOS.' }),
+      command: () => Promise.resolve({ ok: false as const, code: 'unsupported', error: 'Not available here.' }),
+      screenshot: () => Promise.resolve({ ok: false as const, code: 'unsupported', error: 'Not available here.' }),
+      input: () => undefined,
+      ackFrame: () => undefined,
+      onFrame: noopUnsub,
+      onStatus: noopUnsub,
+      onAgentEvent: noopUnsub,
+      linkRemoved: () => undefined
+    },
     // Real in the browser (ws-bridge `buildRecentConversationsApi`). Where this stub stays in force
     // — nowhere today — `unsupported` is the honest answer: "could not look", never "no history".
     recentConversations: {

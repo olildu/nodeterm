@@ -24,6 +24,15 @@ plain `npm install` under a stock Node 26 with node-gyp 12 otherwise fails with 
 
 `npm run server:dev` boots the Server Edition (browser UI) if you are working on that surface.
 
+On macOS with Xcode, `npm run build:sim-helper` builds the native helper behind the **simulator
+node** (`resources/bin/sim-helper`, gitignored; clang + lipo only). `npm run dev` does not build it
+for you — without it the node says "helper missing". `NODETERM_TEST_SIM_UDID=<booted udid> npx
+vitest run src/core/sim/service.realhelper.test.ts` is the end-to-end check against a real device.
+Agents drive the same device through the `sim` canvas-control verb (`core/sim/verb.ts` holds the
+grammar and the limits). Its agent-facing text is rendered from those constants, so changing a flag
+or a limit changes the docs — and `src/main/canvas-control-sim.test.ts` is the test that tells you.
+See CLAUDE.md → Simulator node → "Agents drive it too".
+
 **If `src/main/node-pty-patch.test.ts` is red, your `node_modules` is unpatched — not your code.**
 Run `npm run rebuild`. node-pty 1.1.0 leaks a pty device per spawn on macOS
 ([node-pty#950](https://github.com/microsoft/node-pty/issues/950)) and, on Windows, leaves a

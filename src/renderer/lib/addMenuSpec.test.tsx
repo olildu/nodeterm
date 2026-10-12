@@ -31,6 +31,7 @@ const handlers = (overrides: Partial<AddHandlers> = {}): AddHandlers => ({
   files: noop,
   run: noop,
   dino: noop,
+  simulator: noop,
   trigger: noop,
   openFile: noop,
   newFile: noop,
@@ -48,12 +49,33 @@ const allKinds: AddItem['kind'][] = [
   'sticky',
   'files',
   'dino',
+  'simulator',
   'trigger',
   'open-file',
   'new-file',
   'spawn-team',
   'worktree'
 ]
+
+describe('Simulator row', () => {
+  const reason = 'Simulators run in the desktop app on macOS'
+  it('is offered, enabled, by default — the node explains a missing helper itself', () => {
+    const [row] = contentAddItemsToMenuItems([{ kind: 'simulator' }], handlers(), { hasCwd: false, isSshProject: false })
+    expect(row).toMatchObject({ label: 'New simulator' })
+    expect((row as { disabled?: boolean }).disabled).toBeFalsy()
+  })
+  it('is disabled with its reason on the menu and the Dock alike (browser tab, team tab, not macOS)', () => {
+    const ctx = { hasCwd: true, isSshProject: false, simulatorUnavailable: reason }
+    const [row] = contentAddItemsToMenuItems([{ kind: 'simulator' }], handlers(), ctx)
+    expect(row).toMatchObject({ label: 'New simulator', disabled: true, hint: reason })
+    const [dock] = contentAddItemsToDockRows([{ kind: 'simulator' }], handlers(), ctx)
+    expect(dock).toMatchObject({ kind: 'simulator', disabled: true, hint: reason })
+  })
+  it('is enabled in an SSH project: the device is this machine\'s, not the project\'s host', () => {
+    const [row] = contentAddItemsToMenuItems([{ kind: 'simulator' }], handlers(), { hasCwd: true, isSshProject: true })
+    expect((row as { disabled?: boolean }).disabled).toBeFalsy()
+  })
+})
 
 describe('Run configuration row', () => {
   it('is disabled with its reason in an SSH project, on the menu and the Dock alike', () => {
@@ -93,6 +115,7 @@ describe('contentAddItemsToMenuItems', () => {
       'New sticky note',
       'New file manager',
       'New dino game',
+      'New simulator',
       'New trigger…',
       'Open file…',
       'New file…',
@@ -167,6 +190,7 @@ describe('contentAddItemsToMenuItems', () => {
       web: () => calls.push('web'),
       sticky: () => calls.push('sticky'),
       dino: () => calls.push('dino'),
+      simulator: () => calls.push('simulator'),
       spawnTeam: () => calls.push('spawnTeam'),
       worktree: () => calls.push('worktree')
     })
@@ -177,7 +201,7 @@ describe('contentAddItemsToMenuItems', () => {
     for (const item of items) {
       if ('onClick' in item) item.onClick()
     }
-    expect(calls.sort()).toEqual(['browser', 'dino', 'spawnTeam', 'sticky', 'terminal', 'web', 'worktree'])
+    expect(calls.sort()).toEqual(['browser', 'dino', 'simulator', 'spawnTeam', 'sticky', 'terminal', 'web', 'worktree'])
   })
 })
 
@@ -196,6 +220,7 @@ describe('contentAddItemsToDockRows', () => {
       'sticky',
       'files',
       'dino',
+      'simulator',
       'trigger',
       'open-file',
       'new-file',
@@ -323,7 +348,8 @@ describe('buildGroupedAddMenu', () => {
       'New web view…',
       'New sticky note',
       'New file manager',
-      'New dino game'
+      'New dino game',
+      'New simulator'
     ])
     expect(children(ADD_GROUP_LABEL.files)).toEqual(['Open file…', 'New file…'])
     expect(children(ADD_GROUP_LABEL.orchestrate)).toEqual([
@@ -454,6 +480,7 @@ describe('buildGroupedAddMenu', () => {
       sticky: () => calls.push('sticky'),
       files: () => calls.push('files'),
       dino: () => calls.push('dino'),
+      simulator: () => calls.push('simulator'),
       trigger: () => calls.push('trigger'),
       openFile: () => calls.push('openFile'),
       newFile: () => calls.push('newFile'),
@@ -475,6 +502,7 @@ describe('buildGroupedAddMenu', () => {
       'openFile',
       'remote',
       'scopedCheckout',
+      'simulator',
       'spawnTeam',
       'sticky',
       'terminal',

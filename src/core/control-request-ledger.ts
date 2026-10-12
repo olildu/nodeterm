@@ -74,6 +74,7 @@ export const REQUEST_ID_VERBS: ReadonlySet<string> = new Set([
   'show-video',
   'show-web',
   'open-browser',
+  'open-simulator',
   'group'
 ])
 

@@ -18,7 +18,15 @@ export interface LinkEndpoint {
 export const LINK_PROJECT_ONLY = 'cross-project linking is not supported'
 export const LINK_ENDPOINT_NOT_FOUND = `node not found in this project; ${LINK_PROJECT_ONLY}`
 
-export type LinkKind = 'context' | 'note'
+export const LINK_NOT_LINKABLE =
+  'not linkable (needs two context-capable agents, a sticky + terminal, or a Simulator node + a context-capable agent)'
+
+/** `sim`: a Simulator node + a context-capable agent. The agent may drive that device (it becomes
+ *  the agent's default `sim` target) and read its device/state through the link map. */
+export type LinkKind = 'context' | 'note' | 'sim'
+
+/** The node kind a Simulator node carries (`NodeKind` in types.ts); spelled once for the planner. */
+export const SIMULATOR_KIND = 'simulator'
 
 /** The endpoints of a context link, plus its optional one-way reader (issue #852). */
 export interface LinkEdge {
@@ -76,6 +84,14 @@ export function gainedReaders(before: LinkEdge, after: LinkEdge): string[] {
 
 /** Decide what kind of link (if any) a new edge between two nodes forms. */
 export function classifyLink(a: LinkEndpoint, b: LinkEndpoint): LinkKind | null {
+  const sims = (a.kind === SIMULATOR_KIND ? 1 : 0) + (b.kind === SIMULATOR_KIND ? 1 : 0)
+  if (sims === 2) return null
+  if (sims === 1) {
+    // A device only links to an AGENT: the link means "this agent's default `sim` target", and a
+    // plain shell or a note has nothing to do with one. Never a sticky, never another device.
+    const other = a.kind === SIMULATOR_KIND ? b : a
+    return other.kind === 'terminal' && other.contextCapable ? 'sim' : null
+  }
   const stickies = (a.kind === 'sticky' ? 1 : 0) + (b.kind === 'sticky' ? 1 : 0)
   if (stickies === 0) return a.contextCapable && b.contextCapable ? 'context' : null
   if (stickies === 2) return null
@@ -136,11 +152,14 @@ export function planBridges(
     if (!kind) {
       skipped.push({
         id: targetId,
-        why: 'not linkable (needs two context-capable agents, or a sticky + terminal)'
+        why: LINK_NOT_LINKABLE
       })
       continue
     }
-    const source = kind === 'note' && te.kind === 'sticky' ? targetId : fromId
+    // Note and sim edges normalize to passive → agent (sticky / device is the source), whichever
+    // way the caller named them, so every reader keys off "the source is passive".
+    const passiveTarget = te.kind === 'sticky' || te.kind === SIMULATOR_KIND
+    const source = (kind === 'note' || kind === 'sim') && passiveTarget ? targetId : fromId
     const target = source === fromId ? targetId : fromId
     if (linkedAlready(source, target)) {
       skipped.push({ id: targetId, why: 'already linked' })

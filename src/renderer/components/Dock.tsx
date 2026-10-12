@@ -10,6 +10,9 @@ import { useSettings } from '../state/settings'
 import { useProjects } from '../state/projects'
 import { accountsForProject, sshAccountsHint } from '../state/workspace'
 import { CONTENT_ADD_ITEMS, contentAddItemsToDockRows, type AddHandlers } from '../lib/addMenuSpec'
+import { simulatorUnavailableReason } from '../lib/simulatorView'
+import { isBrowserRuntime } from '../bridge/runtime'
+import { isMacPlatform } from '@shared/platform-utils'
 import { layoutSubtitle, sortedLayouts } from '../lib/canvasLayoutView'
 import { ZOOM_PRESETS, activeZoomPreset } from '../lib/zoomPresets'
 import { Tooltip } from './Tooltip'
@@ -28,6 +31,7 @@ interface DockProps {
   /** Opens the Spawn-a-team dialog (issue #78) — the conductor lands at the Dock's default spot. */
   onSpawnTeam: () => void
   onAddDino: () => void
+  onAddSimulator: () => void
   onAddTrigger: () => void
   onAddFiles: () => void
   /** A run node (a launch.json configuration) rooted in the project folder. */
@@ -80,6 +84,7 @@ export function Dock({
   onAddSticky,
   onSpawnTeam,
   onAddDino,
+  onAddSimulator,
   onAddTrigger,
   onAddFiles,
   onAddRun,
@@ -194,6 +199,7 @@ export function Dock({
     sticky: onAddSticky,
     spawnTeam: onSpawnTeam,
     dino: onAddDino,
+    simulator: onAddSimulator,
     trigger: onAddTrigger,
     files: onAddFiles,
     run: onAddRun,
@@ -203,7 +209,12 @@ export function Dock({
   }
   const contentRows = contentAddItemsToDockRows(CONTENT_ADD_ITEMS, dockAddHandlers, {
     hasCwd,
-    isSshProject
+    isSshProject,
+    simulatorUnavailable: simulatorUnavailableReason({
+      browser: isBrowserRuntime(),
+      relay: !!activeProject?.remote,
+      mac: isMacPlatform()
+    })
   })
 
   return (

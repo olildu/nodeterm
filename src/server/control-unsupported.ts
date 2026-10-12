@@ -40,13 +40,20 @@ export const BROWSER_UNSUPPORTED_CLAUSE =
   'There is no browser control on this edition: a browser node here renders in your own browser ' +
   'tab, which this server has no debugger for.'
 
+/** The extra reason some verbs can never exist on this edition (they need something a server lacks). */
+function editionClause(verb: string): string {
+  if (verb === 'browser') return ` ${BROWSER_UNSUPPORTED_CLAUSE}`
+  if (verb === 'sim' || verb === 'open-simulator') return ' The iOS Simulator belongs to the nodeterm desktop app on a Mac; a server has no simulator to drive or add.'
+  return ''
+}
+
 /**
  * One line, always — control replies are rendered as a single line by the shim, and a multi-line
  * body buries whichever half the reader stops at. The machine name is repeated inside the prose so
  * the text/plain dialect (which carries no `error` field) still names the refusal.
  */
 export function controlUnsupportedMessage(verb: string): string {
-  const why = verb === 'browser' ? ` ${BROWSER_UNSUPPORTED_CLAUSE}` : ''
+  const why = editionClause(verb)
   return `${CONTROL_UNSUPPORTED_ERROR}: ${CONTROL_UNSUPPORTED_SENTENCE}${why}`
 }
 
@@ -133,7 +140,7 @@ const SERVER_V1_VERBS: ReadonlySet<string> = new Set([
 
 /** A permanent, verb-specific refusal used only while canvas control itself is enabled. */
 export function unsupportedServerVerbMessage(verb: string): string {
-  const why = verb === 'browser' ? ` ${BROWSER_UNSUPPORTED_CLAUSE}` : ''
+  const why = editionClause(verb)
   return (
     `${CONTROL_UNSUPPORTED_ERROR}: The "${verb}" canvas-control verb is not supported by ` +
     `nodeterm Server Edition v1. This is not a temporary failure — do not retry.${why}`

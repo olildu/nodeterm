@@ -6,13 +6,20 @@
 // point at the node's top-left corner, or at the origin.
 import { BaseEdge, getBezierPath, useInternalNode, type EdgeProps } from '@xyflow/react'
 import { floatingEdgeParams, type AnchorSides, type Rect } from '../lib/floatingEdge'
+import { useEdgeAnchorInsets, type EdgeInsets } from '../state/edgeAnchorInsets'
 
-function rectOf(n: ReturnType<typeof useInternalNode>): Rect | null {
+function rectOf(n: ReturnType<typeof useInternalNode>, inset?: EdgeInsets): Rect | null {
   if (!n) return null
   const width = n.measured?.width ?? 0
   const height = n.measured?.height ?? 0
   if (!(width > 0) || !(height > 0)) return null
-  return { x: n.internals.positionAbsolute.x, y: n.internals.positionAbsolute.y, width, height }
+  const r = { x: n.internals.positionAbsolute.x, y: n.internals.positionAbsolute.y, width, height }
+  if (!inset) return r
+  // A node whose visible body is smaller than its box (the folded Simulator node): meet the body.
+  const w = width - inset.left - inset.right
+  const h = height - inset.top - inset.bottom
+  if (!(w > 0) || !(h > 0)) return r
+  return { x: r.x + inset.left, y: r.y + inset.top, width: w, height: h }
 }
 
 export function FloatingEdge(props: EdgeProps) {
@@ -31,8 +38,10 @@ export function FloatingEdge(props: EdgeProps) {
     labelBgBorderRadius,
     interactionWidth
   } = props
-  const a = rectOf(useInternalNode(source))
-  const b = rectOf(useInternalNode(target))
+  const sourceInset = useEdgeAnchorInsets((s) => s.byId[source])
+  const targetInset = useEdgeAnchorInsets((s) => s.byId[target])
+  const a = rectOf(useInternalNode(source), sourceInset)
+  const b = rectOf(useInternalNode(target), targetInset)
   if (!a || !b) return null
   const anchor = (props.data as { anchor?: AnchorSides } | undefined)?.anchor
   const p = floatingEdgeParams(a, b, anchor === 'horizontal' ? 'horizontal' : 'all')

@@ -59,6 +59,16 @@ jobs:
       - name: Build bundled tmux (universal, static libevent + utf8proc)
         run: caffeinate -dims node scripts/build-tmux.mjs
 
+      # The simulator node's native helper (native/sim-helper, CLAUDE.md → Simulator node). Same
+      # reasoning as tmux: a SEPARATE step so a missing binary fails the job instead of shipping a
+      # DMG whose simulator node says "helper missing". Needs only the Xcode command line tools
+      # (clang + lipo). The ad-hoc signature the script leaves is replaced when electron-builder
+      # signs the bundle: the helper sits in Resources/bin beside tmux and is signed with the app's
+      # hardened-runtime identity like it. It only dlopens Apple's own frameworks, and
+      # build/entitlements.mac.plist already disables library validation for the app.
+      - name: Build simulator helper (universal)
+        run: node scripts/build-sim-helper.mjs
+
       # ELECTRON-BUILDER FLOOR — 26.16.1, and the `^26.16.1` range in package.json is what keeps
       # it. Up to and including 26.16.0, createKeychain generated a random keychain password but
       # then handed `security set-key-partition-list` the P12 password instead

@@ -14,6 +14,13 @@ export type ContextLinkVerb = 'list' | 'summary' | 'transcript' | 'terminal'
 
 export const CONTEXT_LINK_VERBS: ContextLinkVerb[] = ['list', 'summary', 'transcript', 'terminal']
 
+/** What `list` appends to a linked node: a note or a Simulator node says so, an agent says nothing. */
+export function linkKindMark(n: Pick<LinkDocEntry, 'note' | 'simulator'>): string {
+  if (n.note != null) return ' (note)'
+  if (n.simulator) return n.simulator.name ? ` (simulator: ${n.simulator.name})` : ' (simulator)'
+  return ''
+}
+
 const SUMMARY_DEFAULT_LINES = 15
 const TOOL_ARG_MAX = 200
 const TOOL_RESULT_MAX = 500
@@ -344,7 +351,7 @@ export function pickLinkNode(doc: LinkDoc, want?: string): { node: LinkDocEntry 
   return {
     message: [
       'Several linked nodes — re-run with --node <id|title>:',
-      ...links.map((n) => `- ${n.title}${n.note != null ? ' (note)' : ''} (id: ${n.id})`)
+      ...links.map((n) => `- ${n.title}${linkKindMark(n)} (id: ${n.id})`)
     ].join('\n')
   }
 }
@@ -353,7 +360,7 @@ export function renderList(doc: LinkDoc): string {
   if (!doc.links.length) return 'No linked nodes.'
   return [
     'Linked nodes:',
-    ...doc.links.map((n) => `- ${n.title}${n.note != null ? ' (note)' : ''} (id: ${n.id})`)
+    ...doc.links.map((n) => `- ${n.title}${linkKindMark(n)} (id: ${n.id})`)
   ].join('\n')
 }
 
@@ -361,6 +368,25 @@ export function renderList(doc: LinkDoc): string {
 export function renderNote(node: LinkDocEntry, verb: ContextLinkVerb): string {
   if (verb === 'terminal') return `"${node.title}" is a sticky note — it has no terminal.`
   return `=== ${node.title} — note ===\n${node.note || '(empty note)'}`
+}
+
+/**
+ * A linked Simulator node: its device and live state, no transcript. `state` is the one line the
+ * shell read for the device (null = it could not be read); the verbs that need an agent's
+ * conversation say so instead of inventing one.
+ */
+export function renderSimulator(node: LinkDocEntry, verb: ContextLinkVerb, state: string | null): string {
+  if (verb === 'terminal') return `"${node.title}" is a Simulator node — it has no terminal.`
+  const sim = node.simulator
+  const lines = [`=== ${node.title} — simulator ===`]
+  if (!sim?.udid) lines.push('No device is chosen on this node yet (the user picks one in the node).')
+  else lines.push(state ?? `Device ${sim.name ?? sim.udid} (state could not be read).`)
+  if (sim?.udid) {
+    lines.push(
+      `Drive it with the sim verb — it is your default target, so no --node is needed while it is the only Simulator node you are linked to: sim --describe, sim --tap-label "<label>", sim --screenshot. (udid ${sim.udid})`
+    )
+  }
+  return lines.join('\n')
 }
 
 export function renderSummary(node: LinkDocEntry, lines: string[], n: number): string {
@@ -392,6 +418,8 @@ export interface ContextLinkFetch {
   terminal: (node: LinkDocEntry) => Promise<string>
   /** `opencode export <sessionId>` output, or null when it could not be produced. */
   opencodeExport: (node: LinkDocEntry) => Promise<string | null>
+  /** One line about a linked Simulator node's device ("iPhone 15 · iOS 26.5 · booted"), or null. */
+  simulator?: (node: LinkDocEntry) => Promise<string | null>
 }
 
 /**
@@ -411,6 +439,7 @@ export async function renderContextLink(
   const node = picked.node
 
   if (node.note != null) return renderNote(node, verb)
+  if (node.simulator) return renderSimulator(node, verb, (await fetch.simulator?.(node)) ?? null)
 
   if (verb === 'terminal') return renderTerminal(node, await fetch.terminal(node))
 
