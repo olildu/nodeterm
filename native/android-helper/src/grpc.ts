@@ -180,6 +180,63 @@ export function decodeStatus(buf: Buffer): { version: string; booted: boolean } 
 
 const SERVICE = '/android.emulation.control.EmulatorController/'
 
+/**
+ * Reassembles gRPC length-prefixed messages (`u8 compressed | u32be length | payload`) from HTTP/2 DATA
+ * chunks. A raw 1080x1920 RGB frame is 6.2 MB and arrives in a few hundred chunks, so the chunks are
+ * KEPT in a list and joined ONCE per message: re-concatenating the whole buffer on every chunk costs
+ * O(chunks x size) memcpy (measured 34 ms a frame at that size on an M4).
+ */
+export class GrpcMessageReader {
+  private chunks: Buffer[] = []
+  private have = 0
+  /** Bytes of the message being read (5-byte prefix included); 0 = its prefix has not been read yet. */
+  private need = 0
+
+  /** Feeds one chunk; returns every message it completed (each WITHOUT the 5-byte prefix). */
+  push(chunk: Buffer): Buffer[] {
+    const out: Buffer[] = []
+    if (chunk.length === 0) return out
+    this.chunks.push(chunk)
+    this.have += chunk.length
+    for (;;) {
+      if (this.need === 0) {
+        if (this.have < 5) break
+        const head = this.chunks[0].length >= 5 ? this.chunks[0] : Buffer.concat(this.chunks.slice(0, 5))
+        this.need = 5 + head.readUInt32BE(1)
+      }
+      if (this.have < this.need) break
+      out.push(this.take(this.need).subarray(5))
+      this.need = 0
+    }
+    return out
+  }
+
+  /** Bytes buffered that are not yet a whole message. */
+  get pending(): number {
+    return this.have
+  }
+
+  private take(n: number): Buffer {
+    const parts: Buffer[] = []
+    let got = 0
+    while (got < n) {
+      const c = this.chunks[0]
+      if (got + c.length <= n) {
+        parts.push(c)
+        this.chunks.shift()
+        got += c.length
+      } else {
+        const k = n - got
+        parts.push(c.subarray(0, k))
+        this.chunks[0] = c.subarray(k)
+        got = n
+      }
+    }
+    this.have -= n
+    return parts.length === 1 ? parts[0] : Buffer.concat(parts, n)
+  }
+}
+
 export class GrpcError extends Error {
   constructor(
     message: string,
@@ -201,6 +258,11 @@ export interface StreamHandle {
   done: Promise<void>
 }
 
+/** HTTP/2 flow control we advertise to the emulator (see connect()). */
+const STREAM_WINDOW_BYTES = 16 * 1024 * 1024
+const SESSION_WINDOW_BYTES = 64 * 1024 * 1024
+const MAX_FRAME_BYTES = 1024 * 1024
+
 export class EmulatorGrpc {
   private session: http2.ClientHttp2Session | null = null
   private closed = false
@@ -213,7 +275,17 @@ export class EmulatorGrpc {
   private connect(): http2.ClientHttp2Session {
     if (this.closed) throw new GrpcError('client closed', null)
     if (this.session && !this.session.closed && !this.session.destroyed) return this.session
-    const s = http2.connect(`http://127.0.0.1:${this.port}`)
+    // Node's HTTP/2 defaults (64 KB windows, 16 KB frames, 10 MB session memory) throttle multi-MB frames:
+    // a 6 MB RGB frame needs ~95 window updates. Ask for big windows and frames up front.
+    const s = http2.connect(`http://127.0.0.1:${this.port}`, {
+      settings: { initialWindowSize: STREAM_WINDOW_BYTES, maxFrameSize: MAX_FRAME_BYTES },
+      maxSessionMemory: 256
+    })
+    try {
+      s.setLocalWindowSize(SESSION_WINDOW_BYTES)
+    } catch {
+      /* an older Node: the stream window above still applies */
+    }
     s.on('error', () => {
       /* surfaced per call */
     })
@@ -238,7 +310,7 @@ export class EmulatorGrpc {
   /** Calls `method`, yielding each reply message to `onMessage`; resolves at the trailers. */
   private run(method: string, body: Buffer, onMessage: (m: Buffer) => void, timeoutMs?: number): { stream: http2.ClientHttp2Stream; done: Promise<void> } {
     const stream = this.open(method)
-    let buf: Buffer = Buffer.alloc(0)
+    const reader = new GrpcMessageReader()
     const done = new Promise<void>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | null = null
       if (timeoutMs) {
@@ -260,12 +332,7 @@ export class EmulatorGrpc {
         check(h) // a "trailers-only" response puts the status in the headers
       })
       stream.on('data', (chunk: Buffer) => {
-        buf = buf.length ? Buffer.concat([buf, chunk]) : chunk
-        while (buf.length >= 5) {
-          const len = buf.readUInt32BE(1)
-          if (buf.length < 5 + len) break
-          const msg = buf.subarray(5, 5 + len)
-          buf = buf.subarray(5 + len)
+        for (const msg of reader.push(chunk)) {
           try {
             onMessage(msg)
           } catch (e) {

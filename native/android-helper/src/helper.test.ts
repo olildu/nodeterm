@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { decodeImage, imageFormat, keyboardEvent, pbBytes, pbDecode, pbInt, pbNum, touchEvent } from './grpc'
+import { GrpcMessageReader, decodeImage, imageFormat, keyboardEvent, pbBytes, pbDecode, pbInt, pbNum, touchEvent } from './grpc'
 import { BUTTON_KEYS, hidToKey, isTypable } from './keys'
 import { avdOf, parseAvdList, parseDiscovery, parseIni, parseWmDensity, parseWmSize, runtimeLabel, sdkRootCandidates } from './sdk'
 import { decodeEntities, hitTest, parseAttributes, parseBounds, parseDump, roleOf } from './uiautomator'
@@ -160,5 +160,57 @@ describe('adb input fallback (no hardware keyboard)', () => {
     expect(hardwareKeyboard(path.join(dir, 'nope'))).toBeNull()
     expect(hardwareKeyboard(undefined)).toBeNull()
     fs.rmSync(dir, { recursive: true })
+  })
+})
+
+describe('GrpcMessageReader', () => {
+  const frameOf = (payload: Buffer, compressed = 0): Buffer => {
+    const head = Buffer.alloc(5)
+    head[0] = compressed
+    head.writeUInt32BE(payload.length, 1)
+    return Buffer.concat([head, payload])
+  }
+  const payloads = [Buffer.from('a'), Buffer.alloc(0), Buffer.alloc(70_000, 7), Buffer.from('hello world'), Buffer.alloc(5, 9)]
+  const wire = Buffer.concat(payloads.map((p) => frameOf(p)))
+
+  it('yields every message whatever the chunk boundaries (1 byte, odd sizes, the whole wire)', () => {
+    for (const size of [1, 2, 3, 4, 5, 6, 7, 1000, 16_384, 65_536, wire.length]) {
+      const r = new GrpcMessageReader()
+      const got: Buffer[] = []
+      for (let i = 0; i < wire.length; i += size) got.push(...r.push(wire.subarray(i, i + size)))
+      expect(got.map((b) => b.length), `chunk ${size}`).toEqual(payloads.map((p) => p.length))
+      got.forEach((b, i) => expect(b.equals(payloads[i]), `chunk ${size} message ${i}`).toBe(true))
+      expect(r.pending).toBe(0)
+    }
+  })
+
+  it('returns several messages from one chunk and holds a partial one back', () => {
+    const r = new GrpcMessageReader()
+    const two = Buffer.concat([frameOf(Buffer.from('one')), frameOf(Buffer.from('two'))])
+    const third = frameOf(Buffer.from('three'))
+    const out = r.push(Buffer.concat([two, third.subarray(0, 4)]))
+    expect(out.map(String)).toEqual(['one', 'two'])
+    expect(r.pending).toBe(4)
+    expect(r.push(third.subarray(4)).map(String)).toEqual(['three'])
+    expect(r.pending).toBe(0)
+  })
+
+  it('does not copy a message that arrives whole in one chunk, and joins a split one exactly once', () => {
+    const r = new GrpcMessageReader()
+    const f = frameOf(Buffer.alloc(100, 1))
+    const [m] = r.push(f)
+    expect(m.buffer).toBe(f.buffer) // a view of the chunk, no copy
+    const big = frameOf(Buffer.alloc(40_000, 2))
+    const parts: Buffer[] = []
+    for (let i = 0; i < big.length; i += 16_384) parts.push(big.subarray(i, i + 16_384))
+    const got = parts.flatMap((c) => r.push(c))
+    expect(got).toHaveLength(1)
+    expect(got[0].length).toBe(40_000)
+  })
+
+  it('ignores an empty chunk', () => {
+    const r = new GrpcMessageReader()
+    expect(r.push(Buffer.alloc(0))).toEqual([])
+    expect(r.pending).toBe(0)
   })
 })
