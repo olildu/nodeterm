@@ -2,6 +2,7 @@ import {
   SIM_SCALE_DEFAULT,
   SIM_SCALE_MIN,
   type SimAvailability,
+  type SimDeviceEntry,
   type SimErrorCode,
   type SimStatus,
   type SimViewLevel
@@ -120,6 +121,30 @@ export function simView(input: {
       }
     }
   }
+}
+
+export type SimPickerRow = { kind: 'header'; label: string } | { kind: 'device'; label: string; device: SimDeviceEntry }
+
+/**
+ * The device picker's rows: iOS simulators, then Android emulators, each platform under its own
+ * header when both are present, booted devices first within a platform. The current device is
+ * ticked. Empty = one disabled row saying so (`error` when the listing failed).
+ */
+export function simPickerRows(devices: readonly SimDeviceEntry[], current: string | undefined): SimPickerRow[] {
+  const platformOf = (d: SimDeviceEntry): 'ios' | 'android' => d.platform ?? (d.udid.startsWith('android:') ? 'android' : 'ios')
+  const groups: Array<{ label: string; list: SimDeviceEntry[] }> = [
+    { label: 'iOS simulators', list: devices.filter((d) => platformOf(d) === 'ios') },
+    { label: 'Android emulators', list: devices.filter((d) => platformOf(d) === 'android') }
+  ].filter((g) => g.list.length > 0)
+  const rows: SimPickerRow[] = []
+  for (const g of groups) {
+    if (groups.length > 1) rows.push({ kind: 'header', label: g.label })
+    const sorted = [...g.list].sort((a, b) => Number(b.booted) - Number(a.booted))
+    for (const d of sorted) {
+      rows.push({ kind: 'device', device: d, label: `${d.udid === current ? '✓ ' : ''}${d.name} · ${d.runtime}${d.booted ? ' · running' : ''}` })
+    }
+  }
+  return rows
 }
 
 /**

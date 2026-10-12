@@ -40,6 +40,7 @@ import { useEdgeAnchorInsets } from '../state/edgeAnchorInsets'
 import {
   normalizeSimUdid,
   parseSimFrame,
+  simPlatformOf,
   type SimAvailability,
   type SimButton,
   type SimDeviceEntry,
@@ -60,7 +61,7 @@ import {
   pointerLeaveRearmsGuard,
   resolveFocusFollowsPointer
 } from '../lib/terminalFocusMode'
-import { desiredStreamScale, simView, viewLevel } from '../lib/simulatorView'
+import { desiredStreamScale, simPickerRows, simView, viewLevel } from '../lib/simulatorView'
 import {
   clientToDevice,
   cornerRadiusFraction,
@@ -97,7 +98,7 @@ const ICON = { width: 13, height: 13, viewBox: '0 0 16 16', 'aria-hidden': true 
 const stroke = { stroke: 'currentColor', strokeWidth: 1.5, fill: 'none', strokeLinecap: 'round', strokeLinejoin: 'round' } as const
 
 /** Hardware buttons in the header, in the order the design shows them. */
-const BUTTONS: Array<{ name: SimButton; title: string; icon: JSX.Element }> = [
+const IOS_BUTTONS: Array<{ name: SimButton; title: string; icon: JSX.Element }> = [
   { name: 'home', title: 'Home', icon: <svg {...ICON}><rect x="3" y="3" width="10" height="10" rx="3" {...stroke} /></svg> },
   {
     name: 'lock',
@@ -140,6 +141,24 @@ const BUTTONS: Array<{ name: SimButton; title: string; icon: JSX.Element }> = [
     )
   }
 ]
+const VOLUME_BUTTONS = IOS_BUTTONS.filter((b) => b.name === 'voldown' || b.name === 'volup')
+/** Android's navigation bar (back, home, recents) and its power + volume keys. */
+const ANDROID_BUTTONS: Array<{ name: SimButton; title: string; icon: JSX.Element }> = [
+  { name: 'back', title: 'Back', icon: <svg {...ICON}><path d="M11 3L5 8l6 5z" {...stroke} /></svg> },
+  { name: 'home', title: 'Home', icon: <svg {...ICON}><circle cx="8" cy="8" r="4.5" {...stroke} /></svg> },
+  { name: 'recents', title: 'Recent apps', icon: <svg {...ICON}><rect x="4" y="4" width="8" height="8" rx="1" {...stroke} /></svg> },
+  {
+    name: 'power',
+    title: 'Power',
+    icon: (
+      <svg {...ICON}>
+        <path d="M8 2.5V7.5" {...stroke} />
+        <path d="M5 4.5a4.5 4.5 0 106 0" {...stroke} />
+      </svg>
+    )
+  },
+  ...VOLUME_BUTTONS
+]
 const SHOT_ICON = (
   <svg {...ICON}>
     <path d="M2.5 5.5V4a1.5 1.5 0 011.5-1.5h1.5M10.5 2.5H12A1.5 1.5 0 0113.5 4v1.5M13.5 10.5V12a1.5 1.5 0 01-1.5 1.5h-1.5M5.5 13.5H4A1.5 1.5 0 012.5 12v-1.5" {...stroke} />
@@ -161,6 +180,8 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
   const sim = api.sim
 
   const udid = useMemo(() => normalizeSimUdid(data.simUdid), [data.simUdid])
+  const platform = udid ? simPlatformOf(udid) : 'ios'
+  const buttons = platform === 'android' ? ANDROID_BUTTONS : IOS_BUTTONS
   const collapsed = !!data.collapsed
   const focusFollowsPointer = resolveFocusFollowsPointer(
     useSettings((s) => s.settings.terminalFocusFollowsPointer)
@@ -468,13 +489,15 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
       } catch {
         error = 'Could not list simulators.'
       }
+      const rows = simPickerRows(devices, udid)
       const items: MenuItem[] =
-        devices.length === 0
-          ? [{ label: error || 'No iOS simulators found', onClick: () => undefined, disabled: true }]
-          : devices.map((d) => ({
-              label: `${d.udid === udid ? '✓ ' : ''}${d.name} · ${d.runtime}${d.booted ? ' · running' : ''}`,
-              onClick: () => pickDevice(d)
-            }))
+        rows.length === 0
+          ? [{ label: error || 'No simulators or emulators found', onClick: () => undefined, disabled: true }]
+          : rows.map((r) =>
+              r.kind === 'header'
+                ? { label: r.label, onClick: () => undefined, disabled: true }
+                : { label: r.label, onClick: () => pickDevice(r.device) }
+            )
       setMenu({ x: r.left, y: r.bottom + 4, items })
     },
     [sim, udid, pickDevice]
@@ -518,7 +541,7 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
     ? ((getNode(driving.ownerNodeId)?.data.title as string | undefined) || 'An agent')
     : ''
   const dot = isLive ? 'live' : view.kind === 'connecting' ? 'wait' : view.kind === 'error' ? 'error' : 'off'
-  const radius = screenBox.width * cornerRadiusFraction(deviceBox)
+  const radius = screenBox.width * cornerRadiusFraction(deviceBox, platform)
 
   // ─── chrome: open while the user works in it or the node needs them, else folded into the phone ──
   const pinned = chromePinnedOpen({
@@ -647,7 +670,7 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
           </svg>
         </button>
         {!editingTitle && <span className="term-node__spacer" />}
-        {BUTTONS.map((b) => (
+        {buttons.map((b) => (
           <button
             key={b.name}
             className="term-node__refresh sim-node__tool nodrag"

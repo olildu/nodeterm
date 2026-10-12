@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { SimAvailability, SimDeviceInfo, SimStatus } from '@shared/sim'
-import { desiredStreamScale, simView, simulatorUnavailableReason, viewLevel } from './simulatorView'
+import { desiredStreamScale, simPickerRows, simView, simulatorUnavailableReason, viewLevel } from './simulatorView'
 
 const UDID = 'AE342EEF-B624-4060-B9E6-AE6E9EAAC24A'
 const OK: SimAvailability = { ok: true }
@@ -106,5 +106,34 @@ describe('simulatorUnavailableReason', () => {
       expect(r).not.toMatch(/this Mac/i)
     }
     expect(new Set(reasons).size).toBe(3)
+  })
+})
+
+describe('simPickerRows', () => {
+  const ios = { udid: 'AE342EEF-B624-4060-B9E6-AE6E9EAAC24A', name: 'iPhone 15', runtime: 'iOS 26.5', booted: false, platform: 'ios' as const }
+  const pixel = { udid: 'android:Pixel_6', name: 'Pixel 6', runtime: 'Android 14', booted: false, platform: 'android' as const }
+  const n7 = { udid: 'android:Nexus_7', name: 'Nexus 7', runtime: 'Android 11', booted: true }
+  it('groups by platform under headers only when both are present, booted first, current ticked', () => {
+    expect(simPickerRows([pixel, ios, n7], 'android:Pixel_6').map((r) => r.label)).toEqual([
+      'iOS simulators',
+      'iPhone 15 · iOS 26.5',
+      'Android emulators',
+      'Nexus 7 · Android 11 · running',
+      '✓ Pixel 6 · Android 14'
+    ])
+    expect(simPickerRows([ios], undefined).map((r) => r.kind)).toEqual(['device'])
+    expect(simPickerRows([], undefined)).toEqual([])
+  })
+})
+
+describe('pick copy names the platforms the host can run', () => {
+  it('says Android when only Android is available', () => {
+    expect(simView({ availability: { ok: true, platforms: { ios: false, android: true } }, udid: undefined, status: null }).detail).toMatch(/Android emulator/)
+    expect(simView({ availability: { ok: true, platforms: { ios: true, android: true } }, udid: undefined, status: null }).detail).toMatch(/iOS simulator or an Android emulator/)
+    expect(simView({ availability: { ok: true }, udid: undefined, status: null }).detail).toMatch(/^Pick an iOS simulator/)
+  })
+  it('shows why an Android boot failed while still offering Boot', () => {
+    const v = simView({ availability: { ok: true }, udid: 'android:X', status: { phase: 'shutdown', error: { code: 'boot-failed', message: 'Running multiple emulators with the same AVD' } } })
+    expect(v).toMatchObject({ kind: 'shutdown', action: 'boot', detail: 'Running multiple emulators with the same AVD' })
   })
 })

@@ -141,4 +141,9 @@ describe('cornerRadiusFraction', () => {
     expect(cornerRadiusFraction({ width: 820, height: 1180 })).toBeLessThan(0.05)
     expect(cornerRadiusFraction({ width: 0, height: 0 })).toBeGreaterThan(0)
   })
+  it('rounds a tall Android phone less than an iPhone', () => {
+    const pixel = { width: 411, height: 914 }
+    expect(cornerRadiusFraction(pixel, 'android')).toBeLessThan(cornerRadiusFraction(pixel))
+    expect(cornerRadiusFraction(pixel, 'android')).toBeGreaterThan(0.03)
+  })
 })

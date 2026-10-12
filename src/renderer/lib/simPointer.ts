@@ -155,9 +155,10 @@ export function wheelSwipe(
  * corners on a 393 pt screen; a home-button iPhone or an iPad is nearly square-cornered, and
  * rounding THOSE by the iPhone amount would clip real UI at the corners.
  */
-export function cornerRadiusFraction(device: Box): number {
+export function cornerRadiusFraction(device: Box, platform: 'ios' | 'android' = 'ios'): number {
   if (!(device.width > 0 && device.height > 0)) return 0.12
   const aspect = Math.max(device.width, device.height) / Math.min(device.width, device.height)
-  if (aspect > 2) return 0.13
+  // Android phones round their corners far less than a notched iPhone does.
+  if (aspect > 2) return platform === 'android' ? 0.07 : 0.13
   return aspect > 1.6 ? 0.03 : 0.045
 }
