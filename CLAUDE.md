@@ -6169,7 +6169,8 @@ project's existing ControlMaster, so the URL the tool itself printed just works 
 
 ## Simulator node (the iOS Simulator inside a canvas node)
 
-A `simulator` node (`NodeKind`, persisted) shows one iOS Simulator device and lets you drive it —
+A `simulator` node (`NodeKind`, persisted) shows one iOS Simulator device — or an Android emulator,
+see **Android emulators (android-helper)** at the end of this section — and lets you drive it —
 touch, buttons, keyboard, screenshots — with **Simulator.app never opened**. Add menu ▸ New view ▸
 "New simulator", ⌘K, and the `node.newSimulator` registry command (ships unbound). Pieces:
 `native/sim-helper` (Objective-C; `PROTOCOL.md` is the wire contract, `npm run build:sim-helper`
@@ -6270,7 +6271,7 @@ builds `resources/bin/sim-helper`), `core/sim/` (service), `shared/sim.ts` (type
   screenshot, stream off ⇒ no frames, last viewer leaves ⇒ process gone ⇒ re-attach works.
   **Not run by anyone yet:** the node UI in a real Electron window (pointer feel, IME, guard
   dwell), Intel Macs, packaged/notarized builds, Xcode other than 26.x.
-- **Out of scope:** rotation, multiple displays, Android.
+- **Out of scope:** rotation, multiple displays. Android emulators: see **Android emulators** below.
 
 ### The node's chrome folds into the phone (hover to open)
 
@@ -6437,6 +6438,48 @@ Rules a refactor must not undo:
   verb is refused by name there; the planner is shared so a persisted sim link is harmless and inert.
   Relay tabs: `sim:` is host-only, the stub's two new members are inert. Kanban: not a card, so no
   link UI (links are a canvas concept). Mobile: N/A (no canvas, no simulator).
+
+### Android emulators (android-helper)
+
+The same node, `sim` verb and `open-simulator` drive an Android AVD. Device id `android:<avd>`;
+`native/android-helper` (TypeScript, bundled by `npm run build:android-helper` into
+`resources/bin/android-helper.cjs`) speaks the SAME stdio protocol as `sim-helper`
+(`native/sim-helper/PROTOCOL.md` → "Android"), so `service.ts`, `verb.ts`, `control.ts` and the node
+only learned a platform, not a second protocol. Rules a refactor must not undo:
+- **One validator, both id shapes.** `normalizeSimUdid` accepts a UUID or
+  `^android:[A-Za-z0-9][A-Za-z0-9._-]{0,99}$` (case kept), at BOTH serializer seams and before any
+  helper argument; the helper re-checks it and only boots an AVD whose `.ini` exists. The first
+  character is alphanumeric so an AVD name can never read as a flag on the emulator's argv.
+  `simPlatformOf` picks the helper.
+- **It is a Node script run by Electron's own Node** (`ELECTRON_RUN_AS_NODE=1`,
+  `process.execPath`), not a native binary: screen and input are the emulator's public gRPC
+  (`streamScreenshot`, `sendTouch`, `sendKey`, `setClipboard`), spoken by a hand-rolled
+  protobuf/gRPC client over `node:http2` (`src/grpc.ts`, ~200 lines) — no grpc-js, no `.proto` to
+  ship. JPEG/PNG encoding is nodeterm's own `sharp`, kept EXTERNAL in the bundle and resolved from
+  the app (`NODETERM_REQUIRE_FROM` → `<Resources>/app.asar/package.json`; sharp is asar-unpacked)
+  or, in dev, from the repo. The packaged path (asar + Electron-as-Node) is NOT verified yet.
+- **Ownership: attaching never boots; the helper stops only what it booted.** `boot` (service →
+  the device's helper, under an internal lease) starts the AVD headless on free ports with
+  **`-gpu host`** (headless defaults to software rendering: 20–30 fps vs 48–60 — measured), records
+  the emulator pid in `$TMPDIR` (so a crashed helper's successor still owns it) and SIGTERMs it on
+  quit. An emulator the user started (Android Studio, a terminal) is found through the emulator's
+  own discovery files and driven, NEVER stopped. Because a cold boot is ~18 s, an Android device's
+  helper lingers `ANDROID_GRACE_MS` (5 min) after its last viewer instead of `SIM_GRACE_MS` — a
+  project switch or a gap between an agent's `sim` calls must not reboot it; app quit stops it.
+- **Limits, stated**: an emulator without gRPC or with JWT auth (Android Studio's default launch)
+  cannot be shown — the node says to boot it from nodeterm; ctrl/alt/cmd `--mods` are not applied
+  (the emulator's gRPC keys do not combine modifiers; shift is); non-ASCII `--type` goes through the
+  device clipboard + `adb input keyevent 279`; `describe` is `uiautomator dump` (~1.5 s) and has no
+  degraded mode; `sim --list` prints a running emulator's `adb emulator-NNNN` serial because that
+  (not `android:<avd>`) is Maestro's `--device`.
+- **Surfaces**: the renderer gate is still macOS-only (`simulatorUnavailableReason`), though core
+  and the helper are platform-neutral — Linux/Windows Android is a deliberate follow-up, unmeasured.
+  Server Edition, relay tabs, mobile: as for iOS (not registered / stub / N/A).
+- **Verified**: `native/android-helper/test/smoke.mjs` 18/18 against a running Nexus_7 (API 30)
+  and a headless boot of a fresh AVD (ready in 18.4 s, stopped on quit); 44–46 fps at 600×960 with
+  ~30 ms capture→stdout; `control.realandroid.test.ts`
+  (`NODETERM_TEST_ANDROID_AVD=<running avd>`) through the real service + verb. **Not verified**:
+  the node in an Electron window, packaged builds, Flutter semantics through `describe` on Android.
 
 ## Node colors (one palette, two sections)
 

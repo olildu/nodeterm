@@ -81,3 +81,39 @@ the device, so other tools see accessibility on. Apps read it at launch: the `de
 
 ## Other modes
 `sim-helper --version` · `sim-helper list` → JSON array `{udid,name,runtime,state,deviceType}`.
+
+## Android (`android-helper`)
+
+`resources/bin/android-helper.cjs` (native/android-helper, run by Electron's Node with
+`ELECTRON_RUN_AS_NODE=1`) speaks this same protocol for an Android emulator, so core treats both alike.
+Differences, all MEASURED on emulator 36.6.11 (API 30 Nexus 7, API 30 Pixel):
+
+* **Device id** `android:<avd>` (AVD name, `[A-Za-z0-9][A-Za-z0-9._-]*`, case kept). `info`/`ready` bodies add
+  `platform: "android"`, `serial` (`emulator-<console port>`) and `owned` (this helper booted it).
+* **Points**: `scale = density / 160` (Nexus 7: 320 dpi → 2, 1200×1920 px = 600×960 pt). Coordinates are points.
+* **Attach never boots.** A shut-down AVD reports `device-state Shutdown`; the extra command **`boot`** starts it
+  headless (`-no-window -no-audio -no-snapshot -no-boot-anim -gpu host -grpc P -port N`, free ports) and replies at
+  once (`booting`, ports); `ready` follows when Android has booted (~18 s cold). `boot-failed` (non-fatal error
+  event) when the emulator exits first, with the log's last error line. `-gpu host` matters: headless defaults
+  to software rendering (20–30 fps); host GPU gives 48–60 fps.
+* **Ownership**: on quit/EOF/SIGTERM the helper SIGTERMs only an emulator it booted (recorded in
+  `$TMPDIR/nodeterm-android-helper-<avd>.owned.json`, so a crashed helper's successor still knows). An emulator
+  someone else started is never stopped. One controller per AVD: `$TMPDIR/nodeterm-android-helper-<avd>.lock` (pid).
+* **Found by** the emulator's discovery files (`…/avd/running/pid_*.ini`): a user-started emulator is used if it
+  has gRPC; started without `-grpc`, or with JWT auth (Android Studio), it reports `setup-failed` with a sentence.
+* **Frames**: gRPC `streamScreenshot` RGB888 at `scale` × pixel size → JPEG (sharp). The emulator sends a frame at
+  once and nothing while static; the helper encodes the newest only, ≤ `maxFps`. Measured 44–46 fps at 600×960
+  while scrolling, ~30 ms capture→stdout.
+* **Input**: gRPC `sendTouch` (pressure 1/0; `edge` ignored — Android's edge gestures are ordinary touches),
+  `sendKey` with W3C key names. `button`: `home`, `back`, `recents`, `power` (`lock`/`side` = power), `volup`,
+  `voldown`; `siri`/`playpause` are refused. `key`: HID usages map to keys; **shift** picks the shifted
+  character, **ctrl/alt/cmd are not applied** (the emulator's gRPC keys do not combine modifiers).
+* **`text`**: printable ASCII via gRPC (newline = Enter). Anything else (or `paste: true`) goes through the
+  emulator clipboard + `adb shell input keyevent 279` (KEYCODE_PASTE, ~0.5 s) — gRPC drops non-ASCII text and no
+  gRPC Ctrl+V/Paste key pasted. It overwrites the device clipboard.
+* **`describe`**: `adb exec-out uiautomator dump /dev/tty` (~1.5 s, retried while the screen animates), mapped to
+  the element shape above: `label` = content-desc or text, `value` = text when both exist (never a password
+  field's), `identifier` = resource-id, `role` = class short name (`EditText` → `TextField`; a clickable generic
+  container → `Button`; else `Element`). No `axPref`, no degraded mode. `describe-point` hit-tests that dump.
+* **Exit codes**: 3 already attached, 4 not an AVD / malformed id, 5 no Android SDK (`no-android-sdk`).
+* `list` → `{udid, name, runtime ("Android 11"), state, deviceType, serial?}` per AVD (`emulator -list-avds`).
