@@ -531,6 +531,12 @@ export function createOpenSimulatorPrep(
       const booted = found.devices.filter((d) => d.booted)
       if (booted.length === 1) bound = { udid: booted[0].udid, name: booted[0].name }
     }
+    // An agent that opens an Android emulator wants to use it, and Android attach never boots (only the
+    // helper's `boot` does), so start a shut-down AVD here. The node shows it starting; a failure is not
+    // fatal to the open (the node keeps its Boot button and the agent's next `sim` says why).
+    if (bound && simPlatformOf(bound.udid) === 'android' && !found.devices.find((d) => d.udid === bound.udid)?.booted) {
+      await deps.service.boot(bound.udid).catch(() => undefined)
+    }
     const next: Record<string, string> = { ...args }
     delete next.udid
     if (bound) {

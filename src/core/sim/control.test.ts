@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { SimReply, SimScreenshotReply, SimStatus } from '../../shared/sim'
 import { createSimControl, type SimControlDeps } from './control'
 import type { AgentDevice, AgentFailure, AgentRunOptions } from './service'
@@ -442,5 +442,26 @@ describe('open-simulator prep', () => {
     ])
     expect(await two({ args: {}, verified: true })).toEqual({ args: {} })
     expect(await mk([], false)({ args: {}, verified: true })).toMatchObject({ ok: false })
+  })
+
+  it('boots a shut-down Android AVD it binds, but not a booted one or an iOS simulator', async () => {
+    const boot = vi.fn(async () => ({ ok: true }))
+    const prep = (booted: boolean) =>
+      createOpenSimulatorPrep({
+        service: { availability: () => ({ ok: true }), devices: async () => ({ devices: [{ udid: 'android:Pixel_6', name: 'Pixel_6', runtime: 'Android 30', booted }] }), boot } as never
+      })
+    expect(await prep(false)({ args: { udid: 'android:Pixel_6' }, verified: true })).toMatchObject({ args: { udid: 'android:Pixel_6' } })
+    expect(boot).toHaveBeenCalledWith('android:Pixel_6')
+    boot.mockClear()
+    await prep(true)({ args: { udid: 'android:Pixel_6' }, verified: true })
+    await mk([{ udid: A, name: 'iPhone', runtime: 'iOS 26.5', booted: false }])({ args: { udid: A }, verified: true })
+    expect(boot).not.toHaveBeenCalled()
+  })
+
+  it('still opens the node when the Android boot request fails', async () => {
+    const out = await createOpenSimulatorPrep({
+      service: { availability: () => ({ ok: true }), devices: async () => ({ devices: [] }), boot: async () => { throw new Error('x') } } as never
+    })({ args: { udid: 'android:Pixel_6' }, verified: true })
+    expect(out).toMatchObject({ args: { udid: 'android:Pixel_6' } })
   })
 })
