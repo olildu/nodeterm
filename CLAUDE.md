@@ -6389,6 +6389,43 @@ Rules a refactor must not undo:
   SSH host's older shim loop (the grammar accepts both spellings of a bare switch), a real shut-down
   device (`--boot` is unit-tested; the only available device was the user's booted one).
 
+### Flows: `sim --run flow.yaml` replays a device test with no model
+
+An agent works a test out once; the flow file replays it deterministically, and a model is needed
+again only when a step fails. Pieces: `core/sim/flow-yaml.ts` (a bounded YAML-subset reader, no
+dependency), `flow.ts` (format, variables, includes, masking), `flow-run.ts` (the step engine),
+`flow-record.ts` (the recorder), `flow-vars.ts` (the leaf the verb parser may import), and
+`runFlowAction` / `startRecord` / `stopRecord` in `control.ts`. The agent-facing text is
+`simFlowDocLines` (`canvas-control-core.ts`), rendered from the constants. Rules a refactor must not undo:
+- **A step is the verb's own flag map.** Every sim step is turned into `--flag` args and validated by
+  `parseSimArgs` (and run through the same `act`), so a flow cannot say what the command line cannot and
+  every limit lives in one place. Assertions (`wait-for`, `assert-visible`, `assert-not-visible`) share one
+  `probe`; `--wait-for` is also a plain action.
+- **Check everything, then run.** The file, every include (jailed like `--screenshot`: project folder or OS
+  temp), every variable and every step are validated BEFORE the lease; a bad flow touches no device. One
+  `agentRun` lease covers the run, so there is no per-step reconnect; the drive highlight is refreshed per step.
+- **Bounds**: 200 steps after includes, 4 include levels, 20 files, 128 KB per file, 15 min total
+  (`--timeout-ms`, default 5 min). Verified callers only (the verb's gate).
+- **Variables**: `${NAME}` from `--var NAME=v` (newline list) or `--var-NAME v` (the shim collapses repeated
+  flags), else the app's env `FLOW_NAME`. Host env is read ONLY through the `FLOW_` prefix, never bare: a
+  repository's flow must not be able to type `AWS_SECRET_ACCESS_KEY` into a device. Names containing
+  PASSWORD/TOKEN/SECRET/KEY are secrets: masked in every output string (message, error, JSON) including the
+  failure screen, whose password field really holds the value. Steps print with `${NAME}` unexpanded, and a
+  literal typed text prints as a length. Masking uses the values of ALL secret-named vars, used or not.
+- **Failure report** (small by design): step, origin `file step N`, reason (the verb's own message with
+  closest labels / numbered candidates), screenshot in the run folder (`<tmp>/nodeterm-flow-<name>-<ts>/`),
+  the compact screen (45 lines) and `sim --run <file> --udid X --from-step N` (var NAMES only, never values).
+  `--from-step N` numbers the FLATTENED steps and counts skipped ones as passed.
+- **Recording**: `--record <name>` / `--record-stop [--out]`, one per device (in the control closure's memory,
+  2 h, 200 steps). Only successful label/id taps, type-label, swipe, press, key, wait-for and coordinate taps
+  are logged (coordinates get a `# TODO: use a label`). A password-looking field is written as `${PASSWORD}`,
+  never its value; other typed text is literal (the header says to review it). `--record-stop` never
+  overwrites an existing file. Output goes to `<project>/.nodeterm/flows/<name>.yaml`.
+- Surfaces: Desktop macOS only like the rest of `sim`; Server Edition refuses `sim`; Mobile N/A.
+- Tests: `flow-yaml/flow/flow-run/flow-record.test.ts` (pure) and `control.flow.test.ts` (fake device: run,
+  ambiguous failure + resume, timeout, masking, record → replay round trip). **Not run:** the live smoke on
+  an emulator, and the built app's `readFile` wiring in `main/index.ts`.
+
 ### `open-simulator`: agents add the node
 
 `open-simulator [--udid <id>] [--group <frame id>] [--request-id <id>]` creates a Simulator node

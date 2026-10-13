@@ -8,7 +8,7 @@ import { join, resolve, posix } from 'path'
 import { startSessionNameSweep, displayNodeTitle } from '../core/session-name-sweep'
 import { startTriggerService } from '../core/trigger-service'
 import { readAgentSessionName, type AgentSessionNameDeps } from '../core/agent-session-name'
-import { readFile, realpath as fsRealpath, lstat as fsLstat, writeFile as fsWriteFile, mkdir as fsMkdir } from 'fs/promises'
+import { readFile, realpath as fsRealpath, lstat as fsLstat, writeFile as fsWriteFile, mkdir as fsMkdir, open as fsOpen } from 'fs/promises'
 import { existsSync, statSync, openSync, fstatSync, readFileSync, closeSync } from 'fs'
 import { homedir, hostname, tmpdir } from 'os'
 import { randomUUID } from 'crypto'
@@ -354,6 +354,7 @@ import { registerWallpaperIpc } from '../core/wallpaper'
 import { registerRunConfigIpc, stopAllRunWatches } from '../core/run-service'
 import { disposeSim, registerSimIpc } from '../core/sim/service'
 import { createOpenSimulatorPrep, createSimControl } from '../core/sim/control'
+import { FLOW_YAML_MAX_BYTES } from '../core/sim/flow-yaml'
 import { createSimLinkLedger } from '../core/sim/links'
 import { canContextLink } from '../shared/agents/config'
 import { resolveSimScreenshotPath } from '../core/sim/screenshot-path'
@@ -4225,7 +4226,21 @@ app.whenReady().then(async () => {
         lstat: (p) => fsLstat(p),
         mkdir: (p, o) => fsMkdir(p, o)
       }),
-    writeFile: (p, d) => fsWriteFile(p, d)
+    writeFile: (p, d) => fsWriteFile(p, d),
+    // Flow files (`sim --run`): at most FLOW_YAML_MAX_BYTES + 1 bytes are read, so an oversize file is
+    // refused by the parser instead of being loaded whole. The path was already through the jail above.
+    readFile: async (abs) => {
+      const fh = await fsOpen(abs, 'r')
+      try {
+        const buf = Buffer.alloc(FLOW_YAML_MAX_BYTES + 1)
+        const { bytesRead } = await fh.read(buf, 0, buf.length, 0)
+        return buf.toString('utf8', 0, bytesRead)
+      } finally {
+        await fh.close()
+      }
+    },
+    // A flow variable NAME falls back to FLOW_NAME in the app's environment (never a bare host variable).
+    env: () => process.env
   })
   const prepOpenSimulator = createOpenSimulatorPrep({ service: simService })
   hookServer.setControlHandler(async ({ verb, nodeId, args, verified, onLateAnswer }) => {

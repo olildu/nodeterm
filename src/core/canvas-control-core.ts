@@ -41,6 +41,8 @@ import {
   simPickDeviceDocLines
 } from './sim/verb'
 import { SIM_TEXT_MAX } from '../shared/sim'
+import { FLOW_DIR, FLOW_INCLUDE_DEPTH_MAX, FLOW_MAX_STEPS, FLOW_TOTAL_MS_DEFAULT, FLOW_TOTAL_MS_MAX } from './sim/flow'
+import { RECORD_STEPS_MAX } from './sim/flow-record'
 import { nodeColorChoices } from '@shared/node-colors'
 import { offScreenGuidanceLines } from '@shared/control-off-screen'
 import { arrangeArgsRefusal, arrangeGroupGuidanceLines } from '@shared/arrange-verb'
@@ -510,6 +512,51 @@ function simLinkDocLines(): string[] {
   ]
 }
 
+/**
+ * Flows: replay a device test with no model. Rendered from the constants that enforce each limit
+ * (core/sim/flow.ts), shared by both agent-facing bodies.
+ */
+function simFlowDocLines(): string[] {
+  return [
+    `REPLAY BEFORE YOU IMPROVISE. Look in \`${FLOW_DIR}/\` (the project folder) first. A saved flow runs the whole test`,
+    'in one call, with no model turns, and costs a fraction of working it out again:',
+    `  - \`sim --run ${FLOW_DIR}/<name>.yaml [--udid X] [--var NAME=value ...] [--from-step N] [--timeout-ms N]\` — runs every`,
+    `    step in order under one device lease (the user watches in their node). Output: one line per step with its time, then`,
+    `    \`passed N/N in X s\`. The flow may name its \`device:\`; \`--udid\`/\`--node\` wins. Budget: ${Math.round(FLOW_TOTAL_MS_DEFAULT / 1000)} s total`,
+    `    (\`--timeout-ms\` up to ${Math.round(FLOW_TOTAL_MS_MAX / 1000)} s), at most ${FLOW_MAX_STEPS} steps after includes, includes ${FLOW_INCLUDE_DEPTH_MAX} deep.`,
+    '    Nothing runs if the file, an include or a variable is bad: the whole flow is checked first.',
+    '  - VARIABLES: `${NAME}` in any string, from `--var NAME=value` (several: newline-separated, or one `--var-NAME value` flag',
+    '    each), else the app\'s environment variable `FLOW_NAME`. A name containing PASSWORD, TOKEN, SECRET or KEY is a SECRET:',
+    '    its value is masked ("***") in every line the run returns, and steps print as `${NAME}`. Keep secrets out of flow files.',
+    '  - ON FAILURE the run stops at the first bad step and returns: the step and where it lives, the reason (no match + closest',
+    '    labels, ambiguous + numbered candidates, timeout), a screenshot path, the compact screen, and the exact resume command',
+    '    `sim --run <file> --udid X --from-step N`. Fix JUST that step (edit the YAML, or do it by hand), then resume at N —',
+    '    earlier steps are not repeated. This is the only point you are needed.',
+    '  - THE FORMAT (YAML; one key per step):',
+    '      name: login',
+    '      device: android:nt_smoke_30        # optional',
+    '      steps:',
+    '        - tap: "Log in"                  # or { label | id, index, timeout } or { at: [x, y] }',
+    '        - type: { into: "Email", text: "${EMAIL}" }     # or: type: "text" into the focused field',
+    '        - wait-for: "Home"               # or { label | id, timeout } (10 s default)',
+    '        - assert-visible: "Welcome"      # fails the run if absent (3 s grace)',
+    '        - assert-not-visible: "Error"',
+    '        - swipe: { from: [200, 600], to: [200, 150] }',
+    '        - press: back                    # any --press button;  key: Enter  also works',
+    '        - screenshot: after-login        # saved in the run folder (OS temp dir)',
+    '        - wait-idle: {}',
+    '        - run: other-flow.yaml           # include, relative to this file',
+    `  - RECORD WHAT YOU IMPROVISE so the next run is free: \`sim --record <name>\` starts logging the label-based actions you run on`,
+    `    that device (tap-label/tap-id, type-label, swipe, press, key, wait-for; at most ${RECORD_STEPS_MAX}; one recording per device;`,
+    `    failed actions are not logged); \`sim --record-stop [--out file.yaml]\` writes \`${FLOW_DIR}/<name>.yaml\` (never overwrites).`,
+    '    Coordinate taps are written as `at:` with a "TODO: use a label" note; text typed into a password/PIN/token-looking field is',
+    '    written as `${PASSWORD}` etc., never the value. Read the file, add assert-visible steps, then commit it.',
+    '  - `sim --wait-for "<label>" [--wait-for-ms N]` — block until a label is visible (10 s default).',
+    'The loop: `ls .nodeterm/flows/` → run the matching flow → improvise ONLY the steps with no flow (with `--record` on) →',
+    'on a failed step fix it and `--from-step` resume → leave a saved flow behind.'
+  ]
+}
+
 function simVerbDocLines(): string[] {
   const secs = (ms: number): string => `${Math.round(ms / 1000)}s`
   return [
@@ -568,6 +615,7 @@ function simVerbDocLines(): string[] {
     '  (boot it with `--boot`); a device no node shows works but the user cannot see it — the reply',
     '  says so once, and you should add one with `open-simulator --udid <id>`.',
     ...simLinkDocLines(),
+    ...simFlowDocLines(),
     ...openSimulatorDocLines()
   ]
 }
@@ -580,6 +628,8 @@ function simVerbDocLines(): string[] {
 function simTestingDocLines(): string[] {
   return [
     'Testing an iOS or Android app (the `sim` verb + Maestro):',
+    `0. FIRST \`ls ${FLOW_DIR}/\`: a saved flow for this app replays with \`sim --run\` and needs no further steps (see REPLAY above).`,
+    '   Improvise only what has no flow, with `sim --record <name>` on, so the next run is free.',
     '1. `sim --list` → pick a device (rules below). Prefer the Simulator node the user already has open',
     '   (`--node`) so they can watch; no Simulator node? run `open-simulator --udid <id>` — never ask the user to add one.',
     ...simPickDeviceDocLines('   '),

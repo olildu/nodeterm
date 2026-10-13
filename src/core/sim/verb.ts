@@ -31,6 +31,17 @@ import {
   type SimModifier
 } from '../../shared/sim'
 import { isSafeNodeId } from '../remote-safety'
+import {
+  FLOW_NAME_RE,
+  FLOW_STEP_NUMBER_MAX,
+  FLOW_TOTAL_MS_DEFAULT,
+  FLOW_TOTAL_MS_MAX,
+  FLOW_TOTAL_MS_MIN,
+  FLOW_VARS_MAX,
+  FLOW_VAR_NAME_RE,
+  FLOW_VAR_VALUE_MAX,
+  parseVarAssignments
+} from './flow-vars'
 
 /** The flat refusal for an unverified caller — one sentence, no diagnosis (house style, hook-server). */
 export const SIM_CONTROL_REFUSAL = 'Simulator control refused.'
@@ -78,7 +89,11 @@ export const SIM_ACTION_KEYS = [
   'key',
   'press',
   'boot',
-  'wait-idle'
+  'wait-idle',
+  'wait-for',
+  'run',
+  'record',
+  'record-stop'
 ] as const
 export type SimActionKey = (typeof SIM_ACTION_KEYS)[number]
 
@@ -96,7 +111,7 @@ export const SIM_INPUT_ACTIONS: ReadonlySet<SimActionKey> = new Set([
 
 /** The bare-switch spellings: `--describe`, `--describe true`. */
 export const SIM_HASH_RE = /^[0-9a-f]{8}$/
-const BARE_ACTIONS: ReadonlySet<string> = new Set(['list', 'describe', 'boot', 'wait-idle'])
+const BARE_ACTIONS: ReadonlySet<string> = new Set(['list', 'describe', 'boot', 'wait-idle', 'record-stop'])
 
 /** The buttons an agent may press. `side` and `playpause` exist in the helper but have no use here. */
 /** `back`, `recents`, `power`: Android only; `siri`: iOS only (each helper refuses what it lacks). */
@@ -116,8 +131,19 @@ const KNOWN_FLAGS: ReadonlySet<string> = new Set([
   'since',
   'index',
   'wait-for-ms',
-  'text'
+  'text',
+  'from-step',
+  'var',
+  'timeout-ms',
+  'out'
 ])
+
+/** `--var-NAME value`: a variable as its own flag (several `--var` flags collapse to one in the shim). */
+const VAR_FLAG_RE = /^var-[A-Za-z_][A-Za-z0-9_]{0,63}$/
+/** A flow file path: bounded, no control characters, YAML only. */
+export const SIM_FLOW_PATH_MAX = 1024
+/** `wait-for` polls this long by default (flows use the same number). */
+export const SIM_WAIT_FOR_DEFAULT_LONG_MS = 10_000
 
 // ─── Keys ────────────────────────────────────────────────────────────────────────────────────
 
@@ -199,6 +225,10 @@ export type SimAction =
   | { kind: 'press'; button: SimButton }
   | { kind: 'boot' }
   | { kind: 'wait-idle' }
+  | { kind: 'wait-for'; label: string; waitForMs: number }
+  | { kind: 'run'; path: string; fromStep: number; vars: Array<[string, string]>; totalMs: number }
+  | { kind: 'record'; name: string }
+  | { kind: 'record-stop'; out: string | null }
 
 export type SimTarget = { by: 'node'; node: string } | { by: 'udid'; udid: string }
 
@@ -215,6 +245,8 @@ export interface SimCall {
   wait: boolean
   /** `--scale` for a screenshot (fraction of the device's pixel size). */
   scale: number
+  /** Internal (a flow step): answer without the "Screen now" dump. Never set by the parser. */
+  noScreen?: boolean
 }
 
 const err = (message: string): { error: string } => ({ error: message })
@@ -258,9 +290,28 @@ function buildAction(key: SimActionKey, value: string): SimAction | { error: str
     }
     case 'list':
     case 'boot':
+    case 'record-stop':
     case 'wait-idle': {
       const on = bareOn(key, value)
-      return on === true ? { kind: key } : on
+      return on === true ? (key === 'record-stop' ? { kind: 'record-stop', out: null } : { kind: key }) : on
+    }
+    case 'wait-for': {
+      const label = value.trim()
+      if (!label) return err('sim: --wait-for takes the element\'s label, e.g. --wait-for "Home"')
+      if (label.length > SIM_LABEL_MAX || BAD_TEXT.test(label)) return err('sim: --wait-for is not usable')
+      return { kind: 'wait-for', label, waitForMs: SIM_WAIT_FOR_DEFAULT_LONG_MS }
+    }
+    case 'run': {
+      const path = value.trim()
+      if (!path) return err('sim: --run takes the path of a flow file, e.g. --run .nodeterm/flows/login.yaml')
+      if (path.length > SIM_FLOW_PATH_MAX || BAD_TEXT.test(path)) return err('sim: --run path is not usable')
+      if (!/\.ya?ml$/i.test(path)) return err('sim: --run path must end in .yaml or .yml')
+      return { kind: 'run', path, fromStep: 1, vars: [], totalMs: FLOW_TOTAL_MS_DEFAULT }
+    }
+    case 'record': {
+      const name = value.trim()
+      if (!FLOW_NAME_RE.test(name)) return err('sim: --record takes a flow name of letters, digits, . _ - (up to 64), e.g. --record login')
+      return { kind: 'record', name }
     }
     case 'point':
     case 'tap': {
@@ -332,7 +383,7 @@ function buildAction(key: SimActionKey, value: string): SimAction | { error: str
 export function parseSimArgs(args: Record<string, string>): SimCall | { error: string } {
   const has = (k: string): boolean => Object.prototype.hasOwnProperty.call(args, k)
   for (const k of Object.keys(args)) {
-    if (!KNOWN_FLAGS.has(k)) {
+    if (!KNOWN_FLAGS.has(k) && !VAR_FLAG_RE.test(k)) {
       return err(`sim: unknown flag --${k}. One action: ${SIM_ACTION_KEYS.map((a) => `--${a}`).join(' ')}`)
     }
   }
@@ -398,6 +449,43 @@ export function parseSimArgs(args: Record<string, string>): SimCall | { error: s
     }
     action = { ...action, mods: [...new Set(mapped)] as SimModifier[] }
   }
+  // flow modifiers
+  const flowVarFlags = Object.keys(args).filter((k) => VAR_FLAG_RE.test(k))
+  if (has('from-step') || has('var') || has('timeout-ms') || flowVarFlags.length > 0) {
+    if (action.kind !== 'run') return err('sim: --from-step, --var, --var-NAME and --timeout-ms apply to --run only')
+    let fromStep = 1
+    if (has('from-step')) {
+      const n = intInRange(args['from-step'], 1, FLOW_STEP_NUMBER_MAX)
+      if (n === null) return err('sim: --from-step takes the step number to resume at (1 = the first)')
+      fromStep = n
+    }
+    let totalMs = FLOW_TOTAL_MS_DEFAULT
+    if (has('timeout-ms')) {
+      const n = intInRange(args['timeout-ms'], FLOW_TOTAL_MS_MIN, FLOW_TOTAL_MS_MAX)
+      if (n === null) return err(`sim: --timeout-ms takes ${FLOW_TOTAL_MS_MIN}-${FLOW_TOTAL_MS_MAX} (the whole run's time budget)`)
+      totalMs = n
+    }
+    const vars: Array<[string, string]> = []
+    if (has('var')) {
+      const parsed = parseVarAssignments(args.var ?? '')
+      if ('error' in parsed) return err(parsed.error)
+      vars.push(...parsed)
+    }
+    for (const k of flowVarFlags) {
+      const value = args[k] ?? ''
+      if (value.length > FLOW_VAR_VALUE_MAX) return err(`sim: --${k} is longer than ${FLOW_VAR_VALUE_MAX} characters`)
+      vars.push([k.slice(4), value])
+    }
+    if (vars.length > FLOW_VARS_MAX) return err(`sim: at most ${FLOW_VARS_MAX} variables`)
+    for (const [n] of vars) if (!FLOW_VAR_NAME_RE.test(n)) return err('sim: a variable name is letters, digits and _')
+    action = { ...action, fromStep, totalMs, vars }
+  }
+  if (has('out')) {
+    if (action.kind !== 'record-stop') return err('sim: --out applies to --record-stop only')
+    const p = (args.out ?? '').trim()
+    if (!p || p.length > SIM_FLOW_PATH_MAX || BAD_TEXT.test(p) || !/\.ya?ml$/i.test(p)) return err('sim: --out takes a .yaml path for the flow file')
+    action = { ...action, out: p }
+  }
   // describe modifiers
   if (has('full') || has('since')) {
     if (action.kind !== 'describe') return err('sim: --full and --since apply to --describe only')
@@ -425,7 +513,7 @@ export function parseSimArgs(args: Record<string, string>): SimCall | { error: s
     action = { ...action, index: n } as SimAction
   }
   if (has('wait-for-ms')) {
-    if (!selector) return err('sim: --wait-for-ms applies to --tap-label, --tap-id and --type-label')
+    if (!selector && action.kind !== 'wait-for') return err('sim: --wait-for-ms applies to --tap-label, --tap-id, --type-label and --wait-for')
     const n = intInRange(args['wait-for-ms'], 0, SIM_TIMEOUT_MAX_MS)
     if (n === null) return err(`sim: --wait-for-ms takes 0-${SIM_TIMEOUT_MAX_MS} (how long to wait for the element to appear)`)
     action = { ...action, waitForMs: n } as SimAction
@@ -1058,6 +1146,10 @@ export function describeDriveAction(action: SimAction): string {
       return 'sim --boot'
     case 'wait-idle':
       return 'sim --wait-idle'
+    case 'wait-for':
+      return `sim --wait-for ${JSON.stringify(cleanUiText(action.label, 40))}`
+    case 'run':
+      return `sim --run ${cleanUiText(action.path.slice(action.path.lastIndexOf('/') + 1), 40)}`
     default:
       return 'sim'
   }

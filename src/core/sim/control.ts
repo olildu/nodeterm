@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import { join } from 'node:path'
-import { simPlatformOf, type SimAgentEvent, type SimDeviceEntry, type SimStatus } from '../../shared/sim'
+import path, { join } from 'node:path'
+import { normalizeSimUdid, simPlatformOf, type SimAgentEvent, type SimDeviceEntry, type SimStatus } from '../../shared/sim'
 import type { AgentDevice, AgentFailure, AgentRunOptions, SimService } from './service'
 import {
   createSimLinkLedger,
@@ -40,6 +40,20 @@ import {
   type SimCall,
   type SimElement
 } from './verb'
+import {
+  buildVarMap,
+  createMasker,
+  FlowError,
+  FLOW_DIR,
+  isSecretVarName,
+  loadFlow,
+  maskDeep,
+  type ElementRef,
+  type FlowStep,
+  type LoadedFlow
+} from './flow'
+import { classifyFailure, renderRunSummary, runFlow, type FlowRunResult, type StepOutcome } from './flow-run'
+import { RECORD_MAX_AGE_MS, RECORD_STEPS_MAX, recordStep, renderRecording, startRecording, type Recording } from './flow-record'
 
 /** What a running call reports to the node's driving chip (no-ops when nobody is shown the device). */
 interface DriveProgress {
@@ -95,6 +109,10 @@ export interface SimControlDeps {
   emit?(event: SimAgentEvent): void
   /** The per-run memory of auto-links and user removals; main shares it with the removal IPC. */
   ledger?: SimLinkLedger
+  /** Read a flow file (already jailed by `resolvePath`), as text, at most ~128 KB of it. Absent = `--run` is unavailable. */
+  readFile?(abs: string): Promise<string>
+  /** The app's environment: a flow variable NAME falls back to `FLOW_NAME` here. Absent = none. */
+  env?(): Record<string, string | undefined>
   now?(): number
   /** Wait between polls of a `--wait-for-ms` lookup (tests inject a virtual clock). */
   sleep?(ms: number): Promise<void>
@@ -128,6 +146,8 @@ const DEVICE_LIST_MAX = 40
 /** Screens remembered per device for `--describe --since <hash>`, and devices remembered at all. */
 const SNAPSHOTS_PER_DEVICE = 6
 const SNAPSHOT_DEVICES_MAX = 16
+/** Lines of the compact screen a flow failure report carries. */
+const FLOW_FAILURE_SCREEN_LINES = 45
 
 /** How a failed lease reads to the agent: a code it can branch on, then the sentence. */
 export function failureReply(f: AgentFailure, udid: string): SimControlReply {
@@ -365,9 +385,52 @@ export function createSimControl(deps: SimControlDeps): (req: {
     }
   }
 
+
+  /**
+   * Poll the tree for an element: until it is visible (`present`) or gone (`absent`), at most
+   * `timeoutMs` (0 = look once). An element matched by several visible candidates is PRESENT — that
+   * is a question about the screen, not an aim at one target.
+   */
+  async function probe(
+    d: AgentDevice,
+    ref: ElementRef,
+    index: number | null,
+    timeoutMs: number,
+    mode: 'present' | 'absent'
+  ): Promise<{ ok: true; waitedMs: number; element?: SimElement } | { ok: false; reply: SimControlReply }> {
+    const t0 = now()
+    const query: ElementQuery = { by: ref.by, text: ref.text }
+    for (;;) {
+      const desc = await d.command({ cmd: 'describe' })
+      if (!desc.ok) return { ok: false, reply: helperFailure(desc, 'describe') }
+      const read = readDescribe(desc)
+      const hit = resolveElement(read.elements, query, { index })
+      const visible = hit.ok || hit.reason === 'ambiguous'
+      const waited = now() - t0
+      if (mode === 'present' && visible) return { ok: true, waitedMs: waited, ...(hit.ok ? { element: hit.element } : {}) }
+      if (mode === 'absent' && !visible) return { ok: true, waitedMs: waited }
+      if (waited < timeoutMs) {
+        await sleep(Math.min(SIM_WAIT_FOR_POLL_MS, timeoutMs - waited))
+        continue
+      }
+      const what = `${ref.by} ${JSON.stringify(ref.text)}`
+      if (mode === 'absent') {
+        const shown = hit.ok ? renderElement(hit.element) : `${hit.candidates.length} elements`
+        return { ok: false, reply: fail(`sim-assert-visible: ${what} is still on screen after ${Math.round(waited)} ms: ${shown}`) }
+      }
+      return {
+        ok: false,
+        reply: fail(
+          `sim-wait-for-${hit.ok ? 'none' : hit.reason}: ${what} did not appear within ${Math.round(waited)} ms.\n${hit.ok ? '' : hit.message}` +
+            (read.partial ? '\n(The tree was PARTIAL; run --describe again in a moment.)' : '')
+        )
+      }
+    }
+  }
+
   /** After a settled input: the compact screen, so the agent needs no separate --describe. */
   async function newScreen(d: AgentDevice, call: SimCall, udid: string): Promise<{ text: string; result?: Record<string, unknown> }> {
-    if (!call.wait) return { text: '' }
+    if (!call.wait || call.noScreen) return { text: '' }
     const r = await d.command({ cmd: 'describe' })
     if (!r.ok) return { text: '' }
     const c = compactScreen(readDescribe(r))
@@ -525,8 +588,265 @@ export function createSimControl(deps: SimControlDeps): (req: {
           result: { idle: r.idle, waitedMs: r.waitedMs }
         }
       }
+      case 'wait-for': {
+        const r = await probe(d, { by: 'label', text: a.label }, null, a.waitForMs, 'present')
+        if (!r.ok) return r.reply
+        return { ok: true, message: `${JSON.stringify(a.label)} is on screen (${Math.round(r.waitedMs)} ms)` }
+      }
       default:
         return fail(`sim: ${a.kind} is not a device action`)
+    }
+  }
+
+
+  // ─── Flows: --run, --record, --record-stop ────────────────────────────────────────────────
+
+  /** One recording per device, bounded: devices are few, steps are capped, and an old one is dropped. */
+  const recordings = new Map<string, Recording>()
+  const liveRecording = (udid: string): Recording | undefined => {
+    const r = recordings.get(udid)
+    if (r && now() - r.startedAt > RECORD_MAX_AGE_MS) {
+      recordings.delete(udid)
+      return undefined
+    }
+    return r
+  }
+
+  const jailMessage = (m: string): string => m.replace('--screenshot path', 'path')
+
+  /** Resolve a flow path (or an include relative to `baseAbs`) through the shell's path jail. */
+  const flowResolve =
+    (cwd: string | undefined) =>
+    async (baseAbs: string | null, rel: string): Promise<{ ok: true; abs: string } | { ok: false; message: string }> => {
+      if (rel.length === 0 || rel.length > 1024) return { ok: false, message: 'the path is empty or too long' }
+      const raw = baseAbs ? path.resolve(path.dirname(baseAbs), rel) : rel
+      const r = await deps.resolvePath(cwd, raw)
+      return r.ok ? r : { ok: false, message: jailMessage(r.message) }
+    }
+
+  /** The `--var` flags of a resume command: names only, never values. */
+  const varFlagsFor = (vars: Array<[string, string]>): string =>
+    vars.length ? ' ' + [...new Set(vars.map(([n]) => n))].map((n) => `--var ${n}=…`).join(' ') : ''
+
+  function stepAction(step: FlowStep): SimCall | { error: string } {
+    const parsed = parseSimArgs(step.args ?? {})
+    return 'error' in parsed ? parsed : { ...parsed, noScreen: true }
+  }
+
+  async function runFlowOnDevice(
+    d: AgentDevice,
+    flow: LoadedFlow,
+    action: Extract<SimAction, { kind: 'run' }>,
+    udid: string,
+    projectId: string | undefined,
+    pr: DriveProgress | undefined,
+    say: ((extra: Partial<Extract<SimAgentEvent, { kind: 'drive' }>>) => void) | undefined,
+    mask: (s: string) => string
+  ): Promise<{ run: FlowRunResult; runDir: string; shot: string | null; screen: string | null }> {
+    const stamp = new Date(now()).toISOString().replace(/[:.]/g, '-').slice(0, 19)
+    const runDir = join(deps.tempDir(), `nodeterm-flow-${flow.name}-${stamp}`)
+    const total = flow.steps.length
+    const exec = async (step: FlowStep, remainingMs: number): Promise<StepOutcome> => {
+      say?.({ action: `flow ${flow.name} ${step.index}/${total}: ${step.display}` })
+      const wrap = (r: SimControlReply): StepOutcome => {
+        if (r.ok) return { ok: true }
+        const reason = r.error ?? r.message ?? 'the step failed'
+        return { ok: false, reason, kind: classifyFailure(reason) }
+      }
+      if (step.op === 'sim') {
+        const call = stepAction(step)
+        if ('error' in call) return { ok: false, kind: 'other', reason: call.error }
+        return wrap(await act(d, call, projectId, udid, pr))
+      }
+      if (step.op === 'screenshot') {
+        const call = parseSimArgs({ screenshot: join(runDir, `${String(step.index).padStart(2, '0')}-${step.shot}.png`) })
+        if ('error' in call) return { ok: false, kind: 'other', reason: call.error }
+        return wrap(await act(d, call, projectId, udid, pr))
+      }
+      const c = step.check as NonNullable<FlowStep['check']>
+      const r = await probe(d, c.ref, c.index, Math.min(c.timeoutMs, remainingMs), step.op === 'assert-not-visible' ? 'absent' : 'present')
+      if (r.ok) return { ok: true }
+      const reason = r.reply.error ?? r.reply.message ?? 'the step failed'
+      return { ok: false, reason, kind: step.op === 'wait-for' ? classifyFailure(reason) : 'assert' }
+    }
+    const run = await runFlow({
+      name: flow.name,
+      steps: flow.steps,
+      fromStep: action.fromStep,
+      totalTimeoutMs: action.totalMs,
+      exec,
+      now,
+      mask
+    })
+    let shot: string | null = null
+    let screen: string | null = null
+    if (run.failed) {
+      const target = join(runDir, `failed-step-${String(run.failed.index).padStart(2, '0')}.png`)
+      try {
+        const cwd = projectId ? deps.projectCwd(projectId) : undefined
+        const resolved = await deps.resolvePath(cwd, target)
+        const img = resolved.ok ? await d.screenshot(0.5) : null
+        if (resolved.ok && img && img.ok) {
+          await deps.writeFile(resolved.abs, Buffer.from(img.data))
+          shot = resolved.abs
+        }
+      } catch {
+        /* a failure report without a screenshot is still a failure report */
+      }
+      try {
+        const desc = await d.command({ cmd: 'describe' })
+        if (desc.ok) {
+          const c = compactScreen(readDescribe(desc))
+          remember(udid, c)
+          screen = renderCompactText(c).split('\n').slice(0, FLOW_FAILURE_SCREEN_LINES).join('\n')
+        }
+      } catch {
+        /* same */
+      }
+    }
+    return { run, runDir, shot, screen }
+  }
+
+  /** `--run`: load everything first (nothing touches the device on a bad flow), then replay under ONE lease. */
+  async function runFlowAction(
+    a: Extract<SimAction, { kind: 'run' }>,
+    call: SimCall,
+    nodeId: string,
+    projectId: string | undefined
+  ): Promise<SimControlReply> {
+    if (!deps.readFile) return fail('sim-flow-unavailable: flows cannot be read in this build.')
+    const cwd = projectId ? deps.projectCwd(projectId) : undefined
+    const vars = buildVarMap(a.vars, deps.env?.() ?? {})
+    // Masked from the first byte: every secret-NAMED variable we hold, used by this flow or not.
+    const mask = createMasker([...vars].filter(([n]) => isSecretVarName(n)).map(([, v]) => v))
+    const resolve = flowResolve(cwd)
+    const root = await resolve(null, a.path)
+    if (!root.ok) return fail(`sim-flow-path: ${root.message}`)
+    let flow: LoadedFlow
+    try {
+      flow = await loadFlow(root.abs, { vars, io: { resolve, read: deps.readFile } })
+    } catch (e) {
+      if (e instanceof FlowError) return fail(`sim-flow-invalid: ${mask(e.message)}`)
+      throw e
+    }
+    if (a.fromStep > flow.steps.length) {
+      return fail(`sim-flow-invalid: --from-step ${a.fromStep} is past the last step (the flow has ${flow.steps.length}).`)
+    }
+    // The device: the command line wins, then the flow's own `device:`, then the caller's link.
+    let c = call
+    if (!c.target && flow.device) {
+      const udid = normalizeSimUdid(flow.device)
+      if (!udid) return fail(`sim-flow-invalid: the flow's device ${JSON.stringify(flow.device)} is not a simulator id.`)
+      c = { ...c, target: { by: 'udid', udid } }
+    }
+    const t = target(c, projectId, nodeId)
+    if ('ok' in t) return t
+    const linkNote = autoLink(nodeId, projectId, t)
+    const drive = t.shownBy.length > 0
+    const say = drive
+      ? (extra: Partial<Extract<SimAgentEvent, { kind: 'drive' }>>): void =>
+          deps.emit?.({ kind: 'drive', ownerNodeId: nodeId, simNodeIds: t.shownBy, until: now() + SIM_DRIVE_MAX_MS, ...extra } as SimAgentEvent)
+      : undefined
+    const progress: DriveProgress = {
+      point: (p) => say?.({ action: 'flow step', ...p }),
+      settling: () => say?.({ action: SIM_DRIVE_SETTLING })
+    }
+    say?.({ action: `flow ${flow.name}` })
+    const run = await deps.service.agentRun(t.udid, { connectTimeoutMs: CONNECT_TIMEOUT_MS }, (d) =>
+      runFlowOnDevice(d, flow, a, t.udid, projectId, progress, say, mask)
+    )
+    if (drive) deps.emit?.({ kind: 'drive', ownerNodeId: nodeId, simNodeIds: t.shownBy, until: now() + SIM_DRIVE_LINGER_MS, action: SIM_DRIVE_DONE })
+    if (!run.ok) return failureReply(run, t.udid)
+    const { run: res, runDir, shot, screen } = run.value
+    const lines = [`flow ${JSON.stringify(flow.name)} on ${t.udid} — ${flow.steps.length} step${flow.steps.length === 1 ? '' : 's'}${flow.files.length > 1 ? ` (${flow.files.length} files)` : ''}`, renderRunSummary(res)]
+    if (res.failed) {
+      const f = res.failed
+      lines.push('', `FAILED step ${f.index}/${res.total} (${f.origin}): ${f.display}`, `reason: ${f.reason ?? 'unknown'}`)
+      if (shot) lines.push(`screenshot: ${shot}`)
+      if (screen) lines.push('screen now:', screen)
+      lines.push(
+        `resume after you fix it: sim --run ${a.path} --udid ${t.udid} --from-step ${f.index}${varFlagsFor(a.vars)}`,
+        'Fix the step in the flow file (or do it by hand with --tap-label etc.), then resume — steps before it are not repeated.'
+      )
+    } else if (res.steps.some((s) => s.display.startsWith('screenshot'))) {
+      lines.push(`screenshots: ${runDir}`)
+    }
+    const reply: SimControlReply = {
+      ok: !res.failed,
+      ...(res.failed ? { error: lines.join('\n') } : {}),
+      message: lines.join('\n') + (res.failed ? '' : tailOf(t, linkNote)),
+      result: {
+        flow: flow.name,
+        udid: t.udid,
+        passed: res.passed,
+        total: res.total,
+        elapsedMs: res.elapsedMs,
+        steps: res.steps.map((s) => ({ index: s.index, step: s.display, status: s.status, ms: s.ms, ...(s.reason ? { reason: s.reason } : {}) })),
+        ...(res.failed ? { failedStep: res.failed.index, resume: `--from-step ${res.failed.index}`, ...(shot ? { screenshot: shot } : {}) } : {})
+      }
+    }
+    return maskDeep(reply, mask)
+  }
+
+  const tailOf = (t: Resolved, linkNote: string): string => watchHint(t.udid, t.shown) + linkNote
+
+  function startRecord(a: Extract<SimAction, { kind: 'record' }>, udid: string): SimControlReply {
+    const live = liveRecording(udid)
+    if (live) {
+      return fail(
+        `sim-recording-active: already recording ${JSON.stringify(live.name)} on this device (${live.steps.length} step${live.steps.length === 1 ? '' : 's'}). ` +
+          'Finish it with: sim --record-stop'
+      )
+    }
+    recordings.set(udid, startRecording(a.name, udid, now()))
+    while (recordings.size > SNAPSHOT_DEVICES_MAX) recordings.delete(recordings.keys().next().value as string)
+    return {
+      ok: true,
+      message:
+        `recording ${JSON.stringify(a.name)} on ${udid}: the label-based actions you run on this device (--tap-label, --tap-id, --type-label, --swipe, --press, --key, --wait-for) ` +
+        `are logged, ${RECORD_STEPS_MAX} at most. Finish with: sim --record-stop [--out <file.yaml>]`
+    }
+  }
+
+  async function stopRecord(
+    a: Extract<SimAction, { kind: 'record-stop' }>,
+    udid: string,
+    projectId: string | undefined
+  ): Promise<SimControlReply> {
+    const rec = liveRecording(udid)
+    if (!rec) return fail('sim-no-recording: nothing is being recorded on this device. Start one with: sim --record <name>')
+    if (rec.steps.length === 0) {
+      return fail('sim-recording-empty: no steps were recorded yet — run some actions (--tap-label …) first. The recording is still on; --record-stop again when done.')
+    }
+    const cwd = projectId ? deps.projectCwd(projectId) : undefined
+    const raw = a.out ?? (cwd ? `${FLOW_DIR}/${rec.name}.yaml` : null)
+    if (!raw) return fail('sim-flow-path: this node has no project folder to hold .nodeterm/flows — pass --out <path>.yaml (inside the OS temp directory).')
+    const resolved = await deps.resolvePath(cwd, raw)
+    if (!resolved.ok) return fail(`sim-flow-path: ${jailMessage(resolved.message)}`)
+    if (deps.readFile) {
+      let exists = true
+      try {
+        await deps.readFile(resolved.abs)
+      } catch {
+        exists = false
+      }
+      if (exists) return fail(`sim-flow-exists: ${resolved.abs} already exists — it was not overwritten. Pass --out <another>.yaml (the recording is kept).`)
+    }
+    try {
+      await deps.writeFile(resolved.abs, Buffer.from(renderRecording(rec), 'utf8'))
+    } catch {
+      return fail(`sim: could not write the flow to ${resolved.abs}`)
+    }
+    recordings.delete(udid)
+    const todo = rec.steps.filter((s) => s.note?.startsWith('TODO')).length
+    return {
+      ok: true,
+      message:
+        `wrote ${resolved.abs} (${rec.steps.length} step${rec.steps.length === 1 ? '' : 's'}${rec.dropped ? `, ${rec.dropped} past the limit not kept` : ''}). ` +
+        `Replay with: sim --run ${raw} --udid ${udid}${varFlagsFor([...rec.vars].map((n) => [n, '']))}` +
+        (todo ? `\n${todo} step${todo === 1 ? '' : 's'} tap${todo === 1 ? 's' : ''} a coordinate (marked "TODO: use a label") — replace with a label if the element has one.` : '') +
+        '\nRead the file before committing: typed text is written as typed (secret-looking fields are written as ${VARIABLES}). Add assert-visible steps for what must hold.',
+      result: { path: resolved.abs, steps: rec.steps.length, name: rec.name }
     }
   }
 
@@ -578,10 +898,13 @@ export function createSimControl(deps: SimControlDeps): (req: {
     if (!avail.ok) return fail(`sim-unavailable: ${avail.message}`)
     const projectId = deps.projectIdOfNode(nodeId)
     if (call.action.kind === 'list') return list(projectId, nodeId)
+    if (call.action.kind === 'run') return runFlowAction(call.action, call, nodeId, projectId)
     const t = target(call, projectId, nodeId)
     if ('ok' in t) return t
     const linkNote = autoLink(nodeId, projectId, t)
     const tail = (): string => watchHint(t.udid, t.shown) + linkNote
+    if (call.action.kind === 'record') return startRecord(call.action, t.udid)
+    if (call.action.kind === 'record-stop') return stopRecord(call.action, t.udid, projectId)
     if (call.action.kind === 'boot') {
       const r = await boot(t.udid, call)
       return r.ok ? { ...r, message: (r.message ?? '') + tail() } : r
@@ -602,6 +925,10 @@ export function createSimControl(deps: SimControlDeps): (req: {
     if (drive) deps.emit?.({ kind: 'drive', ownerNodeId: nodeId, simNodeIds: t.shownBy, until: now() + SIM_DRIVE_LINGER_MS, action: SIM_DRIVE_DONE })
     if (!run.ok) return failureReply(run, t.udid)
     const reply = run.value
+    if (reply.ok) {
+      const rec = liveRecording(t.udid)
+      if (rec) recordStep(rec, call.action)
+    }
     return reply.ok ? { ...reply, message: (reply.message ?? '') + tail() } : reply
   }
 }
