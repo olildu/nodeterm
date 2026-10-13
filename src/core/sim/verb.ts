@@ -55,6 +55,13 @@ export const SIM_SCREENSHOT_SCALE_MIN = 0.05
 /** Lines of `--describe` output before it is cut (the header says how many were left out). */
 export const SIM_DESCRIBE_LINES_MAX = 300
 export const SIM_LABEL_MAX = 200
+/** `--tap-label` / `--tap-id` / `--type-label` poll the tree this long (ms) for the element to appear. */
+export const SIM_WAIT_FOR_DEFAULT_MS = 3_000
+export const SIM_WAIT_FOR_POLL_MS = 250
+/** Compact describe: labels longer than this are cut. */
+export const SIM_COMPACT_LABEL_MAX = 60
+/** Candidate lines printed for an ambiguous match, and the closest labels printed for no match. */
+export const SIM_CANDIDATES_MAX = 10
 
 /** Exactly one of these is the call's action. */
 export const SIM_ACTION_KEYS = [
@@ -64,6 +71,8 @@ export const SIM_ACTION_KEYS = [
   'screenshot',
   'tap',
   'tap-label',
+  'tap-id',
+  'type-label',
   'swipe',
   'type',
   'key',
@@ -77,6 +86,8 @@ export type SimActionKey = (typeof SIM_ACTION_KEYS)[number]
 export const SIM_INPUT_ACTIONS: ReadonlySet<SimActionKey> = new Set([
   'tap',
   'tap-label',
+  'tap-id',
+  'type-label',
   'swipe',
   'type',
   'key',
@@ -84,6 +95,7 @@ export const SIM_INPUT_ACTIONS: ReadonlySet<SimActionKey> = new Set([
 ])
 
 /** The bare-switch spellings: `--describe`, `--describe true`. */
+export const SIM_HASH_RE = /^[0-9a-f]{8}$/
 const BARE_ACTIONS: ReadonlySet<string> = new Set(['list', 'describe', 'boot', 'wait-idle'])
 
 /** The buttons an agent may press. `side` and `playpause` exist in the helper but have no use here. */
@@ -99,7 +111,12 @@ const KNOWN_FLAGS: ReadonlySet<string> = new Set([
   'mods',
   'timeout',
   'quiet',
-  'no-wait'
+  'no-wait',
+  'full',
+  'since',
+  'index',
+  'wait-for-ms',
+  'text'
 ])
 
 // ─── Keys ────────────────────────────────────────────────────────────────────────────────────
@@ -169,11 +186,13 @@ export function simKeyUsage(raw: string): number | null {
 
 export type SimAction =
   | { kind: 'list' }
-  | { kind: 'describe' }
+  | { kind: 'describe'; full: boolean; since: string | null }
   | { kind: 'point'; x: number; y: number }
   | { kind: 'screenshot'; path: string | null }
   | { kind: 'tap'; x: number; y: number }
-  | { kind: 'tap-label'; label: string }
+  | { kind: 'tap-label'; label: string; index: number | null; waitForMs: number }
+  | { kind: 'tap-id'; id: string; index: number | null; waitForMs: number }
+  | { kind: 'type-label'; label: string; text: string; index: number | null; waitForMs: number }
   | { kind: 'swipe'; x1: number; y1: number; x2: number; y2: number; ms: number }
   | { kind: 'type'; text: string }
   | { kind: 'key'; usage: number; name: string; mods: SimModifier[] }
@@ -233,8 +252,11 @@ const BAD_TEXT = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/
 
 function buildAction(key: SimActionKey, value: string): SimAction | { error: string } {
   switch (key) {
+    case 'describe': {
+      const on = bareOn(key, value)
+      return on === true ? { kind: 'describe', full: false, since: null } : on
+    }
     case 'list':
-    case 'describe':
     case 'boot':
     case 'wait-idle': {
       const on = bareOn(key, value)
@@ -263,7 +285,19 @@ function buildAction(key: SimActionKey, value: string): SimAction | { error: str
       const label = value.trim()
       if (!label) return err('sim: --tap-label takes the element\'s label, e.g. --tap-label "General"')
       if (label.length > SIM_LABEL_MAX || BAD_TEXT.test(label)) return err('sim: --tap-label is not usable')
-      return { kind: 'tap-label', label }
+      return { kind: 'tap-label', label, index: null, waitForMs: SIM_WAIT_FOR_DEFAULT_MS }
+    }
+    case 'tap-id': {
+      const id = value.trim()
+      if (!id) return err('sim: --tap-id takes the element\'s id (Android resource-id, iOS accessibilityIdentifier), e.g. --tap-id login_button')
+      if (id.length > SIM_LABEL_MAX || BAD_TEXT.test(id)) return err('sim: --tap-id is not usable')
+      return { kind: 'tap-id', id, index: null, waitForMs: SIM_WAIT_FOR_DEFAULT_MS }
+    }
+    case 'type-label': {
+      const label = value.trim()
+      if (!label) return err('sim: --type-label takes the field\'s label, e.g. --type-label "Email" --text "a@b.c"')
+      if (label.length > SIM_LABEL_MAX || BAD_TEXT.test(label)) return err('sim: --type-label is not usable')
+      return { kind: 'type-label', label, text: '', index: null, waitForMs: SIM_WAIT_FOR_DEFAULT_MS }
     }
     case 'type': {
       if (value.length === 0) return err('sim: --type takes the text to type')
@@ -364,6 +398,47 @@ export function parseSimArgs(args: Record<string, string>): SimCall | { error: s
     }
     action = { ...action, mods: [...new Set(mapped)] as SimModifier[] }
   }
+  // describe modifiers
+  if (has('full') || has('since')) {
+    if (action.kind !== 'describe') return err('sim: --full and --since apply to --describe only')
+    let full = false
+    let since: string | null = null
+    if (has('full')) {
+      const on = bareOn('full', args.full ?? '')
+      if (on !== true) return on
+      full = true
+    }
+    if (has('since')) {
+      const h = (args.since ?? '').trim().toLowerCase()
+      if (!SIM_HASH_RE.test(h)) return err('sim: --since takes the screen hash a compact --describe printed (8 hex characters)')
+      if (full) return err('sim: --since works on the compact describe, not --full')
+      since = h
+    }
+    action = { ...action, full, since }
+  }
+  // label-selector modifiers
+  const selector = action.kind === 'tap-label' || action.kind === 'tap-id' || action.kind === 'type-label'
+  if (has('index')) {
+    if (!selector) return err('sim: --index applies to --tap-label, --tap-id and --type-label')
+    const n = intInRange(args.index, 1, 99)
+    if (n === null) return err('sim: --index takes 1-99 (the Nth match, counted as the ambiguity list numbers them)')
+    action = { ...action, index: n } as SimAction
+  }
+  if (has('wait-for-ms')) {
+    if (!selector) return err('sim: --wait-for-ms applies to --tap-label, --tap-id and --type-label')
+    const n = intInRange(args['wait-for-ms'], 0, SIM_TIMEOUT_MAX_MS)
+    if (n === null) return err(`sim: --wait-for-ms takes 0-${SIM_TIMEOUT_MAX_MS} (how long to wait for the element to appear)`)
+    action = { ...action, waitForMs: n } as SimAction
+  }
+  if (action.kind === 'type-label') {
+    const text = args.text ?? ''
+    if (!has('text') || text.length === 0) return err('sim: --type-label needs --text "<what to type>"')
+    if (text.length > SIM_TEXT_MAX) return err(`sim: --text is longer than ${SIM_TEXT_MAX} characters`)
+    if (BAD_TEXT.test(text)) return err('sim: --text holds a control character')
+    action = { ...action, text }
+  } else if (has('text')) {
+    return err('sim: --text applies to --type-label only (use --type <text> to type into the focused field)')
+  }
   let wait = SIM_INPUT_ACTIONS.has(key)
   if (has('no-wait')) {
     if (!SIM_INPUT_ACTIONS.has(key)) return err('sim: --no-wait applies to the input actions (tap, swipe, type, key, press)')
@@ -398,6 +473,9 @@ export interface SimElement {
   enabled: boolean
   offscreen: boolean
   clipped: boolean
+  /** Android only (and only when true / checkable); iOS elements carry neither. */
+  focused?: boolean
+  checked?: boolean
   center: { x: number; y: number } | null
   frame: { x: number; y: number; width: number; height: number } | null
 }
@@ -408,6 +486,8 @@ export interface SimScreenRead {
   partial: boolean
   /** The helper switched the guest's accessibility preference on during this attach: apps started earlier may still describe empty. */
   axEnabledNow?: boolean
+  /** The helper's own answer to "is the soft keyboard up" (Android); undefined = it did not say. */
+  keyboard?: boolean
   elements: SimElement[]
 }
 
@@ -449,6 +529,8 @@ function toElement(raw: unknown): SimElement | null {
     enabled: r.enabled !== false,
     offscreen: r.offscreen === true,
     clipped: r.clipped === true,
+    ...(r.focused === true ? { focused: true } : {}),
+    ...(typeof r.checked === 'boolean' ? { checked: r.checked } : {}),
     center: cx !== null && cy !== null ? { x: cx, y: cy } : null,
     frame: fx !== null && fy !== null && fw !== null && fh !== null ? { x: fx, y: fy, width: fw, height: fh } : null
   }
@@ -466,6 +548,7 @@ export function readDescribe(reply: Record<string, unknown>): SimScreenRead {
     count: num(reply.count) ?? elements.length,
     partial: reply.partial === true || reply.viaPoint === true,
     ...(reply.axPref === 'enabled-now' ? { axEnabledNow: true } : {}),
+    ...(typeof reply.keyboard === 'boolean' ? { keyboard: reply.keyboard } : {}),
     elements
   }
 }
@@ -569,6 +652,11 @@ const INTERACTIVE_ROLES: ReadonlySet<string> = new Set([
   'TextArea',
   'Slider',
   'Stepper',
+  'ImageButton',
+  'ToggleButton',
+  'Spinner',
+  'SeekBar',
+  'CheckedTextView',
   'SegmentedControl',
   'Picker',
   'DatePicker'
@@ -579,47 +667,124 @@ const SAME_SPOT_PT = 12
 
 export type LabelResolution =
   | { ok: true; element: SimElement }
-  | { ok: false; reason: 'none' | 'ambiguous' | 'unreachable'; message: string; candidates: SimElement[] }
+  | { ok: false; reason: 'none' | 'ambiguous' | 'unreachable' | 'bad-index'; message: string; candidates: SimElement[] }
+
+export type ElementQuery = { by: 'label'; text: string } | { by: 'id'; text: string }
 
 const tappable = (e: SimElement): boolean => !!e.center && !e.offscreen && !e.clipped
 const dist = (a: SimElement, b: SimElement): number =>
   a.center && b.center ? Math.hypot(a.center.x - b.center.x, a.center.y - b.center.y) : Infinity
 
+/** Is `inner`'s centre inside `outer`'s frame (a caption inside its row)? */
+const frameHolds = (outer: SimElement, inner: SimElement): boolean =>
+  !!outer.frame &&
+  !!inner.center &&
+  inner.center.x >= outer.frame.x &&
+  inner.center.x <= outer.frame.x + outer.frame.width &&
+  inner.center.y >= outer.frame.y &&
+  inner.center.y <= outer.frame.y + outer.frame.height
+
+/** `  1) Button "Done" (196,430)` — numbered the way `--index` counts. */
 function candidateLines(list: SimElement[]): string {
   return list
-    .slice(0, 8)
-    .map((e) => `  ${renderElement(e)}`)
+    .slice(0, SIM_CANDIDATES_MAX)
+    .map((e, i) => `  ${i + 1}) ${renderElement(e)}`)
     .join('\n')
 }
 
-/**
- * `--tap-label`: an exact label match first (then case-insensitive, then the identifier), preferring
- * the interactive element when a row and its caption both match. More than one distinct target is a
- * REFUSAL listing the candidates — tapping the first of two "Done" buttons is a coin flip on a
- * screen the user is watching.
- */
-export function resolveTapLabel(elements: SimElement[], label: string): LabelResolution {
-  const want = cleanUiText(label, SIM_LABEL_MAX)
+/** Plain Levenshtein distance, small inputs only (labels are capped at SIM_LABEL_MAX). */
+export function editDistance(a: string, b: string): number {
+  if (a === b) return 0
+  if (!a.length) return b.length
+  if (!b.length) return a.length
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i)
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i]
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1))
+    }
+    prev = cur
+  }
+  return prev[b.length]
+}
+
+/** The ids an element answers to: the whole identifier, and the part after the last `/` or `:` (`com.app:id/login` → `login`). */
+function idForms(e: SimElement): string[] {
+  if (!e.identifier) return []
+  const tail = e.identifier.slice(Math.max(e.identifier.lastIndexOf('/'), e.identifier.lastIndexOf(':')) + 1)
+  return tail && tail !== e.identifier ? [e.identifier, tail] : [e.identifier]
+}
+
+/** The names of the elements nearest to `want`, for a "no match" message (distinct, at most N). */
+export function closestLabels(elements: SimElement[], want: string, n = SIM_CANDIDATES_MAX, by: 'label' | 'id' = 'label'): string[] {
   const lower = want.toLowerCase()
-  const tiers: Array<(e: SimElement) => boolean> = [
+  const seen = new Map<string, number>()
+  for (const e of elements) {
+    const names = by === 'id' ? idForms(e) : [e.label || e.value]
+    for (const name of names) {
+      if (!name) continue
+      const l = name.toLowerCase()
+      const score = l.includes(lower) || lower.includes(l) ? 0 : editDistance(l, lower) / Math.max(l.length, lower.length, 1)
+      const old = seen.get(name)
+      if (old === undefined || score < old) seen.set(name, score)
+    }
+  }
+  return [...seen.entries()]
+    .sort((x, y) => x[1] - y[1])
+    .slice(0, n)
+    .map(([name]) => name)
+}
+
+/** The tiers a query is matched in. The first tier with any match wins; a tier with several is ambiguity. */
+function matchTiers(q: ElementQuery): Array<(e: SimElement) => boolean> {
+  const want = cleanUiText(q.text, SIM_LABEL_MAX)
+  const lower = want.toLowerCase()
+  if (q.by === 'id') {
+    return [
+      (e) => e.identifier === want,
+      (e) => idForms(e).some((f) => f === want),
+      (e) => idForms(e).some((f) => f.toLowerCase() === lower),
+      (e) => e.identifier.toLowerCase().includes(lower)
+    ]
+  }
+  return [
     (e) => e.label === want || (e.label === '' && e.value === want),
     (e) => e.label.toLowerCase() === lower || (e.label === '' && e.value.toLowerCase() === lower),
-    (e) => e.identifier === want
+    (e) => e.identifier === want,
+    (e) => e.label.toLowerCase().includes(lower) || (e.label === '' && e.value.toLowerCase().includes(lower))
   ]
+}
+
+/**
+ * Resolve a label (or id) to ONE tap target. Tiers: exact, case-insensitive, (label: the id), then a
+ * substring. More than one distinct target is a REFUSAL listing the candidates — tapping the first of
+ * two "Done" buttons is a coin flip on a screen the user is watching — unless `index` (1-based, the
+ * numbering the refusal prints) picks one. A row and its caption at the same spot count as one target.
+ * `prefer` narrows a tier's matches to those it accepts when any do (a field label's text field).
+ */
+export function resolveElement(
+  elements: SimElement[],
+  q: ElementQuery,
+  opts: { index?: number | null; prefer?: (e: SimElement) => boolean } = {}
+): LabelResolution {
+  const want = cleanUiText(q.text, SIM_LABEL_MAX)
+  const noun = q.by === 'id' ? 'id' : 'label'
   let matched: SimElement[] = []
-  for (const test of tiers) {
+  for (const test of matchTiers(q)) {
     matched = elements.filter(test)
     if (matched.length > 0) break
   }
   if (matched.length === 0) {
-    const near = elements.filter((e) => e.label.toLowerCase().includes(lower) || e.value.toLowerCase().includes(lower))
+    const close = closestLabels(elements, want, SIM_CANDIDATES_MAX, q.by)
     return {
       ok: false,
       reason: 'none',
-      candidates: near,
+      candidates: [],
       message:
-        `no element is labelled ${JSON.stringify(want)}.` +
-        (near.length ? `\nElements that contain it:\n${candidateLines(near)}` : ' Run --describe to see what is on screen.')
+        `no element has the ${noun} ${JSON.stringify(want)}.` +
+        (close.length
+          ? `\nClosest ${noun}s on screen: ${close.map((c) => JSON.stringify(c)).join(', ')}.`
+          : ' Nothing on screen exposes a label; run --describe, or tap by --tap x,y.')
     }
   }
   const visible = matched.filter(tappable)
@@ -633,18 +798,218 @@ export function resolveTapLabel(elements: SimElement[], label: string): LabelRes
         'Scroll it into view (--swipe) and try again.'
     }
   }
-  if (visible.length === 1) return { ok: true, element: visible[0] }
   const interactive = visible.filter((e) => INTERACTIVE_ROLES.has(e.role))
-  const pool = interactive.length > 0 ? interactive : visible
-  const first = pool[0]
-  if (pool.every((e) => dist(first, e) <= SAME_SPOT_PT)) return { ok: true, element: first }
+  let pool = interactive.length > 0 ? interactive : visible
+  if (opts.prefer) {
+    const preferred = pool.filter(opts.prefer)
+    if (preferred.length > 0) pool = preferred
+  }
+  // One target per spot: a row and the caption inside it.
+  const targets: SimElement[] = []
+  for (const e of pool) if (!targets.some((t) => dist(t, e) <= SAME_SPOT_PT)) targets.push(e)
+  const idx = opts.index ?? null
+  if (idx !== null) {
+    if (idx > targets.length) {
+      return {
+        ok: false,
+        reason: 'bad-index',
+        candidates: targets,
+        message: `--index ${idx} is past the last match: ${targets.length} element${targets.length === 1 ? ' matches' : 's match'} the ${noun} ${JSON.stringify(want)}:\n${candidateLines(targets)}`
+      }
+    }
+    return { ok: true, element: targets[idx - 1] }
+  }
+  if (targets.length === 1) return { ok: true, element: targets[0] }
   return {
     ok: false,
     reason: 'ambiguous',
-    candidates: pool,
+    candidates: targets,
     message:
-      `${pool.length} elements are labelled ${JSON.stringify(want)}:\n${candidateLines(pool)}\n` +
-      'Tap one by its centre with --tap x,y.'
+      `${targets.length} elements match the ${noun} ${JSON.stringify(want)}:\n${candidateLines(targets)}\n` +
+      'Pick one with --index N (the number above), or tap by its centre with --tap x,y.'
+  }
+}
+
+/** `--tap-label`, kept as its own name: label-only resolution without an index. */
+export function resolveTapLabel(elements: SimElement[], label: string): LabelResolution {
+  return resolveElement(elements, { by: 'label', text: label })
+}
+
+export const FIELD_ROLES: ReadonlySet<string> = new Set(['TextField', 'SecureTextField', 'SearchField', 'TextArea'])
+export const isFieldElement = (e: SimElement): boolean => FIELD_ROLES.has(e.role)
+
+// ─── The compact describe ────────────────────────────────────────────────────────────────────
+
+/** Roles that only lay other things out: never worth a line in the compact view. */
+const CONTAINER_ROLES: ReadonlySet<string> = new Set([
+  'Application',
+  'Window',
+  'Group',
+  'ScrollArea',
+  'ScrollView',
+  'Other',
+  'List',
+  'Table',
+  'Collection'
+])
+
+export interface CompactEntry {
+  /** Identity for diffing: role, label, id — what makes this "the same element" on the next screen. */
+  key: string
+  /** The rendered line without its ordinal. */
+  line: string
+}
+
+export interface CompactScreen {
+  hash: string
+  entries: CompactEntry[]
+  /** Offscreen elements left out. */
+  hiddenOffscreen: number
+  focused: string | null
+  keyboard: boolean | null
+  screen: SimScreenRead['screen']
+  partial: boolean
+  axEnabledNow: boolean
+}
+
+const cut = (v: string, max: number): string => (v.length > max ? `${v.slice(0, max - 1)}…` : v)
+
+function compactState(e: SimElement): string {
+  const st: string[] = []
+  if (e.value && e.value !== e.label) st.push(`value=${JSON.stringify(cut(e.value, SIM_COMPACT_LABEL_MAX))}`)
+  if (!e.label && e.identifier) st.push(`id=${JSON.stringify(cut(e.identifier, SIM_COMPACT_LABEL_MAX))}`)
+  if (e.checked !== undefined) st.push(e.checked ? 'checked' : 'unchecked')
+  if (e.focused) st.push('focused')
+  if (!e.enabled) st.push('disabled')
+  if (e.clipped) st.push('clipped')
+  return st.length ? ` [${st.join(',')}]` : ''
+}
+
+/** A stable 8-hex hash of the screen's lines. */
+export function screenHash(lines: string[]): string {
+  // FNV-1a ×2 (different seeds) → 64 bits, 8 hex of the mix; no crypto needed for a content tag.
+  let h1 = 0x811c9dc5
+  let h2 = 0x01000193
+  for (const ch of lines.join('\n')) {
+    const c = ch.codePointAt(0) as number
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0
+    h2 = Math.imul(h2 ^ c, 0x85ebca6b) >>> 0
+  }
+  return ((h1 ^ Math.imul(h2, 0x9e3779b1)) >>> 0).toString(16).padStart(8, '0')
+}
+
+/**
+ * The compact view of a screen read: meaningful elements only, in tree order, each one line
+ * `role "label" (cx,cy) [state]`. Dropped: layout containers, elements with no label or value (unless interactive; an id alone is not a name), offscreen ones
+ * (counted), and a non-interactive caption that repeats the label of an interactive element at the
+ * same spot. The hash covers exactly these lines.
+ */
+export function compactScreen(read: SimScreenRead): CompactScreen {
+  const named = read.elements.filter((e) => (!!(e.label || e.value) || (INTERACTIVE_ROLES.has(e.role) && !!e.center)) && !CONTAINER_ROLES.has(e.role))
+  const onScreen = named.filter((e) => !e.offscreen)
+  const hiddenOffscreen = named.length - onScreen.length
+  const interactive = onScreen.filter((e) => INTERACTIVE_ROLES.has(e.role))
+  const labelled = onScreen.filter((e) => e.label || e.value)
+  const kept = onScreen.filter(
+    (e) =>
+      // An unlabelled row/button whose caption is listed on its own line is that caption's tap target; a line for
+      // it too only repeats the row (Android settings: a clipped `Button` under every title).
+      (e.label || e.value || !labelled.some((l) => l !== e && frameHolds(e, l))) &&
+      (INTERACTIVE_ROLES.has(e.role) ||
+      !interactive.some((i) => (i.label || i.value) === (e.label || e.value) && (dist(i, e) <= SAME_SPOT_PT || frameHolds(i, e))))
+  )
+  const entries: CompactEntry[] = kept.slice(0, SIM_DESCRIBE_LINES_MAX).map((e) => {
+    const text = cut(e.label || (isFieldElement(e) ? '' : e.value), SIM_COMPACT_LABEL_MAX)
+    const pos = e.center ? ` (${round(e.center.x)},${round(e.center.y)})` : ''
+    return {
+      key: `${e.role}|${e.label || (isFieldElement(e) ? '' : e.value)}|${e.identifier}`,
+      line: `${e.role}${text ? ` ${JSON.stringify(text)}` : ''}${pos}${compactState(e)}`
+    }
+  })
+  // A container can hold focus (Android marks a whole page); only an input counts as "the focused field".
+  const focusedEl = read.elements.find((e) => e.focused && isFieldElement(e))
+  const keyboard =
+    read.keyboard !== undefined ? read.keyboard : read.elements.some((e) => e.role === 'Keyboard') ? true : null
+  return {
+    hash: screenHash(entries.map((e) => e.line)),
+    entries,
+    hiddenOffscreen,
+    focused: focusedEl ? JSON.stringify(cut(focusedEl.label || focusedEl.identifier || focusedEl.role, SIM_COMPACT_LABEL_MAX)) : null,
+    keyboard,
+    screen: read.screen,
+    partial: read.partial,
+    axEnabledNow: read.axEnabledNow === true
+  }
+}
+
+function compactHeader(c: CompactScreen, extra = ''): string {
+  const n = c.entries.length
+  return (
+    `screen ${c.hash}${extra} · ${n} element${n === 1 ? '' : 's'}` +
+    (c.hiddenOffscreen ? ` (+${c.hiddenOffscreen} offscreen)` : '') +
+    ` · focused: ${c.focused ?? 'none'} · keyboard: ${c.keyboard === null ? 'unknown' : c.keyboard ? 'visible' : 'hidden'}`
+  )
+}
+
+/** Notes that only matter when the read was degraded (shared by the full and the compact text). */
+function compactNotes(c: CompactScreen): string[] {
+  const notes: string[] = []
+  if (c.partial) {
+    notes.push(
+      'PARTIAL: the accessibility tree was not available (hit-test grid, leaf elements only); run --describe again in a moment.' +
+        (c.axEnabledNow ? ' Accessibility was just switched on: relaunch an app that was already running (Flutter in particular).' : '')
+    )
+  } else if (c.axEnabledNow && c.entries.length <= 6) {
+    notes.push('Note: accessibility was just switched on in this simulator. If an app that was already running looks empty, relaunch it.')
+  }
+  if (c.entries.length === 0) notes.push('(nothing on screen exposes a label — a Flutter or game surface needs Semantics to be readable)')
+  return notes
+}
+
+/**
+ * The default `--describe` text. `Role "label" (cx,cy) [state]` per line; the coordinates are the
+ * element's centre in device points. The header's hash is what `--since` takes next time.
+ */
+export function renderCompactText(c: CompactScreen): string {
+  return [compactHeader(c), SIM_UNTRUSTED_NOTE, ...compactNotes(c), ...c.entries.map((e) => e.line)].join('\n')
+}
+
+/** What changed against an earlier screen (`--since <hash>`): added `+`, removed `-`, changed `~`. */
+export function renderCompactDiff(now: CompactScreen, before: CompactEntry[], beforeHash: string): string {
+  if (now.hash === beforeHash) return `unchanged ${now.hash}`
+  const bucket = (list: CompactEntry[]): Map<string, CompactEntry[]> => {
+    const m = new Map<string, CompactEntry[]>()
+    for (const e of list) m.set(e.key, [...(m.get(e.key) ?? []), e])
+    return m
+  }
+  const was = bucket(before)
+  const is = bucket(now.entries)
+  const lines: string[] = []
+  for (const [key, list] of is) {
+    const old = was.get(key) ?? []
+    list.forEach((e, i) => {
+      const o = old[i]
+      if (!o) lines.push(`+ ${e.line}`)
+      else if (o.line !== e.line) lines.push(`~ ${e.line}   (was: ${o.line})`)
+    })
+  }
+  for (const [key, old] of was) {
+    const cur = is.get(key) ?? []
+    old.slice(cur.length).forEach((o) => lines.push(`- ${o.line}`))
+  }
+  return [compactHeader(now, ` (was ${beforeHash})`), SIM_UNTRUSTED_NOTE, ...compactNotes(now), ...(lines.length ? lines : ['(only the order of elements changed)'])].join('\n')
+}
+
+/** The JSON beside the compact text. */
+export function compactResult(c: CompactScreen): Record<string, unknown> {
+  return {
+    hash: c.hash,
+    count: c.entries.length,
+    hiddenOffscreen: c.hiddenOffscreen,
+    focused: c.focused,
+    keyboard: c.keyboard,
+    partial: c.partial,
+    lines: c.entries.map((e) => e.line)
   }
 }
 
@@ -667,6 +1032,12 @@ export function describeDriveAction(action: SimAction): string {
       return `sim --tap ${Math.round(action.x)},${Math.round(action.y)}`
     case 'tap-label':
       return `sim --tap-label ${JSON.stringify(cleanUiText(action.label, 40))}`
+    case 'tap-id':
+      return `sim --tap-id ${JSON.stringify(cleanUiText(action.id, 40))}`
+    case 'type-label': {
+      const n = Array.from(action.text).length
+      return `typing ${n} character${n === 1 ? '' : 's'} into ${JSON.stringify(cleanUiText(action.label, 30))}`
+    }
     case 'swipe':
       return 'sim --swipe'
     case 'type': {

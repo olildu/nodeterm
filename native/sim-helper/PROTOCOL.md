@@ -115,8 +115,11 @@ Differences, all MEASURED on emulator 36.6.11 (API 30 Nexus 7, API 30 Pixel):
   the element shape above: `label` = content-desc or text, `value` = text when both exist; for a `TextField`
   the typed text is always `value` and the label is content-desc, else `hint`, else empty (a password field's
   text is never reported). `identifier` = resource-id, `role` = class short name (`EditText` → `TextField`; a
-  clickable generic container → `Button`; else `Element`). No `axPref`, no degraded mode. `describe-point`
-  hit-tests that dump.
+  clickable generic container → `Button`; else `Element`). Elements may also carry `focused`, `checked`,
+  `clickable`, `scrollable` (booleans, present only when true / checkable). The reply adds `keyboard` (boolean,
+  from `dumpsys input_method` `mInputShown`; omitted when it could not be read). No `axPref`, no degraded mode.
+  `describe-point` hit-tests that dump. iOS replies carry no `focused`/`keyboard`; nodeterm detects the iOS
+  keyboard from a `Keyboard`-role element.
 * **Flutter** (Posha, API 30, measured by the step-4 spike): labels show with NO accessibility setting changed —
   `uiautomator` connects as a UiAutomation client, Flutter builds its semantics for it, and nothing persists
   afterwards (`accessibility_enabled` stays 0). So there is no iOS-style attach-time switch, on purpose. Before a

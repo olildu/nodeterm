@@ -86,7 +86,8 @@ run('an Android emulator through the sim service and verb', () => {
     expect((await call({ list: '' })).message).toContain(ID)
     const looked = await call({ describe: '', node: 'sim1' })
     expect(looked.ok).toBe(true)
-    expect(looked.message).toMatch(/^Screen \d+×\d+ pt; \d+ named elements?/)
+    expect(looked.message).toMatch(/^screen [0-9a-f]{8} · \d+ elements?/)
+    expect((await call({ describe: '', full: 'true', node: 'sim1' })).message).toMatch(/^Screen \d+×\d+ pt; \d+ named elements?/)
     const back = await call({ press: 'back', node: 'sim1' })
     expect(back).toMatchObject({ ok: true })
     const siri = await call({ press: 'siri', node: 'sim1' })
@@ -94,6 +95,32 @@ run('an Android emulator through the sim service and verb', () => {
     const shot = await call({ screenshot: 'home.png', node: 'sim1', scale: '0.3' })
     expect(shot.ok).toBe(true)
     expect(fs.readFileSync(path.join(proj, 'home.png')).subarray(0, 4).toString('hex')).toBe('89504e47')
+
+    // Label selectors and the compact describe, against the live Settings app.
+    const adb = process.env.NODETERM_TEST_ADB_SERIAL
+    if (adb) {
+      const sdk = process.env.ANDROID_HOME ?? path.join(os.homedir(), 'Library/Android/sdk')
+      const sh = (...a: string[]): Promise<void> => new Promise((r) => spawn(path.join(sdk, 'platform-tools/adb'), ['-s', adb, ...a]).on('close', () => r()))
+      await sh('shell', 'am', 'start', '-a', 'android.settings.SETTINGS')
+      await new Promise((r) => setTimeout(r, 2500))
+      const compact = await call({ describe: '', node: 'sim1' })
+      process.stderr.write(`\n${compact.message}\n`)
+      expect(compact.message).toMatch(/^screen [0-9a-f]{8} · \d+ elements?/)
+      expect(compact.message).toMatch(/keyboard: hidden/)
+      const hash = /^screen ([0-9a-f]{8})/.exec(compact.message!)![1]
+      expect((await call({ describe: '', since: hash, node: 'sim1' })).message).toBe(`unchanged ${hash}`)
+      const tapped = await call({ 'tap-label': 'Search settings', node: 'sim1', 'wait-for-ms': '5000' })
+      process.stderr.write(`\n${tapped.message ?? tapped.error}\n`)
+      expect(tapped.ok).toBe(true)
+      const diff = await call({ describe: '', since: hash, node: 'sim1' })
+      process.stderr.write(`\n${diff.message}\n`)
+      expect(diff.message).toMatch(/\(was /)
+      // The search box has no label; its hint is its value, which is what a label lookup falls back to.
+      const typed = await call({ 'type-label': 'Search…', text: 'wifi', node: 'sim1', 'wait-for-ms': '3000' })
+      process.stderr.write(`\n${typed.message ?? typed.error}\n`)
+      expect(typed.ok).toBe(true)
+      expect(typed.message).toMatch(/value="wifi"/)
+    }
 
     // The node and the agent shared ONE helper process.
     expect(pids).toHaveLength(1)

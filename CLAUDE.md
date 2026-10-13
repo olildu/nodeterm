@@ -6304,7 +6304,7 @@ terminal-style header rolls open and its items spring in, staggered. Rules a ref
 ### Agents drive it too: the `sim` canvas-control verb (and testing an iOS app)
 
 `sim <one action> [--node <Simulator node> | --udid <device>]` lets an agent LOOK at the screen
-(`--describe`, `--point`, `--screenshot`) and DRIVE it (`--tap`, `--tap-label`, `--swipe`, `--type`,
+(`--describe`, `--point`, `--screenshot`) and DRIVE it (`--tap-label`/`--tap-id`/`--type-label` first, `--tap`, `--swipe`, `--type`,
 `--key`, `--press`, `--boot`, `--wait-idle`; `--list` first). Grammar and rendering are the pure
 `core/sim/verb.ts`, the run is `core/sim/control.ts`, the shell wiring is `handleSimVerb` in
 `src/main/index.ts`. The agent-facing text (both generated bodies) is rendered from the constants in
@@ -6344,9 +6344,31 @@ Rules a refactor must not undo:
   frame the helper sends when the stream is switched on is waited for before the first command
   (`firstFrame`, ≤ 400 ms, skipped when a node already streams) so it cannot read as a reaction.
 - **Coordinates are device points and are checked** against the helper's `info` before anything
-  reaches it (`sim-out-of-bounds`). `--tap-label` resolves from a fresh `--describe`: exact label, then
-  case-insensitive, then id; a row and its caption count as one target; two distinct targets are
-  REFUSED with the candidates listed (the home screen has a Calendar widget AND icon — measured).
+  reaches it (`sim-out-of-bounds`).
+- **Label selectors are the preferred way to act** (`--tap-label`, `--tap-id`, `--type-label --text`).
+  Resolution runs in nodeterm against a fresh `describe` (`resolveElement`, `verb.ts`): exact label →
+  case-insensitive → identifier → substring (for `--tap-id`: whole id → the part after the last `/` or `:`
+  → case-insensitive → substring). A row and its caption at one spot, or inside one frame, are one target;
+  the interactive element wins. Two or more distinct targets are REFUSED with a numbered list, and
+  `--index N` (1-based, the list's numbering) takes the Nth; no match lists the 10 closest labels
+  (edit distance, substring first). `--type-label` prefers a text-field role among the matches so a caption
+  with the same words is not the target. Each polls the tree for `--wait-for-ms` (3000 default, 0 = one
+  look) when the element is absent or not yet visible — an ambiguity is final and never waited on. After
+  the tap (and, for `--type-label`, a settle between the focusing tap and the text) the call settles and
+  REPLIES WITH THE NEW COMPACT SCREEN, so describe → tap → describe is one call; `--no-wait true` skips
+  both. The text typed by `--type-label` goes through the same `text` command as `--type` (so Android's
+  adb-input path applies) and is never shown on the drive chip.
+- **`--describe` is compact by default** (`compactScreen`): a header `screen <hash> · N elements ·
+  focused: … · keyboard: visible|hidden|unknown`, then `Role "label" (cx,cy) [value=…,id=…,checked,
+  focused,disabled,clipped]` per meaningful element. Dropped: layout containers, unnamed non-interactive
+  nodes, offscreen elements (counted in the header), and a caption repeating its interactive row. Labels are
+  cut at 60 characters. The hash is 8 hex over exactly those lines (so a re-layout of containers or an
+  offscreen change does not move it). `--describe --since <hash>` answers `unchanged <hash>` or `+`/`-`/`~`
+  lines against that earlier screen; control.ts keeps the last 6 screens per device (16 devices, in
+  memory, lost on restart) and, when it no longer holds the hash, says so and prints the whole screen.
+  `--describe --full true` is the previous exhaustive format. `focused` and `checked` come from the Android
+  dump (iOS elements carry neither); `keyboard` comes from the Android helper (`dumpsys input_method`
+  `mInputShown`) or an iOS `Keyboard`-role element, else `unknown`.
 - **`--describe` text is the app's words**: labels pass `cleanUiText` (one line, no control/bidi/
   zero-width characters, capped), the output opens with an untrusted-data note, unlabelled containers
   are counted not listed, and the listing is cut at 300 lines. The helper's `PARTIAL` (hit-test grid)

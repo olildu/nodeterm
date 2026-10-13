@@ -65,7 +65,12 @@ function rig(over: Partial<SimControlDeps> = {}): Rig {
       return { idle: idle.value, waitedMs: idle.value ? 312 : o.timeoutMs, changed: changed.value }
     }
   }
+  const clock = { t: 0 }
   const control = createSimControl({
+    now: () => clock.t,
+    sleep: async (ms) => {
+      clock.t += ms
+    },
     service: {
       availability: () => ({ ok: true }),
       devices: async () => ({
@@ -357,8 +362,8 @@ describe('--tap-label', () => {
     const r = rig()
     r.replies.set('describe', tree)
     const out = await r.run({ 'tap-label': 'General', node: 'sim1' })
-    expect(out.message).toBe('tapped Cell "General" (196,430) — screen settled after 312 ms')
-    expect(r.sent.map((c) => c.cmd)).toEqual(['describe', 'tap'])
+    expect(out.message).toMatch(/^tapped Cell "General" \(196,430\) — screen settled after 312 ms\nScreen now:\nscreen [0-9a-f]{8} · /)
+    expect(r.sent.map((c) => c.cmd)).toEqual(['describe', 'tap', 'describe'])
     expect(r.sent[1]).toEqual({ cmd: 'tap', x: 196, y: 430 })
   })
 
@@ -366,7 +371,7 @@ describe('--tap-label', () => {
     const r = rig()
     r.replies.set('describe', tree)
     const out = await r.run({ 'tap-label': 'Done', node: 'sim1' })
-    expect(out).toMatchObject({ ok: false, error: expect.stringMatching(/^sim-tap-label-ambiguous: 2 elements are labelled "Done"/) })
+    expect(out).toMatchObject({ ok: false, error: expect.stringMatching(/^sim-tap-label-ambiguous: 2 elements match the label "Done"/) })
     expect(r.sent.map((c) => c.cmd)).toEqual(['describe'])
   })
 
@@ -374,7 +379,7 @@ describe('--tap-label', () => {
     const r = rig()
     r.replies.set('describe', { ...tree, partial: true })
     const out = await r.run({ 'tap-label': 'Nope', node: 'sim1' })
-    expect(out.error).toMatch(/^sim-tap-label-none: no element is labelled "Nope"/)
+    expect(out.error).toMatch(/^sim-tap-label-none: no element has the label "Nope"/)
     expect(out.error).toMatch(/PARTIAL/)
   })
 })
@@ -463,5 +468,147 @@ describe('open-simulator prep', () => {
       service: { availability: () => ({ ok: true }), devices: async () => ({ devices: [] }), boot: async () => { throw new Error('x') } } as never
     })({ args: { udid: 'android:Pixel_6' }, verified: true })
     expect(out).toMatchObject({ args: { udid: 'android:Pixel_6' } })
+  })
+})
+
+
+describe('label selectors — waiting, ids, --index, type-label', () => {
+  const screen = (elements: Array<Record<string, unknown>>, extra: Record<string, unknown> = {}): SimReply => ({
+    ok: true,
+    screen: { width: 393, height: 852 },
+    elements,
+    ...extra
+  })
+
+  it('polls the tree until the label appears, then taps it', async () => {
+    const r = rig()
+    let reads = 0
+    r.replies.set('describe', () => (++reads < 4 ? screen([el({ label: 'Loading' })]) : screen([el({ label: 'Continue', center: { x: 50, y: 60 } })])))
+    const out = await r.run({ 'tap-label': 'Continue', node: 'sim1' })
+    expect(out.ok).toBe(true)
+    expect(out.message).toContain('tapped Button "Continue" (50,60)')
+    expect(r.sent.filter((c) => c.cmd === 'tap')).toEqual([{ cmd: 'tap', x: 50, y: 60 }])
+    expect(reads).toBeGreaterThanOrEqual(4)
+  })
+
+  it('gives up after --wait-for-ms and names how long it waited; 0 means a single look', async () => {
+    const r = rig()
+    r.replies.set('describe', screen([el({ label: 'Other' })]))
+    const out = await r.run({ 'tap-label': 'Continue', node: 'sim1', 'wait-for-ms': '1000' })
+    expect(out).toMatchObject({ ok: false, error: expect.stringMatching(/^sim-tap-label-none: .*\n.*Closest labels on screen: "Other"[\s\S]*waited 1000 ms/) })
+    const once = rig()
+    once.replies.set('describe', screen([el({ label: 'Other' })]))
+    await once.run({ 'tap-label': 'Continue', node: 'sim1', 'wait-for-ms': '0' })
+    expect(once.sent.filter((c) => c.cmd === 'describe')).toHaveLength(1)
+  })
+
+  it('never waits on an ambiguity, and --index resolves it', async () => {
+    const two = screen([el({ label: 'Done', center: { x: 40, y: 60 } }), el({ label: 'Done', center: { x: 340, y: 800 } })])
+    const r = rig()
+    r.replies.set('describe', two)
+    const out = await r.run({ 'tap-label': 'Done', node: 'sim1' })
+    expect(out.error).toMatch(/^sim-tap-label-ambiguous/)
+    expect(r.sent.filter((c) => c.cmd === 'describe')).toHaveLength(1)
+    const r2 = rig()
+    r2.replies.set('describe', two)
+    expect((await r2.run({ 'tap-label': 'Done', node: 'sim1', index: '2' })).ok).toBe(true)
+    expect(r2.sent.find((c) => c.cmd === 'tap')).toEqual({ cmd: 'tap', x: 340, y: 800 })
+  })
+
+  it('--tap-id taps by identifier', async () => {
+    const r = rig()
+    r.replies.set('describe', screen([el({ label: '', identifier: 'com.app:id/login', center: { x: 77, y: 88 } })]))
+    const out = await r.run({ 'tap-id': 'login', node: 'sim1' })
+    expect(out.message).toContain('tapped')
+    expect(r.sent.find((c) => c.cmd === 'tap')).toEqual({ cmd: 'tap', x: 77, y: 88 })
+    r.replies.set('describe', screen([]))
+    expect((await r.run({ 'tap-id': 'login', node: 'sim1', 'wait-for-ms': '0' })).error).toMatch(/^sim-tap-id-none: no element has the id "login"/)
+  })
+
+  it('--type-label focuses the field (not its caption), then types', async () => {
+    const r = rig()
+    r.replies.set(
+      'describe',
+      screen([
+        el({ role: 'AXStaticText', label: 'Email', center: { x: 50, y: 100 } }),
+        el({ role: 'AXTextField', label: 'Email', center: { x: 200, y: 140 } })
+      ])
+    )
+    r.replies.set('text', { ok: true, typed: 5 })
+    const out = await r.run({ 'type-label': 'Email', text: 'a@b.c', node: 'sim1' })
+    expect(out.ok).toBe(true)
+    expect(out.message).toMatch(/^typed 5 characters into TextField "Email" \(200,140\)/)
+    expect(r.sent.map((c) => c.cmd)).toEqual(['describe', 'tap', 'text', 'describe'])
+    expect(r.sent[1]).toEqual({ cmd: 'tap', x: 200, y: 140 })
+    expect(r.sent[2]).toEqual({ cmd: 'text', text: 'a@b.c' })
+    // typed text is never echoed into the drive chip
+    expect(JSON.stringify(out)).not.toContain('"action"')
+  })
+
+  it('--no-wait true skips the settle waits and the screen summary', async () => {
+    const r = rig()
+    r.replies.set('describe', screen([el({ label: 'Go', center: { x: 5, y: 6 } })]))
+    const out = await r.run({ 'tap-label': 'Go', node: 'sim1', 'no-wait': 'true' })
+    expect(out.message).toBe('tapped Button "Go" (5,6) — not waited for (--no-wait)')
+    expect(r.sent.map((c) => c.cmd)).toEqual(['describe', 'tap'])
+  })
+
+  it('the settled tap returns the new screen compactly, with the hash --since takes', async () => {
+    const r = rig()
+    r.replies.set('describe', screen([el({ label: 'Go', center: { x: 5, y: 6 } })]))
+    const out = await r.run({ 'tap-label': 'Go', node: 'sim1' })
+    const hash = /Screen now:\nscreen ([0-9a-f]{8})/.exec(out.message ?? '')?.[1]
+    expect(hash).toBeTruthy()
+    const same = await r.run({ describe: '', since: hash as string, node: 'sim1' })
+    expect(same.message).toBe(`unchanged ${hash}`)
+  })
+})
+
+describe('--describe: compact, --full and --since', () => {
+  const screenOf = (labels: string[], extra: Record<string, unknown> = {}): SimReply => ({
+    ok: true,
+    screen: { width: 393, height: 852 },
+    elements: labels.map((label, i) => el({ label, center: { x: 10, y: 10 + i * 50 } })),
+    ...extra
+  })
+
+  it('is compact by default and --full keeps the old format', async () => {
+    const r = rig()
+    r.replies.set('describe', screenOf(['General'], { keyboard: true }))
+    const compact = await r.run({ describe: '', node: 'sim1' })
+    expect(compact.message).toMatch(/^screen [0-9a-f]{8} · 1 element · focused: none · keyboard: visible\n/)
+    expect(compact.message).toContain('Button "General" (10,10)')
+    const full = await r.run({ describe: '', full: 'true', node: 'sim1' })
+    expect(full.message).toMatch(/^Screen 393×852 pt; 1 named element/)
+  })
+
+  it('--since answers unchanged, or only the difference, and says when it forgot the hash', async () => {
+    const r = rig()
+    r.replies.set('describe', screenOf(['A', 'B']))
+    const first = await r.run({ describe: '', node: 'sim1' })
+    const hash = /^screen ([0-9a-f]{8})/.exec(first.message ?? '')?.[1] as string
+    expect((await r.run({ describe: '', since: hash, node: 'sim1' })).message).toBe(`unchanged ${hash}`)
+    r.replies.set('describe', screenOf(['A', 'C']))
+    const diff = await r.run({ describe: '', since: hash, node: 'sim1' })
+    expect(diff.message).toContain('+ Button "C"')
+    expect(diff.message).toContain('- Button "B"')
+    expect(diff.message).not.toContain('"A"')
+    const forgot = await r.run({ describe: '', since: 'deadbeef', node: 'sim1' })
+    expect(forgot.message).toMatch(/^\(hash deadbeef is not remembered/)
+    expect(forgot.message).toContain('Button "A"')
+  })
+
+  it('remembers screens per device, and only a bounded number', async () => {
+    const r = rig()
+    r.replies.set('describe', screenOf(['A']))
+    const a = /^screen ([0-9a-f]{8})/.exec((await r.run({ describe: '', udid: UDID })).message ?? '')?.[1] as string
+    // another device does not know that hash
+    r.replies.set('describe', screenOf(['A']))
+    expect((await r.run({ describe: '', since: a, udid: OTHER })).message).toMatch(/not remembered/)
+    for (let i = 0; i < 8; i++) {
+      r.replies.set('describe', screenOf([`S${i}`]))
+      await r.run({ describe: '', udid: UDID })
+    }
+    expect((await r.run({ describe: '', since: a, udid: UDID })).message).toMatch(/not remembered/)
   })
 })

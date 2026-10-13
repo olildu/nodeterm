@@ -383,7 +383,7 @@ export function renderSimulator(node: LinkDocEntry, verb: ContextLinkVerb, state
   else lines.push(state ?? `Device ${sim.name ?? sim.udid} (state could not be read).`)
   if (sim?.udid) {
     lines.push(
-      `Drive it with the sim verb — it is your default target, so no --node is needed while it is the only Simulator node you are linked to: sim --describe, sim --tap-label "<label>", sim --screenshot. (udid ${sim.udid})`
+      `Drive it with the sim verb — it is your default target, so no --node is needed while it is the only Simulator node you are linked to: sim --describe (compact; --since <hash> for what changed), sim --tap-label "<label>" (prefer it to coordinates), sim --screenshot. (udid ${sim.udid})`
     )
   }
   return lines.join('\n')

@@ -19,15 +19,26 @@ import {
   SIM_DRIVE_SETTLING,
   SIM_INPUT_ACTIONS,
   SIM_REACTION_MS,
+  compactResult,
+  compactScreen,
   describeResult,
+  isFieldElement,
   parseOpenSimulatorArgs,
   parseSimArgs,
   readDescribe,
+  renderCompactDiff,
+  renderCompactText,
   renderDescribeText,
   renderElement,
-  resolveTapLabel,
+  resolveElement,
   SIM_UNTRUSTED_NOTE,
-  type SimCall
+  SIM_WAIT_FOR_POLL_MS,
+  type CompactEntry,
+  type CompactScreen,
+  type ElementQuery,
+  type SimAction,
+  type SimCall,
+  type SimElement
 } from './verb'
 
 /** What a running call reports to the node's driving chip (no-ops when nobody is shown the device). */
@@ -85,6 +96,8 @@ export interface SimControlDeps {
   /** The per-run memory of auto-links and user removals; main shares it with the removal IPC. */
   ledger?: SimLinkLedger
   now?(): number
+  /** Wait between polls of a `--wait-for-ms` lookup (tests inject a virtual clock). */
+  sleep?(ms: number): Promise<void>
 }
 
 /** A cold helper start is ~1 s; this only has to outlast a slow machine. */
@@ -111,6 +124,10 @@ export function renderDeviceLine(
 }
 
 const DEVICE_LIST_MAX = 40
+
+/** Screens remembered per device for `--describe --since <hash>`, and devices remembered at all. */
+const SNAPSHOTS_PER_DEVICE = 6
+const SNAPSHOT_DEVICES_MAX = 16
 
 /** How a failed lease reads to the agent: a code it can branch on, then the sentence. */
 export function failureReply(f: AgentFailure, udid: string): SimControlReply {
@@ -145,6 +162,17 @@ export function createSimControl(deps: SimControlDeps): (req: {
   const hinted = new Set<string>()
   const ledger = deps.ledger ?? createSimLinkLedger()
   const now = deps.now ?? Date.now
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)))
+  /** The last few compact screens per device (insertion order = age), for `--since`. Bounded both ways. */
+  const snapshots = new Map<string, Array<{ hash: string; entries: CompactEntry[] }>>()
+  const remember = (udid: string, c: CompactScreen): void => {
+    const list = (snapshots.get(udid) ?? []).filter((s) => s.hash !== c.hash)
+    list.push({ hash: c.hash, entries: c.entries })
+    while (list.length > SNAPSHOTS_PER_DEVICE) list.shift()
+    snapshots.delete(udid)
+    snapshots.set(udid, list)
+    while (snapshots.size > SNAPSHOT_DEVICES_MAX) snapshots.delete(snapshots.keys().next().value as string)
+  }
 
   /** The Simulator nodes of the caller's project it is linked to, in canvas order. */
   const linkedTo = (callerId: string, projectId: string | undefined): string[] =>
@@ -304,17 +332,70 @@ export function createSimControl(deps: SimControlDeps): (req: {
     return null
   }
 
+  /**
+   * Find the element a label/id names, polling the tree for up to `--wait-for-ms` while it has not
+   * appeared (or is not visible yet). An ambiguity is final: another poll cannot make it less so.
+   */
+  async function locate(
+    d: AgentDevice,
+    a: Extract<SimAction, { kind: 'tap-label' | 'tap-id' | 'type-label' }>,
+    query: ElementQuery,
+    prefer?: (e: SimElement) => boolean
+  ): Promise<{ ok: true; element: SimElement } | { ok: false; reply: SimControlReply }> {
+    const t0 = now()
+    for (;;) {
+      const desc = await d.command({ cmd: 'describe' })
+      if (!desc.ok) return { ok: false, reply: helperFailure(desc, 'describe') }
+      const read = readDescribe(desc)
+      const hit = resolveElement(read.elements, query, { index: a.index, prefer })
+      if (hit.ok) return { ok: true, element: hit.element }
+      const waited = now() - t0
+      if ((hit.reason === 'none' || hit.reason === 'unreachable') && waited < a.waitForMs) {
+        await sleep(Math.min(SIM_WAIT_FOR_POLL_MS, a.waitForMs - waited))
+        continue
+      }
+      return {
+        ok: false,
+        reply: fail(
+          `sim-${a.kind}-${hit.reason}: ${hit.message}` +
+            (a.waitForMs > 0 && (hit.reason === 'none' || hit.reason === 'unreachable') ? `\n(waited ${Math.round(waited)} ms for it to appear; --wait-for-ms changes that)` : '') +
+            (read.partial && hit.reason === 'none' ? '\n(The tree was PARTIAL; run --describe again in a moment.)' : '')
+        )
+      }
+    }
+  }
+
+  /** After a settled input: the compact screen, so the agent needs no separate --describe. */
+  async function newScreen(d: AgentDevice, call: SimCall, udid: string): Promise<{ text: string; result?: Record<string, unknown> }> {
+    if (!call.wait) return { text: '' }
+    const r = await d.command({ cmd: 'describe' })
+    if (!r.ok) return { text: '' }
+    const c = compactScreen(readDescribe(r))
+    remember(udid, c)
+    return { text: `\nScreen now:\n${renderCompactText(c)}`, result: compactResult(c) }
+  }
+
   const helperFailure = (reply: { code?: unknown; error?: unknown }, what: string): SimControlReply =>
     fail(`sim-${typeof reply.code === 'string' ? reply.code : 'failed'}: ${what}: ${typeof reply.error === 'string' ? reply.error : 'the simulator refused'}`)
 
-  async function act(d: AgentDevice, call: SimCall, projectId: string | undefined, pr?: DriveProgress): Promise<SimControlReply> {
+  async function act(d: AgentDevice, call: SimCall, projectId: string | undefined, udid: string, pr?: DriveProgress): Promise<SimControlReply> {
     const a = call.action
     switch (a.kind) {
       case 'describe': {
         const r = await d.command({ cmd: 'describe' })
         if (!r.ok) return helperFailure(r, 'describe')
         const read = readDescribe(r)
-        return { ok: true, message: renderDescribeText(read), result: describeResult(read) }
+        if (a.full) return { ok: true, message: renderDescribeText(read), result: describeResult(read) }
+        const c = compactScreen(read)
+        const before = a.since ? snapshots.get(udid)?.find((s) => s.hash === a.since) : undefined
+        remember(udid, c)
+        if (a.since && before) {
+          return { ok: true, message: renderCompactDiff(c, before.entries, a.since), result: { ...describeResult(read), ...compactResult(c), since: a.since, unchanged: c.hash === a.since } }
+        }
+        const lost = a.since
+          ? `(hash ${a.since} is not remembered for this device — it is older than the last ${SNAPSHOTS_PER_DEVICE} screens, or from another session — so the whole screen follows)\n`
+          : ''
+        return { ok: true, message: lost + renderCompactText(c), result: { ...describeResult(read), ...compactResult(c) } }
       }
       case 'point': {
         const oob = bounds(d, [[a.x, a.y]])
@@ -361,25 +442,43 @@ export function createSimControl(deps: SimControlDeps): (req: {
         if (!r.ok) return helperFailure(r, 'tap')
         return { ok: true, message: `tapped (${a.x},${a.y}) — ${await settle(d, call, pr)}` }
       }
-      case 'tap-label': {
-        const desc = await d.command({ cmd: 'describe' })
-        if (!desc.ok) return helperFailure(desc, 'describe')
-        const read = readDescribe(desc)
-        const hit = resolveTapLabel(read.elements, a.label)
-        if (!hit.ok) {
-          return fail(
-            `sim-tap-label-${hit.reason}: ${hit.message}` +
-              (read.partial && hit.reason === 'none' ? '\n(The tree was PARTIAL; run --describe again in a moment.)' : '')
-          )
-        }
-        const c = hit.element.center as { x: number; y: number }
+      case 'tap-label':
+      case 'tap-id': {
+        const found = await locate(d, a, a.kind === 'tap-id' ? { by: 'id', text: a.id } : { by: 'label', text: a.label })
+        if (!found.ok) return found.reply
+        const c = found.element.center as { x: number; y: number }
         pr?.point({ tap: { x: c.x, y: c.y } })
         const r = await d.command({ cmd: 'tap', x: c.x, y: c.y })
         if (!r.ok) return helperFailure(r, 'tap')
+        const settled = await settle(d, call, pr)
+        const screen = await newScreen(d, call, udid)
         return {
           ok: true,
-          message: `tapped ${renderElement(hit.element)} — ${await settle(d, call, pr)}`,
-          result: { x: Math.round(c.x), y: Math.round(c.y) }
+          message: `tapped ${renderElement(found.element)} — ${settled}${screen.text}`,
+          result: { x: Math.round(c.x), y: Math.round(c.y), ...(screen.result ? { screen: screen.result } : {}) }
+        }
+      }
+      case 'type-label': {
+        const found = await locate(d, a, { by: 'label', text: a.label }, isFieldElement)
+        if (!found.ok) return found.reply
+        const c = found.element.center as { x: number; y: number }
+        pr?.point({ tap: { x: c.x, y: c.y } })
+        const t = await d.command({ cmd: 'tap', x: c.x, y: c.y })
+        if (!t.ok) return helperFailure(t, 'tap')
+        // The keyboard rises and the field takes focus; typing before that lands in the old focus.
+        await settle(d, call, pr)
+        const r = await d.command({ cmd: 'text', text: a.text })
+        if (!r.ok) return helperFailure(r, 'type')
+        const pasted = typeof r.pasted === 'number' && r.pasted > 0
+        const settled = await settle(d, call, pr)
+        const screen = await newScreen(d, call, udid)
+        return {
+          ok: true,
+          message:
+            `typed ${plural(Array.from(a.text).length, 'character')} into ${renderElement(found.element)}` +
+            (pasted ? ' (through the device pasteboard, which now holds that text)' : '') +
+            ` — ${settled}${screen.text}`,
+          result: { x: Math.round(c.x), y: Math.round(c.y), ...(screen.result ? { screen: screen.result } : {}) }
         }
       }
       case 'swipe': {
@@ -499,7 +598,7 @@ export function createSimControl(deps: SimControlDeps): (req: {
     }
     if (drive) say({ action: phrase })
     const opts: AgentRunOptions = { connectTimeoutMs: CONNECT_TIMEOUT_MS }
-    const run = await deps.service.agentRun(t.udid, opts, (d) => act(d, call, projectId, progress))
+    const run = await deps.service.agentRun(t.udid, opts, (d) => act(d, call, projectId, t.udid, progress))
     if (drive) deps.emit?.({ kind: 'drive', ownerNodeId: nodeId, simNodeIds: t.shownBy, until: now() + SIM_DRIVE_LINGER_MS, action: SIM_DRIVE_DONE })
     if (!run.ok) return failureReply(run, t.udid)
     const reply = run.value

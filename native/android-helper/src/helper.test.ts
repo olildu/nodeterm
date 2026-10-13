@@ -94,6 +94,19 @@ describe('uiautomator', () => {
     expect(pw).toMatchObject({ role: 'TextField', label: 'Enter your password', value: '', password: true })
     expect(name).toMatchObject({ label: 'Name', value: 'Hi' })
   })
+  it('reports focus and checked state so the compact describe can show them', () => {
+    const f =
+      `<hierarchy rotation="0">` +
+      `<node index="0" text="" class="android.widget.EditText" content-desc="Email" focused="true" bounds="[0,0][400,100]" />` +
+      `<node index="1" text="" class="android.widget.Switch" content-desc="Remember" checkable="true" checked="true" bounds="[0,100][400,200]" />` +
+      `<node index="2" text="" class="android.widget.CheckBox" content-desc="Off" checkable="true" checked="false" bounds="[0,200][400,300]" />` +
+      `</hierarchy>`
+    const [email, sw, box] = parseDump(f, 1, { width: 400, height: 800 }).flat
+    expect(email).toMatchObject({ role: 'TextField', focused: true })
+    expect(email.checked).toBeUndefined()
+    expect(sw).toMatchObject({ role: 'Switch', checked: true })
+    expect(box).toMatchObject({ role: 'CheckBox', checked: false })
+  })
   it('hit-tests the deepest visible element', () => {
     const { flat } = parseDump(xml, 2, { width: 600, height: 960 })
     expect(hitTest(flat, 100, 270)!.label).toBe('Display')

@@ -15,6 +15,8 @@ import { offScreenDisposition, needsLiveCanvas } from '../shared/control-off-scr
 import { createServerEditionControlHandler, unsupportedServerVerbMessage } from '../server/control-unsupported'
 import {
   SIM_BOOT_TIMEOUT_MS,
+  SIM_CANDIDATES_MAX,
+  SIM_WAIT_FOR_DEFAULT_MS,
   SIM_IDLE_QUIET_MS,
   SIM_IDLE_TIMEOUT_MS,
   SIM_KEY_DOC_NAMES,
@@ -91,6 +93,17 @@ describe('both agent-facing bodies document the sim verb, rendered from the code
     }
   })
 
+  it('teaches label selectors, the compact describe and --since, with their limits from the parser', () => {
+    for (const [name, body] of bodies()) {
+      for (const flag of ['--tap-id', '--type-label', '--text', '--index N', '--wait-for-ms', '--describe --since <hash>', '--full true', 'PREFER LABELS TO COORDINATES']) {
+        expect(body, `${name} ${flag}`).toContain(flag)
+      }
+      expect(body, name).toContain(`${SIM_WAIT_FOR_DEFAULT_MS} default`)
+      expect(body, name).toContain(`${SIM_CANDIDATES_MAX} closest labels`)
+      expect(body, name).toMatch(/REPLIES\s+WITH THE NEW SCREEN/)
+    }
+  })
+
   it('states the settle-by-default rule and its escape, and the shim-safe bare-switch spelling', () => {
     for (const [name, body] of bodies()) {
       expect(body, name).toMatch(/Every INPUT action .* waits for the screen to settle before it answers/s)
@@ -135,7 +148,7 @@ describe('the iOS testing guidance both bodies carry (step 4)', () => {
       expect(body, name).toContain('Testing an iOS or Android app (the `sim` verb + Maestro):')
       expect(body, name).toContain('`--device` takes the `emulator-NNNN` serial')
       expect(body, name).toContain('`sim --list`')
-      expect(body, name).toContain('re-`--describe` to')
+      expect(body, name).toContain('`--describe --since <hash>`')
       expect(body, name).toContain('.maestro/<name>.yaml')
       for (const key of ['appId:', 'launchApp', 'tapOn:', 'inputText:', 'assertVisible:']) expect(body, `${name} ${key}`).toContain(key)
       expect(body, name).toContain('maestro --device <udid> test .maestro/<name>.yaml')

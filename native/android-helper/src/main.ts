@@ -695,7 +695,7 @@ class Controller {
   }
 
   private async describe(r: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const { xml, ms } = await this.dump()
+    const [{ xml, ms }, keyboard] = await Promise.all([this.dump(), this.keyboardShown()])
     const screen = this.screenPoints()
     const parsed = parseDump(xml, this.scale, screen)
     const flat = r.flat !== false
@@ -703,8 +703,17 @@ class Controller {
       ...(flat ? { elements: parsed.flat.map(stripChildren) } : { tree: parsed.tree }),
       count: parsed.flat.length,
       screen,
+      // uiautomator's dump does not include the IME window, so ask the input-method service.
+      ...(keyboard === null ? {} : { keyboard }),
       ms
     }
+  }
+
+  /** Is the soft keyboard up? null when `dumpsys` could not say (never a guess). */
+  private async keyboardShown(): Promise<boolean | null> {
+    const out = await run(this.sdk.adb, ['-s', this.serial, 'shell', 'dumpsys', 'input_method'], 5_000).catch(() => '')
+    const m = /mInputShown=(true|false)/.exec(out)
+    return m ? m[1] === 'true' : null
   }
 
   private async describePoint(r: Record<string, unknown>): Promise<Record<string, unknown>> {

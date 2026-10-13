@@ -5,15 +5,21 @@ import {
   SIM_IDLE_TIMEOUT_MS,
   SIM_BOOT_TIMEOUT_MS,
   SIM_TIMEOUT_MAX_MS,
+  compactScreen,
+  isFieldElement,
   parseNumberList,
   parseSimArgs,
   readDescribe,
+  renderCompactDiff,
+  renderCompactText,
   renderDescribeText,
   renderElement,
+  resolveElement,
   resolveTapLabel,
   simKeyUsage,
   type SimCall,
-  type SimElement
+  type SimElement,
+  type SimScreenRead
 } from './verb'
 
 const UDID = 'AE342EEF-B624-4060-B9E6-AE6E9EAAC24A'
@@ -68,7 +74,7 @@ describe('parseSimArgs — exactly one action, a target, nothing unknown', () =>
     expect(ok({ udid: UDID, tap: '196, 430' }).action).toEqual({ kind: 'tap', x: 196, y: 430 })
     expect(ok({ udid: UDID, point: '10.5,20' }).action).toEqual({ kind: 'point', x: 10.5, y: 20 })
     expect(ok({ udid: UDID, swipe: '196,700,196,200' }).action).toMatchObject({ kind: 'swipe', x1: 196, y2: 200, ms: 300 })
-    expect(ok({ udid: UDID, 'tap-label': ' General ' }).action).toEqual({ kind: 'tap-label', label: 'General' })
+    expect(ok({ udid: UDID, 'tap-label': ' General ' }).action).toEqual({ kind: 'tap-label', label: 'General', index: null, waitForMs: 3000 })
     expect(ok({ udid: UDID, type: 'héllo wörld' }).action).toEqual({ kind: 'type', text: 'héllo wörld' })
   })
 
@@ -323,19 +329,34 @@ describe('resolveTapLabel', () => {
     )
     expect(r).toMatchObject({ ok: false, reason: 'ambiguous' })
     if (!r.ok) {
-      expect(r.message).toMatch(/2 elements are labelled "Done"/)
+      expect(r.message).toMatch(/2 elements match the label "Done"/)
+      expect(r.message).toMatch(/1\) .*\n  2\) /)
+      expect(r.message).toMatch(/--index N/)
       expect(r.message).toContain('(40,60)')
       expect(r.message).toContain('(340,800)')
       expect(r.message).toMatch(/--tap x,y/)
     }
   })
 
-  it('names near misses when nothing matches', () => {
-    const r = resolveTapLabel([el({ label: 'General Settings' })], 'General')
-    // "General" is a substring only: not tapped, but offered.
+  it('takes a unique substring, and refuses a substring shared by two', () => {
+    expect(resolveTapLabel([el({ label: 'General Settings' }), el({ label: 'Other', center: { x: 90, y: 90 } })], 'General')).toMatchObject({
+      ok: true,
+      element: { label: 'General Settings' }
+    })
+    expect(
+      resolveTapLabel([el({ label: 'General Settings' }), el({ label: 'General Info', center: { x: 90, y: 90 } })], 'General')
+    ).toMatchObject({ ok: false, reason: 'ambiguous' })
+  })
+
+  it('lists the closest labels when nothing matches', () => {
+    const r = resolveTapLabel([el({ label: 'Settings' }), el({ label: 'Profile', center: { x: 9, y: 9 } })], 'Setings')
     expect(r).toMatchObject({ ok: false, reason: 'none' })
-    if (!r.ok) expect(r.message).toContain('General Settings')
-    expect(resolveTapLabel([el({ label: 'Other' })], 'General')).toMatchObject({ ok: false, reason: 'none' })
+    if (!r.ok) {
+      expect(r.message).toMatch(/Closest labels on screen: "Settings", "Profile"/)
+    }
+    const many = Array.from({ length: 15 }, (_, i) => el({ label: `Item ${i}`, center: { x: i, y: i } }))
+    const r2 = resolveTapLabel(many, 'zzz')
+    if (!r2.ok) expect(r2.message.match(/"Item \d+"/g)).toHaveLength(10)
   })
 
   it('refuses an element that is on the tree but not visible', () => {
@@ -356,13 +377,158 @@ describe('describeDriveAction (the driving chip)', () => {
     const { describeDriveAction } = await import('./verb')
     expect(describeDriveAction({ kind: 'type', text: 'p@ssw0rd' })).toBe('typing 8 characters')
     expect(describeDriveAction({ kind: 'type', text: 'x' })).toBe('typing 1 character')
-    expect(describeDriveAction({ kind: 'tap-label', label: 'General' })).toBe('sim --tap-label "General"')
+    expect(describeDriveAction({ kind: 'tap-label', label: 'General', index: null, waitForMs: 3000 })).toBe('sim --tap-label "General"')
     expect(describeDriveAction({ kind: 'press', button: 'home' })).toBe('sim --press home')
   })
   it('one-lines and caps a hostile label', async () => {
     const { describeDriveAction } = await import('./verb')
-    const out = describeDriveAction({ kind: 'tap-label', label: 'a\nb‮' + 'x'.repeat(200) })
+    const out = describeDriveAction({ kind: 'tap-label', label: 'a\nb‮' + 'x'.repeat(200), index: null, waitForMs: 0 })
     expect(out).not.toMatch(/[\n‮]/)
     expect(out.length).toBeLessThan(70)
+  })
+})
+
+
+describe('resolveElement — ids, --index, field preference', () => {
+  const two = [el({ label: 'Done', center: { x: 40, y: 60 } }), el({ label: 'Done', center: { x: 340, y: 800 } })]
+
+  it('--index picks the Nth match in the order the ambiguity list numbers them', () => {
+    expect(resolveElement(two, { by: 'label', text: 'Done' }, { index: 2 })).toMatchObject({ ok: true, element: { center: { x: 340, y: 800 } } })
+    expect(resolveElement(two, { by: 'label', text: 'Done' }, { index: 1 })).toMatchObject({ ok: true, element: { center: { x: 40, y: 60 } } })
+    const r = resolveElement(two, { by: 'label', text: 'Done' }, { index: 3 })
+    expect(r).toMatchObject({ ok: false, reason: 'bad-index' })
+  })
+
+  it('matches an id exactly, by its tail after / or :, case-insensitively, then as a substring', () => {
+    const els = [el({ label: '', identifier: 'com.app:id/login_button', center: { x: 1, y: 1 } }), el({ label: 'x', identifier: 'other', center: { x: 99, y: 99 } })]
+    for (const q of ['com.app:id/login_button', 'login_button', 'LOGIN_BUTTON', 'login_b']) {
+      expect(resolveElement(els, { by: 'id', text: q })).toMatchObject({ ok: true, element: { identifier: 'com.app:id/login_button' } })
+    }
+    const none = resolveElement(els, { by: 'id', text: 'nothing' })
+    expect(none).toMatchObject({ ok: false, reason: 'none' })
+    if (!none.ok) expect(none.message).toMatch(/no element has the id "nothing"/)
+  })
+
+  it('prefers a text field when the label names both a caption and a field', () => {
+    const caption = el({ role: 'StaticText', label: 'Email', center: { x: 50, y: 100 } })
+    const field = el({ role: 'TextField', label: 'Email', center: { x: 200, y: 140 } })
+    expect(resolveElement([caption, field], { by: 'label', text: 'Email' }, { prefer: isFieldElement })).toMatchObject({ ok: true, element: { role: 'TextField' } })
+  })
+})
+
+describe('compact describe', () => {
+  const screenOf = (elements: SimElement[], extra: Partial<SimScreenRead> = {}): SimScreenRead => ({
+    screen: { width: 393, height: 852 },
+    count: elements.length,
+    partial: false,
+    elements,
+    ...extra
+  })
+  const sample = (): SimElement[] => [
+    el({ role: 'Application', label: 'App', center: { x: 1, y: 1 } }),
+    el({ role: 'Group', center: { x: 2, y: 2 } }),
+    el({ role: 'StaticText', label: 'Welcome back', center: { x: 196, y: 100 } }),
+    el({ role: 'TextField', label: 'Email', value: 'a@b.c', focused: true, center: { x: 196, y: 200 } }),
+    el({ role: 'Switch', label: 'Remember me', checked: false, center: { x: 340, y: 260 } }),
+    el({ role: 'Button', label: 'Sign in', enabled: false, center: { x: 196, y: 400 } }),
+    el({ role: 'Element', center: { x: 5, y: 5 } }),
+    el({ role: 'Button', label: 'Below the fold', offscreen: true, center: null })
+  ]
+
+  it('keeps named and interactive elements only, one line each, and counts what it left out', () => {
+    const c = compactScreen(screenOf(sample()))
+    expect(c.entries.map((e) => e.line)).toEqual([
+      'StaticText "Welcome back" (196,100)',
+      'TextField "Email" (196,200) [value="a@b.c",focused]',
+      'Switch "Remember me" (340,260) [unchecked]',
+      'Button "Sign in" (196,400) [disabled]'
+    ])
+    expect(c.hiddenOffscreen).toBe(1)
+    expect(c.focused).toBe('"Email"')
+    const text = renderCompactText(c)
+    expect(text).toMatch(/^screen [0-9a-f]{8} · 4 elements \(\+1 offscreen\) · focused: "Email" · keyboard: unknown/)
+  })
+
+  it('cuts long labels and drops a caption that repeats its row', () => {
+    const long = 'x'.repeat(100)
+    const row = el({ role: 'Cell', label: 'General', center: { x: 196, y: 430 }, frame: { x: 0, y: 410, width: 393, height: 44 } })
+    const caption = el({ role: 'StaticText', label: 'General', center: { x: 120, y: 430 } })
+    const c = compactScreen(screenOf([caption, row, el({ role: 'StaticText', label: long, center: { x: 9, y: 9 } })]))
+    expect(c.entries).toHaveLength(2)
+    expect(c.entries[0].line).toBe('Cell "General" (196,430)')
+    expect(c.entries[1].line).toBe(`StaticText "${'x'.repeat(59)}…" (9,9)`)
+  })
+
+  it('drops an unlabelled row whose caption is listed, and counts only an input as focused', () => {
+    const row = el({ role: 'Button', center: { x: 206, y: 261 }, frame: { x: 0, y: 230, width: 411, height: 60 }, clipped: true })
+    const caption = el({ role: 'TextView', label: 'Network', center: { x: 138, y: 251 } })
+    const page = el({ role: 'Element', label: 'page', focused: true, center: { x: 1, y: 1 } })
+    const idOnly = el({ role: 'ImageView', identifier: 'x:id/icon', center: { x: 9, y: 9 } })
+    const c = compactScreen(screenOf([row, caption, page, idOnly]))
+    expect(c.entries.map((e) => e.line)).toEqual(['TextView "Network" (138,251)', 'Element "page" (1,1) [focused]'])
+    expect(c.focused).toBeNull()
+  })
+
+  it('reports the keyboard from the helper, or from a Keyboard element', () => {
+    expect(compactScreen(screenOf(sample(), { keyboard: true })).keyboard).toBe(true)
+    expect(compactScreen(screenOf(sample(), { keyboard: false })).keyboard).toBe(false)
+    expect(compactScreen(screenOf([...sample(), el({ role: 'Keyboard', label: '', center: { x: 196, y: 700 } })])).keyboard).toBe(true)
+  })
+
+  it('hashes the lines: stable across reads, different when a line changes', () => {
+    const a = compactScreen(screenOf(sample()))
+    const b = compactScreen(screenOf(sample()))
+    expect(a.hash).toBe(b.hash)
+    expect(a.hash).toMatch(/^[0-9a-f]{8}$/)
+    const moved = sample()
+    moved[5] = el({ role: 'Button', label: 'Sign in', enabled: true, center: { x: 196, y: 400 } })
+    expect(compactScreen(screenOf(moved)).hash).not.toBe(a.hash)
+    // Unnamed containers and offscreen rows are not part of the screen.
+    const extra = [...sample(), el({ role: 'Group', center: { x: 7, y: 7 } }), el({ role: 'Button', label: 'Hidden', offscreen: true, center: null })]
+    expect(compactScreen(screenOf(extra)).hash).toBe(a.hash)
+  })
+
+  it('--since: unchanged, or exactly what was added, removed and changed', () => {
+    const before = compactScreen(screenOf(sample()))
+    expect(renderCompactDiff(before, before.entries, before.hash)).toBe(`unchanged ${before.hash}`)
+    const next = sample()
+    next[5] = el({ role: 'Button', label: 'Sign in', center: { x: 196, y: 400 } }) // now enabled
+    next.splice(2, 1) // "Welcome back" gone
+    next.push(el({ role: 'StaticText', label: 'Invalid email', center: { x: 196, y: 230 } }))
+    const now = compactScreen(screenOf(next))
+    const text = renderCompactDiff(now, before.entries, before.hash)
+    expect(text).toContain(`(was ${before.hash})`)
+    expect(text).toContain('+ StaticText "Invalid email" (196,230)')
+    expect(text).toContain('- StaticText "Welcome back" (196,100)')
+    expect(text).toContain('~ Button "Sign in" (196,400)   (was: Button "Sign in" (196,400) [disabled])')
+    expect(text).not.toContain('Switch')
+  })
+})
+
+describe('label selector flags', () => {
+  it('parses --tap-id, --type-label with --text, --index and --wait-for-ms', () => {
+    expect(ok({ udid: UDID, 'tap-id': 'login_button' }).action).toEqual({ kind: 'tap-id', id: 'login_button', index: null, waitForMs: 3000 })
+    expect(ok({ udid: UDID, 'tap-label': 'Done', index: '2', 'wait-for-ms': '0' }).action).toMatchObject({ index: 2, waitForMs: 0 })
+    expect(ok({ udid: UDID, 'type-label': 'Email', text: 'a@b.c' }).action).toEqual({ kind: 'type-label', label: 'Email', text: 'a@b.c', index: null, waitForMs: 3000 })
+    expect(ok({ udid: UDID, 'type-label': 'Email', text: 'x' }).wait).toBe(true)
+  })
+
+  it('refuses a selector flag on the wrong action, and a type-label with no text', () => {
+    expect(err({ udid: UDID, tap: '1,2', index: '2' })).toMatch(/--index applies to/)
+    expect(err({ udid: UDID, tap: '1,2', 'wait-for-ms': '5' })).toMatch(/--wait-for-ms applies to/)
+    expect(err({ udid: UDID, 'tap-label': 'x', index: '0' })).toMatch(/--index takes 1-99/)
+    expect(err({ udid: UDID, 'tap-label': 'x', 'wait-for-ms': '-1' })).toMatch(/--wait-for-ms takes/)
+    expect(err({ udid: UDID, 'type-label': 'Email' })).toMatch(/needs --text/)
+    expect(err({ udid: UDID, type: 'x', text: 'y' })).toMatch(/--text applies to --type-label only/)
+    expect(err({ udid: UDID, 'tap-label': 'a', 'tap-id': 'b' })).toMatch(/exactly ONE action/)
+  })
+
+  it('parses the describe modifiers', () => {
+    expect(ok({ udid: UDID, describe: '' }).action).toEqual({ kind: 'describe', full: false, since: null })
+    expect(ok({ udid: UDID, describe: '', full: 'true' }).action).toEqual({ kind: 'describe', full: true, since: null })
+    expect(ok({ udid: UDID, describe: '', since: 'ABCDEF01' }).action).toEqual({ kind: 'describe', full: false, since: 'abcdef01' })
+    expect(err({ udid: UDID, describe: '', since: 'nope' })).toMatch(/8 hex/)
+    expect(err({ udid: UDID, describe: '', full: 'true', since: 'abcdef01' })).toMatch(/not --full/)
+    expect(err({ udid: UDID, tap: '1,2', full: 'true' })).toMatch(/apply to --describe only/)
   })
 })
