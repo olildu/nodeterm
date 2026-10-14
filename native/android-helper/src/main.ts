@@ -22,6 +22,7 @@ import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
+import { decideBoot, singleFlight } from './boot-guard'
 import {
   EmulatorGrpc,
   IMG_RGB888,
@@ -728,10 +729,35 @@ class Controller {
 
   // ── boot ──
 
-  private async boot(): Promise<Record<string, unknown>> {
-    if (this.emu) return { alreadyRunning: true }
-    if (this.bootChild && this.bootChild.exitCode === null && this.bootChild.signalCode === null) return { booting: true }
-    const ports = await pickPorts(runningEmulators())
+  /**
+   * Boot requests are single-flight: a second `boot` while one is in flight JOINS it. `bootChild` is
+   * only set after `pickPorts` awaits, so two overlapping requests (open-simulator's auto-boot and the
+   * node's Boot button, or two agents) both passed the guard and launched TWO emulators for one AVD:
+   * the loser dies on the AVD lock, and if the first launch is the survivor the ownership record
+   * points at the dead second pid (the emulator is then never stopped, and the dying child's exit
+   * handler reports a boot failure and a Shutdown state for a device that is in fact starting).
+   */
+  private boot = singleFlight(() => this.bootOnce())
+
+  private async bootOnce(): Promise<Record<string, unknown>> {
+    // `this.emu` is what the monitor saw up to ~1.5 s ago. An emulator that was just killed (adb emu
+    // kill, a crash, the user closing it) is still recorded until the next tick, and answering
+    // "already running" for it started nothing: the caller was told the device was booted, then the
+    // monitor tore it down and nobody was left to boot it.
+    const running = runningEmulators()
+    const decision = decideBoot({
+      adoptedPid: this.emu?.pid ?? null,
+      adoptedStillRunning: !!this.emu && pidAlive(this.emu.pid) && running.some((r) => r.pid === this.emu!.pid),
+      otherRunningForAvd: running.some((r) => r.avd === this.avd),
+      bootChildAlive: !!this.bootChild && this.bootChild.exitCode === null && this.bootChild.signalCode === null
+    })
+    if (decision.dropStale) {
+      this.teardown('emulator gone before boot')
+      this.setState('Shutdown')
+    }
+    if (decision.action === 'already-running') return { alreadyRunning: true }
+    if (decision.action === 'booting') return { booting: true }
+    const ports = await pickPorts(running)
     if (!ports) throw new CmdError('boot-failed', 'No free emulator console port (5554–5682).')
     const logFile = path.join(os.tmpdir(), `nodeterm-android-${this.avd}.log`)
     const fd = fs.openSync(logFile, 'w', 0o600)

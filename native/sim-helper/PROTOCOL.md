@@ -96,6 +96,11 @@ Differences, all MEASURED on emulator 36.6.11 (API 30 Nexus 7, API 30 Pixel):
   once (`booting`, ports); `ready` follows when Android has booted (~18 s cold). `boot-failed` (non-fatal error
   event) when the emulator exits first, with the log's last error line. `-gpu host` matters: headless defaults
   to software rendering (20–30 fps); host GPU gives 48–60 fps.
+* **`boot` is single-flight and checks liveness.** Overlapping `boot` requests share one launch (a second used to
+  start a second emulator for the same AVD, which lost the AVD lock and left the ownership record on a dead pid).
+  The emulator the monitor last adopted is re-checked against the discovery files first: one that was just killed
+  is dropped (`device-state Shutdown`) and booted again instead of being answered `alreadyRunning`; an emulator for
+  this AVD the monitor has not adopted yet also answers `alreadyRunning` and is never launched over.
 * **Ownership**: on quit/EOF/SIGTERM the helper SIGTERMs only an emulator it booted (recorded in
   `$TMPDIR/nodeterm-android-helper-<avd>.owned.json`, so a crashed helper's successor still knows). An emulator
   someone else started is never stopped. One controller per AVD: `$TMPDIR/nodeterm-android-helper-<avd>.lock` (pid).

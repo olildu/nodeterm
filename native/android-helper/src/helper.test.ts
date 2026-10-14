@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { GrpcMessageReader, decodeImage, imageFormat, keyboardEvent, pbBytes, pbDecode, pbInt, pbNum, touchEvent } from './grpc'
+import { decideBoot, singleFlight } from './boot-guard'
 import { PACING_SLACK_MS, encodeWait } from './pacing'
 import { BUTTON_KEYS, hidToKey, isTypable } from './keys'
 import { avdOf, parseAvdList, parseDiscovery, parseIni, parseWmDensity, parseWmSize, runtimeLabel, sdkRootCandidates } from './sdk'
@@ -243,5 +244,57 @@ describe('encodeWait', () => {
     expect(encodeWait(0, 5_000_000, 60)).toBe(0)
     expect(encodeWait(1000, 1000, 0)).toBe(0)
     expect(encodeWait(1000, 1000, 8)).toBeCloseTo(125 - PACING_SLACK_MS, 5)
+  })
+})
+
+describe('boot guard', () => {
+  const idle = { adoptedPid: null, adoptedStillRunning: false, otherRunningForAvd: false, bootChildAlive: false }
+
+  it('spawns only when nothing runs and nothing is launching', () => {
+    expect(decideBoot(idle)).toEqual({ dropStale: false, action: 'spawn' })
+    expect(decideBoot({ ...idle, bootChildAlive: true })).toEqual({ dropStale: false, action: 'booting' })
+  })
+
+  it('does not trust an adopted emulator that has died since the last monitor tick', () => {
+    // The old guard answered "already running" here, so a boot right after `adb emu kill` started
+    // nothing and the caller was told the device was booted; the monitor then tore it down.
+    expect(decideBoot({ ...idle, adoptedPid: 100, adoptedStillRunning: false })).toEqual({ dropStale: true, action: 'spawn' })
+    expect(decideBoot({ ...idle, adoptedPid: 100, adoptedStillRunning: true })).toEqual({ dropStale: false, action: 'already-running' })
+  })
+
+  it('treats an emulator for this AVD the monitor has not adopted yet as running', () => {
+    expect(decideBoot({ ...idle, otherRunningForAvd: true })).toEqual({ dropStale: false, action: 'already-running' })
+    expect(decideBoot({ ...idle, adoptedPid: 100, adoptedStillRunning: false, otherRunningForAvd: true })).toEqual({
+      dropStale: true,
+      action: 'already-running'
+    })
+  })
+
+  it('runs overlapping boots once and lets a later one start again', async () => {
+    let calls = 0
+    let release!: () => void
+    const gate = new Promise<void>((r) => (release = r))
+    const boot = singleFlight(async () => {
+      calls++
+      await gate
+      return calls
+    })
+    const a = boot()
+    const b = boot() // the second request lands while the first is still picking ports
+    expect(a).toBe(b)
+    release()
+    expect(await Promise.all([a, b])).toEqual([1, 1])
+    expect(calls).toBe(1)
+    expect(await boot()).toBe(2)
+  })
+
+  it('forgets a failed boot so the next request can retry', async () => {
+    let calls = 0
+    const boot = singleFlight(async () => {
+      if (++calls === 1) throw new Error('no free port')
+      return 'ok'
+    })
+    await expect(boot()).rejects.toThrow('no free port')
+    expect(await boot()).toBe('ok')
   })
 })

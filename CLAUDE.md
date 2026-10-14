@@ -6525,6 +6525,16 @@ only learned a platform, not a second protocol. Rules a refactor must not undo:
   own discovery files and driven, NEVER stopped. Because a cold boot is ~18 s, an Android device's
   helper lingers `ANDROID_GRACE_MS` (5 min) after its last viewer instead of `SIM_GRACE_MS` — a
   project switch or a gap between an agent's `sim` calls must not reboot it; app quit stops it.
+  **`boot` is single-flight and never trusts a stale `emu`** (`android-helper/src/boot-guard.ts`; boot-flake
+  investigation). Measured with `src/core/sim/boot-cycles.realandroid.test.ts` on `nt_smoke_30`: (1) a boot
+  arriving within the monitor's 1.5 s tick of the emulator dying (`adb emu kill`, a crash, the grace window of a
+  previous run) hit `if (this.emu) return alreadyRunning`, so `sim --boot` said "booted" in 417 ms, started
+  nothing, and every later call saw "shut down"; (2) two overlapping boots (open-simulator's auto-boot + the node's
+  Boot / an agent's `--boot`) both launched an emulator because `bootChild` is set after an `await`. Overlapping
+  boots now join one launch and the adopted emulator is re-checked against the discovery files. The original
+  Session B flake (boot "still starting" at 60 s although the emulator log said booted at 16 s) was NOT reproduced
+  in 20 cold boots, and a second session using the same AVD at the time (shared `$TMPDIR` log/lock, an owner's stop
+  killing the emulator) is a plausible cause that cannot be ruled out.
 - **Limits, stated**: an emulator without gRPC or with JWT auth (Android Studio's default launch)
   cannot be shown — the node says to boot it from nodeterm; ctrl/alt/cmd `--mods` are not applied
   (the emulator's gRPC keys do not combine modifiers; shift is); non-ASCII `--type` goes through the
