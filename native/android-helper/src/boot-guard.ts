@@ -41,3 +41,17 @@ export function decideBoot(f: BootFacts): BootDecision {
   if (f.bootChildAlive) return { dropStale: stale, action: 'booting' }
   return { dropStale: stale, action: 'spawn' }
 }
+
+/** How long after answering a boot request with "already running" a vanishing emulator still counts as a lost boot. */
+export const REBOOT_WINDOW_MS = 15_000
+
+/**
+ * An emulator that is being killed stays alive and listed for a few seconds, so a `boot` that lands in
+ * that window is (correctly, as far as the snapshot goes) answered "already running" and then the
+ * emulator finishes dying with nobody left to boot it. If it disappears inside the window and no
+ * launch of ours is running, the acknowledged boot request is still owed: boot again.
+ */
+export function owesReboot(f: { answeredAt: number | null; now: number; stopping: boolean; bootChildAlive: boolean }): boolean {
+  if (f.answeredAt === null || f.stopping || f.bootChildAlive) return false
+  return f.now - f.answeredAt <= REBOOT_WINDOW_MS
+}

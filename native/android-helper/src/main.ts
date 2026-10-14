@@ -22,7 +22,7 @@ import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
-import { decideBoot, singleFlight } from './boot-guard'
+import { decideBoot, owesReboot, singleFlight } from './boot-guard'
 import {
   EmulatorGrpc,
   IMG_RGB888,
@@ -183,6 +183,8 @@ class Controller {
   private state = ''
   private setupGen = 0
   private bootChild: ChildProcess | null = null
+  /** When a `boot` was last answered "already running" (see owesReboot), or null. */
+  private bootAckedAt: number | null = null
   private bootLog = ''
   private monitorTimer: ReturnType<typeof setTimeout> | null = null
   private reportedSetupError = ''
@@ -285,7 +287,14 @@ class Controller {
     try {
       const running = runningEmulators().find((r) => r.avd === this.avd) ?? null
       if (!running) {
+        const lostPid = this.emu?.pid ?? null
         if (this.emu) this.teardown('emulator stopped')
+        const childAlive = !!this.bootChild && this.bootChild.exitCode === null && this.bootChild.signalCode === null
+        if (owesReboot({ answeredAt: this.bootAckedAt, now: Date.now(), stopping: this.stopping, bootChildAlive: childAlive })) {
+          this.bootAckedAt = null
+          log('boot: the emulator went away right after a boot request was answered "already running"; booting again')
+          void this.rebootAfterLoss(lostPid)
+        }
         const booting = this.bootChild && this.bootChild.exitCode === null && this.bootChild.signalCode === null
         this.setState(booting ? 'Booting' : 'Shutdown')
       } else if (!this.emu || this.emu.pid !== running.pid) {
@@ -739,6 +748,17 @@ class Controller {
    */
   private boot = singleFlight(() => this.bootOnce())
 
+  /** The old process may still hold the AVD lock for a moment after it leaves the discovery files. */
+  private async rebootAfterLoss(lostPid: number | null): Promise<void> {
+    const end = Date.now() + 10_000
+    while (lostPid !== null && pidAlive(lostPid) && Date.now() < end) await new Promise<void>((r) => setTimeout(r, 250))
+    try {
+      await this.boot()
+    } catch (e) {
+      log('boot: re-boot failed:', (e as Error).message)
+    }
+  }
+
   private async bootOnce(): Promise<Record<string, unknown>> {
     // `this.emu` is what the monitor saw up to ~1.5 s ago. An emulator that was just killed (adb emu
     // kill, a crash, the user closing it) is still recorded until the next tick, and answering
@@ -755,7 +775,10 @@ class Controller {
       this.teardown('emulator gone before boot')
       this.setState('Shutdown')
     }
-    if (decision.action === 'already-running') return { alreadyRunning: true }
+    if (decision.action === 'already-running') {
+      this.bootAckedAt = Date.now()
+      return { alreadyRunning: true }
+    }
     if (decision.action === 'booting') return { booting: true }
     const ports = await pickPorts(running)
     if (!ports) throw new CmdError('boot-failed', 'No free emulator console port (5554–5682).')

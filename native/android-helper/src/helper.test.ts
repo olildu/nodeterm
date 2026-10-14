@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { GrpcMessageReader, decodeImage, imageFormat, keyboardEvent, pbBytes, pbDecode, pbInt, pbNum, touchEvent } from './grpc'
-import { decideBoot, singleFlight } from './boot-guard'
+import { REBOOT_WINDOW_MS, decideBoot, owesReboot, singleFlight } from './boot-guard'
 import { PACING_SLACK_MS, encodeWait } from './pacing'
 import { BUTTON_KEYS, hidToKey, isTypable } from './keys'
 import { avdOf, parseAvdList, parseDiscovery, parseIni, parseWmDensity, parseWmSize, runtimeLabel, sdkRootCandidates } from './sdk'
@@ -296,5 +296,19 @@ describe('boot guard', () => {
     })
     await expect(boot()).rejects.toThrow('no free port')
     expect(await boot()).toBe('ok')
+  })
+})
+
+describe('owesReboot (a boot acknowledged while the emulator was dying)', () => {
+  const base = { answeredAt: 1000, now: 3000, stopping: false, bootChildAlive: false }
+  it('owes a boot when the emulator vanishes inside the window', () => {
+    expect(owesReboot(base)).toBe(true)
+    expect(owesReboot({ ...base, now: 1000 + REBOOT_WINDOW_MS })).toBe(true)
+  })
+  it('does not once the window has passed, with no acknowledged request, when quitting, or while a launch of ours is alive', () => {
+    expect(owesReboot({ ...base, now: 1000 + REBOOT_WINDOW_MS + 1 })).toBe(false)
+    expect(owesReboot({ ...base, answeredAt: null })).toBe(false)
+    expect(owesReboot({ ...base, stopping: true })).toBe(false)
+    expect(owesReboot({ ...base, bootChildAlive: true })).toBe(false)
   })
 })
