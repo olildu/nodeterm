@@ -1298,8 +1298,10 @@ export function buildCanvasControlInstructions(shimPath: string): string {
     'output. If not, they are separate stations, open them all at once; if it does, open the',
     'downstream one with `--after <upstream-id>` and it starts itself when the upstream goes',
     'idle (do not poll for that yourself) — or with `--after-success <upstream-id>` when it must',
-    'start only on a SUCCESSFUL upstream, and tell every station you open to finish with',
-    '`report-outcome`. Then break the task into 2-5 workstreams;',
+    'start only on a SUCCESSFUL upstream, and end every station\'s brief with the FULL command',
+    '(`sh "<your nodeterm.sh path>" report-outcome --outcome succeeded --note "<one line>"`:',
+    'report-outcome is a verb of the shim, not a command on PATH, so a bare "run report-outcome"',
+    'leaves the station searching for a binary and the wait never ends). Then break the task into 2-5 workstreams;',
     'per stream `open-worktree --branch <slug>` then `open-agent --agent claude --group <groupId>',
     '--prompt "<concrete task>"` (each stream on its own branch, no tree conflicts). Members land',
     'in grid slots inside the frame automatically; align the frames themselves with',
@@ -1975,8 +1977,11 @@ across Nodeterm sessions), be the orchestration chef — plan the kitchen, then 
    will start itself when the upstream goes idle. Do not fake this by polling in your own
    session; that is what \`--after\` exists to replace. When the downstream must only start on
    a SUCCESSFUL upstream — its turn ending is not enough — use \`--after-success <upstream-id>\`,
-   and end every station's brief with "when you are done, run \`report-outcome --outcome
-   succeeded\` or \`--outcome failed --note <why>\`".
+   and end every station's brief with the FULL command, not just the verb name: "when you are done,
+   run \`sh \"<the same nodeterm.sh path you use>\" report-outcome --outcome succeeded --note \"<one
+   line>\"\` (or \`--outcome failed --note <why>\`)". \`report-outcome\` is a verb of the shim, not a
+   command on PATH: a station told only to "run report-outcome" searches for a binary, never reports,
+   and the dependent waits forever (\`list\` shows it WAITING FOR SUCCESS on an IDLE station).
 1. Split the task into the independent workstreams step 0 identified.
 2. Per workstream, give it its own branch + kitchen station:
    \`open-worktree --branch <slug>\` → note the returned \`groupId\`, then

@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+import { REPORT_OUTCOME_UNBLOCK } from '@shared/station-outcome'
 import {
   routeControlSource,
   needsLiveCanvas,
@@ -553,7 +554,7 @@ it('lists every station’s own report, and where a success wait stands (--after
   const text = controlListingText(rows)
   expect(text).toContain('lint [terminal] Linter — IDLE — REPORTED FAILURE ("eslint red")')
   expect(text).toContain(
-    'rev [terminal] Reviewer — WAITING FOR SUCCESS — needs success from: build "Builder" (no outcome reported yet)'
+    `rev [terminal] Reviewer — WAITING FOR SUCCESS — needs success from: build "Builder" (no outcome reported yet — its turn already ended: ${REPORT_OUTCOME_UNBLOCK})`
   )
   expect(text).toContain(
     'rel [terminal] Release — BLOCKED BY FAILURE (will not start on its own; run it with `run`) — needs success from: lint "Linter" (reported failure: "eslint red")'

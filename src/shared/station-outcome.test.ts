@@ -6,6 +6,8 @@ import {
   SUCCESS_WAIT_MAX,
   afterSuccessFlagRefusal,
   evaluateSuccessDep,
+  REPORT_OUTCOME_BRIEF_HINT,
+  REPORT_OUTCOME_UNBLOCK,
   normalizeSuccessWaitHold,
   outcomeOf,
   parseAfterSuccessArg,
@@ -280,5 +282,27 @@ describe('successWaitSatisfied / successWaitStatus', () => {
   it('the summary names only the unmet stations, by the reader-facing name', () => {
     const f = facts({ a1: ok, a2: { exists: true, turnDone: true, outcome: { outcome: 'failed', note: 'no tests' } } })
     expect(successWaitSummary(hold, f, (id) => `"${id.toUpperCase()}"`)).toBe('"A2" (reported failure: "no tests")')
+  })
+})
+
+describe('telling a stuck success wait how to unblock', () => {
+  const base: SuccessDepFacts = { exists: true, turnDone: false, outcome: undefined } as SuccessDepFacts
+  it('adds the unblock hint only when the station is idle and never reported', () => {
+    expect(evaluateSuccessDep('a1', { ...base, turnDone: false }).detail).toBe('no outcome reported yet')
+    const idle = evaluateSuccessDep('a1', { ...base, turnDone: true })
+    expect(idle.state).toBe('waiting')
+    expect(idle.detail).toContain('its turn already ended')
+    expect(idle.detail).toContain(REPORT_OUTCOME_UNBLOCK)
+  })
+  it('names the shim verb, not a PATH command, in both hints', () => {
+    for (const t of [REPORT_OUTCOME_UNBLOCK, REPORT_OUTCOME_BRIEF_HINT]) {
+      expect(t).toContain('report-outcome --outcome succeeded')
+      expect(t).toMatch(/not a (PATH )?command|not a command on PATH/)
+    }
+  })
+  it('does not change the blocked, failed or met states', () => {
+    expect(evaluateSuccessDep('a1', { ...base, exists: false }).state).toBe('blocked')
+    expect(evaluateSuccessDep('a1', { ...base, turnDone: true, outcome: { outcome: 'failed', note: 'x' } } as SuccessDepFacts).state).toBe('blocked')
+    expect(evaluateSuccessDep('a1', { ...base, turnDone: true, outcome: { outcome: 'succeeded' } } as SuccessDepFacts).state).toBe('met')
   })
 })

@@ -332,6 +332,14 @@ export interface SuccessDepReport {
  *  - a report made before new work that is still QUEUED for the station (`workPending`) is no
  *    report: it speaks for the task before, and the station has not even received the next one.
  */
+/** What to do about an upstream station that went idle without reporting. */
+export const REPORT_OUTCOME_UNBLOCK =
+  'tell it to run `sh "<nodeterm.sh>" report-outcome --outcome succeeded` (a verb of the nodeterm shim, not a PATH command), or start this node with `run`'
+
+/** The line every `--after-success` open prints: the brief of each station waited on must carry the exact command. */
+export const REPORT_OUTCOME_BRIEF_HINT =
+  'each station you wait on must END by running the shim verb: sh "<the same nodeterm.sh path you use>" report-outcome --outcome succeeded --note "<one line>" (or --outcome failed --note "<why>"). report-outcome is a verb of that shim, not a command on PATH: a brief that only says "run report-outcome" leaves the station searching for a binary, it never reports, and this node waits forever. A station already running without that line: `send` it the command, or start this node with `run`.'
+
 export function evaluateSuccessDep(id: string, facts: SuccessDepFacts): SuccessDepReport {
   const r = (state: SuccessDepState, detail: string): SuccessDepReport => ({ id, state, detail })
   if (facts.outcome?.workPending) {
@@ -347,9 +355,10 @@ export function evaluateSuccessDep(id: string, facts: SuccessDepFacts): SuccessD
     if (facts.exists && !facts.turnDone) return r('waiting', 'reported success; waiting for its turn to end')
     return r('met', 'reported success')
   }
-  return facts.exists
-    ? r('waiting', 'no outcome reported yet')
-    : r('blocked', 'closed without reporting success')
+  if (!facts.exists) return r('blocked', 'closed without reporting success')
+  // An idle station that never reported will not do it by itself: it usually does not know that
+  // `report-outcome` is a verb of the nodeterm shim (not a command on PATH). Say how to unblock.
+  return r('waiting', facts.turnDone ? `no outcome reported yet — its turn already ended: ${REPORT_OUTCOME_UNBLOCK}` : 'no outcome reported yet')
 }
 
 export function successWaitReports(

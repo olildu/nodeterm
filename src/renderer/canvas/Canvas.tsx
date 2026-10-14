@@ -654,6 +654,7 @@ import {
   normalizeSuccessWaitHold,
   parseAfterSuccessArg,
   parseSuccessDeadlineArg,
+  REPORT_OUTCOME_BRIEF_HINT,
   outcomeOf,
   successDepRefusal,
   type SuccessWaitHold
@@ -12770,7 +12771,8 @@ export function Canvas() {
       const successReplyLines = successHoldPre
         ? [
             `waits for a reported success from: ${successHoldPre.deps.join(', ')} ` +
-              `(until ${new Date(successHoldPre.deadlineAt).toISOString()})`
+              `(until ${new Date(successHoldPre.deadlineAt).toISOString()})`,
+            REPORT_OUTCOME_BRIEF_HINT
           ]
         : []
       const successReplyText = successReplyLines.map((l) => `\n${l}`).join('')
