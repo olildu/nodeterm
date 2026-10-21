@@ -95,9 +95,9 @@ describe('viewLevel', () => {
 })
 
 describe('desiredStreamScale', () => {
-  it('asks for about one device pixel per screen pixel, quantized and clamped', () => {
-    // 390 css px × dpr 2 = 780 device px of a 1179 px wide screen → 0.66 → 0.7
-    expect(desiredStreamScale(390, 2, 1179)).toBe(0.7)
+  it('asks for about 1.25 device pixels per screen pixel, quantized and clamped', () => {
+    // 390 css px × dpr 2 = 780 device px of a 1179 px wide screen → 0.66 ×1.25 = 0.83 → 0.9
+    expect(desiredStreamScale(390, 2, 1179)).toBe(0.9)
     expect(desiredStreamScale(40, 1, 1179)).toBe(0.2)
     expect(desiredStreamScale(4000, 2, 1179)).toBe(1)
   })

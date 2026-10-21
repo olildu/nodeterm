@@ -317,7 +317,7 @@ export type SimViewLevel = 'active' | 'background' | 'off'
 export const SIM_FPS: Record<SimViewLevel, number> = { active: 60, background: 8, off: 0 }
 export const SIM_SCALE_DEFAULT = 0.5
 export const SIM_SCALE_MIN = 0.2
-export const SIM_QUALITY = 0.7
+export const SIM_QUALITY = 0.88
 
 export interface SimViewOptions {
   level: SimViewLevel

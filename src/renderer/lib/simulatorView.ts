@@ -150,10 +150,10 @@ export function viewLevel(input: {
   return input.windowFocused ? 'active' : 'background'
 }
 
-/** Stream resolution for the size the node is drawn at: ~1 device pixel per screen pixel, no more. */
+/** Stream resolution for the size the node is drawn at: ~1.25 device pixels per screen pixel (the canvas is resampled by the browser, so exactly 1:1 looks soft). */
 export function desiredStreamScale(cssWidth: number, dpr: number, devicePixelWidth: number): number {
   if (!(cssWidth > 0 && dpr > 0 && devicePixelWidth > 0)) return SIM_SCALE_DEFAULT
-  const want = (cssWidth * dpr) / devicePixelWidth
+  const want = (cssWidth * dpr * 1.25) / devicePixelWidth
   // Quantized so a resize drag does not re-configure the encoder on every frame.
   const q = Math.ceil(want * 10) / 10
   return Math.min(1, Math.max(SIM_SCALE_MIN, q))
