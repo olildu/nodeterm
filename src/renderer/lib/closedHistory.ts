@@ -129,6 +129,7 @@ export function stateToReopenSnapshot(entry: ClosedSessionEntry): ReopenNodeSnap
     absolutePosition: entry.absolutePosition ?? n.position ?? origin,
     ...(n.parentId ? { parentId: n.parentId, extent: 'parent' as const } : {}),
     size: n.size,
+    ...(entry.sessionId ? { resumeSessionId: entry.sessionId } : {}),
     data: {
       title: n.title,
       titleAuto: n.titleAuto,

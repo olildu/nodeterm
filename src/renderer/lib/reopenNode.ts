@@ -1,5 +1,5 @@
 import type { NodeKind, Project } from '@shared/types'
-import type { AgentId, AgentPermissionMode } from '@shared/agents/config'
+import { canResumeWith, type AgentId, type AgentPermissionMode } from '@shared/agents/config'
 import {
   type CanvasNode,
   type NodeData,
@@ -44,6 +44,13 @@ export interface ReopenNodeSnapshot {
    * can never be reopened twice into two duplicate nodes.
    */
   closedSessionId?: string
+  /**
+   * The agent conversation this node was running when it closed. A reopened agent node RESUMES it
+   * (`createAgentNode`'s `resumeSessionId`) instead of starting a blank conversation under the same
+   * title — without it, reopening from the sessions manager showed an empty chat. Absent for a node
+   * that never had a session; ignored when the agent's resume grammar refuses the id.
+   */
+  resumeSessionId?: string
 }
 
 type SnapshotSource = {
@@ -156,6 +163,7 @@ function buildBase(snapshot: ReopenNodeSnapshot, ctx: RecreateContext): CanvasNo
         return { ...scaffold, data: { ...scaffold.data, ssh: d.ssh } }
       }
       if (d.agentId) {
+        const resumeId = (snapshot.resumeSessionId ?? d.agentSessionId)?.trim()
         return createAgentNode(
           d.agentId,
           0,
@@ -164,7 +172,11 @@ function buildBase(snapshot: ReopenNodeSnapshot, ctx: RecreateContext): CanvasNo
           undefined,
           ctx.project?.ssh,
           ctx.resolveAccountId(d.accountId),
-          ctx.permissionModeFor(d.agentId)
+          ctx.permissionModeFor(d.agentId),
+          undefined,
+          undefined,
+          undefined,
+          resumeId && canResumeWith(d.agentId, resumeId) ? resumeId : undefined
         )
       }
       // A run node reopens as a run node (same folder/configuration/device); its run is NOT

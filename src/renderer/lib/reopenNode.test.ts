@@ -6,7 +6,10 @@ import { snapshotNode, recreateNodeFromSnapshot, type ReopenNodeSnapshot } from 
 vi.mock('@renderer/state/settings', () => ({
   useSettings: { getState: () => ({ settings: { customAgents: [], defaultNodeWidth: undefined, defaultNodeHeight: undefined, agentLaunchCommands: {} } }) }
 }))
-vi.mock('@renderer/state/permissionMode', () => ({ claudeCliCapsNow: () => ({ sessionIdFlag: false }) }))
+vi.mock('@renderer/state/permissionMode', () => ({
+  claudeCliCapsNow: () => ({ sessionIdFlag: false }),
+  grokCliCapsNow: () => ({ sessionIdFlag: false })
+}))
 vi.mock('@renderer/state/codexIdentity', () => ({ codexSharedIdentity: () => undefined }))
 
 const baseCtx = () => ({
@@ -228,5 +231,36 @@ describe('recreateNodeFromSnapshot', () => {
     )
     expect(snapshot).not.toBeNull()
     expect(snapshot!.type).toBe('simulator')
+  })
+})
+
+describe('recreateNodeFromSnapshot: agent sessions resume', () => {
+  const agentSnap = (extra: Partial<ReopenNodeSnapshot>, data: Record<string, unknown> = {}): ReopenNodeSnapshot => ({
+    type: 'terminal',
+    position: { x: 0, y: 0 },
+    absolutePosition: { x: 0, y: 0 },
+    data: { title: 'Old chat', color: '#fff', group: null, agentId: 'claude', cwd: '/tmp/x', ...data },
+    ...extra
+  })
+
+  it('resumes the closed conversation instead of starting a blank one', () => {
+    const sid = '11111111-2222-3333-4444-555555555555'
+    const node = recreateNodeFromSnapshot(agentSnap({ resumeSessionId: sid }), baseCtx())
+    expect(node?.data.agentSessionId).toBe(sid)
+    expect(String(node?.data.initialCommand)).toContain(`--resume ${sid}`)
+    expect(node?.data.title).toBe('Old chat')
+  })
+
+  it('falls back to the node’s own recorded session id', () => {
+    const sid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const node = recreateNodeFromSnapshot(agentSnap({}, { agentSessionId: sid }), baseCtx())
+    expect(String(node?.data.initialCommand)).toContain(`--resume ${sid}`)
+  })
+
+  it('starts fresh when no session was ever recorded or the id is unsafe', () => {
+    const none = recreateNodeFromSnapshot(agentSnap({}), baseCtx())
+    expect(String(none?.data.initialCommand)).not.toContain('--resume')
+    const bad = recreateNodeFromSnapshot(agentSnap({ resumeSessionId: 'x; rm -rf /' }), baseCtx())
+    expect(String(bad?.data.initialCommand)).not.toContain('rm -rf')
   })
 })
