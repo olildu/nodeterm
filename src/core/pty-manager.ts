@@ -1033,6 +1033,20 @@ function screenGate(screen: string): ChatPromptBlocked | null {
  * survives, so reopening the node or restarting the app reattaches and continues
  * where it left off. Without tmux, it falls back to a plain shell (no persistence).
  */
+/** Env vars that identify one running Claude Code session; never pass them to a pane's own agent. */
+export const INHERITED_CLAUDE_SESSION_ENV = [
+  'CLAUDE_CODE_CHILD_SESSION',
+  'CLAUDE_CODE_SESSION_ID',
+  'CLAUDE_CODE_SESSION_ATTENDED',
+  'CLAUDE_CODE_MESSAGING_SOCKET',
+  'CLAUDE_CODE_MESSAGING_TOKEN',
+  'CLAUDE_CODE_ENTRYPOINT',
+  'CLAUDE_CODE_EXECPATH',
+  'CLAUDECODE',
+  'CLAUDE_PID',
+  'CLAUDE_JOB_DIR'
+] as const
+
 export class PtyManager {
   private sessions = new Map<string, Session>()
   /** persistKey (node id) → live sessionId. The index that makes `pty:create` idempotent:
@@ -3746,6 +3760,12 @@ export class PtyManager {
     delete env.NODETERM_SERVER_PASSWORD
     delete env.TMUX
     delete env.TMUX_PANE
+    // Identity of the Claude session that happened to START nodeterm (e.g. `open nodeterm.app` run
+    // by an agent). It sits in the app's own environment, so every terminal node would inherit it:
+    // new sessions come up already named after that other session (SESSION_ID / messaging socket),
+    // run with transcript saving off (CHILD_SESSION) and talk to its job dir. User settings such as
+    // CLAUDE_CONFIG_DIR or API keys are deliberately NOT in this list.
+    for (const key of INHERITED_CLAUDE_SESSION_ENV) delete env[key]
 
     // A GUI app launched from Finder/Dock inherits only a minimal PATH, so spawned terminals
     // couldn't find tools in /usr/local/bin, Homebrew, ~/.local/bin, nvm, bun, etc. (the classic
