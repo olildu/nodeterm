@@ -385,6 +385,7 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
     if (!t || t.pointerId !== e.pointerId) return
     touch.current = null
     touchingRef.current = false
+    keysRef.current?.focus({ preventScroll: true }) // after the press's default focus change, not before
     if (!udid) return
     const p = toDevice(e, true) ?? t.start
     if (t.alt) {
@@ -711,6 +712,9 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
               borderRadius: radius
             }}
             onPointerDown={onPointerDown}
+            // The press's own default action moves focus to the page body, which would undo the
+            // keyboard grab below (and re-arm the guard through the blur): the field keeps it.
+            onMouseDown={(e) => e.preventDefault()}
             onPointerMove={onPointerMove}
             onPointerUp={endTouch}
             onPointerCancel={endTouch}
