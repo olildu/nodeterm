@@ -7,6 +7,10 @@ shim (`src/renderer/bridge/`) stands in for the Electron preload, so the React U
 unchanged. It boots the same Electron-free core services (`src/core/`) through a
 `ServerPlatform`, so terminals get the same tmux session continuity as the desktop app.
 
+> **Using another computer as your desk?** [REMOTE-DESK.md](REMOTE-DESK.md) and
+> `scripts/remote-desk.sh` run this server on one Mac and open its canvas from another
+> Mac or a phone over an SSH tunnel, in a few commands.
+
 > **Phase 2 scope: terminals only.** This is a real, usable terminal canvas over the
 > network, but it is deliberately narrow — see [Limitations](#phase-2-limitations).
 
