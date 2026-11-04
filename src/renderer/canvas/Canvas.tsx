@@ -9165,6 +9165,10 @@ export function Canvas() {
     [crossOn, nodes]
   )
   const crossPrevRef = useRef<{ pid: string | null; sig: string } | null>(null)
+  // `frameNode`, published below its definition (it is declared after this effect).
+  const crossFrameNodeRef = useRef<
+    (node: Node, at?: { x: number; y: number; width: number; height: number } | null) => void
+  >(() => {})
   useEffect(() => {
     const prev = crossPrevRef.current
     crossPrevRef.current = { pid: renderedProjectId, sig: crossSig }
@@ -9180,14 +9184,36 @@ export function Canvas() {
     const free = new Set(crossSig.split(',').filter((id) => !prevIds.has(id)))
     const prefer = new Set(crossDraggedRef.current)
     const gap = crossGap()
-    if (crossLayout(live, { gap, free, prefer }) === live) return
+    const placed = crossLayout(live, { gap, free, prefer })
+    if (placed === live) return
     crossDraggedRef.current.clear()
     setNodes((ns) => crossLayout(ns as CanvasNode[], { gap, free, prefer }))
     markDirty()
-    // A node was added: bring the whole cross into view so the new one is on screen. A close keeps
-    // the camera where the user left it.
-    if (free.size > 0) requestAnimationFrame(() => fitAll())
-  }, [crossSig, renderedProjectId, setNodes, markDirty, fitAll, nodesRef, nodesProjectIdRef])
+    // ONE node was added: frame THAT node (the camera only — the keyboard stays where it was, so an
+    // agent opening a node never steals typing). Several at once (a team spawn): bring the whole
+    // cross into view. A close keeps the camera where the user left it.
+    // The target rect comes from the layout we just computed, NOT from React Flow: its measured
+    // position is still the factory spot for a frame or two, and framing that sends the camera to
+    // where the node WAS. Size: the measured one once the node has painted, else the persisted one.
+    if (free.size === 1) {
+      const [id] = free
+      const target = placed.find((n) => n.id === id)
+      requestAnimationFrame(() => {
+        if (!target) return fitAll()
+        const sized = nodeFitRect(target as FocusableNode, placed as FocusableNode[])
+        const internal = getInternalNode(id)
+        const rect = isMeasured(internal)
+          ? {
+              ...absolutePosition(target as FocusableNode, placed as FocusableNode[]),
+              width: internal!.measured.width as number,
+              height: internal!.measured.height as number
+            }
+          : sized
+        if (rect) crossFrameNodeRef.current(target as Node, rect)
+        else fitAll()
+      })
+    } else if (free.size > 1) requestAnimationFrame(() => fitAll())
+  }, [crossSig, renderedProjectId, setNodes, markDirty, fitAll, getInternalNode, nodesRef, nodesProjectIdRef])
 
   // Whether the lineage tidy has anything to say. Asked when the menu OPENS so the row can be
   // disabled with its reason instead of silently doing nothing on click: on a canvas nobody
@@ -9479,9 +9505,13 @@ export function Canvas() {
    * against the whole pane when there is nothing sensible to solve.
    */
   const frameNode = useCallback(
-    (node: Node) => {
+    (node: Node, at?: { x: number; y: number; width: number; height: number } | null) => {
       const internal = getInternalNode(node.id)
-      const rect = isMeasured(internal)
+      // `at`: the caller already knows where the node is going (the live cross layout moved it in
+      // the same tick), so React Flow's measured position — still the old spot — must not win.
+      const rect = at
+        ? at
+        : isMeasured(internal)
         ? {
             ...internal!.internals.positionAbsolute,
             width: internal!.measured.width as number,
@@ -9534,6 +9564,7 @@ export function Canvas() {
     },
     [frameNode, markDirty]
   )
+  crossFrameNodeRef.current = frameNode
 
   /**
    * Walks the breadcrumb cursor one stop and flies the camera there. Browser back/forward for the
