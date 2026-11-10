@@ -199,13 +199,13 @@ describe('recreateNodeFromSnapshot', () => {
     const udid = 'AE342EEF-B624-4060-B9E6-AE6E9EAAC24A'
     const node = recreateNodeFromSnapshot(
       snap({
-        type: 'simulator',
+        type: 'agentsim',
         data: { title: 'iPhone 15', color: '#6ac4dc', group: null, simUdid: udid, simName: 'iPhone 15' }
       }),
       baseCtx()
     )
     expect(node).not.toBeNull()
-    expect(node!.type).toBe('simulator')
+    expect(node!.type).toBe('agentsim')
     expect(node!.data.simUdid).toBe(udid)
     expect(node!.data.simName).toBe('iPhone 15')
     expect(node!.id).toMatch(/^sim-/)
@@ -214,7 +214,7 @@ describe('recreateNodeFromSnapshot', () => {
   it('reopens a simulator whose stored device id is not a UUID as one that asks for a device', () => {
     const node = recreateNodeFromSnapshot(
       snap({
-        type: 'simulator',
+        type: 'agentsim',
         data: { title: 'x', color: '#6ac4dc', group: null, simUdid: '$(touch /tmp/pwn)', simName: 'x' }
       }),
       baseCtx()
@@ -226,11 +226,11 @@ describe('recreateNodeFromSnapshot', () => {
 
   it('snapshots a simulator node rather than treating it as unrestorable', () => {
     const snapshot = snapshotNode(
-      { type: 'simulator', position: { x: 0, y: 0 }, width: 320, height: 740, data: { title: 'Simulator', color: '#6ac4dc', group: null } },
+      { type: 'agentsim', position: { x: 0, y: 0 }, width: 320, height: 740, data: { title: 'Simulator', color: '#6ac4dc', group: null } },
       []
     )
     expect(snapshot).not.toBeNull()
-    expect(snapshot!.type).toBe('simulator')
+    expect(snapshot!.type).toBe('agentsim')
   })
 })
 

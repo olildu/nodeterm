@@ -94,7 +94,7 @@ export function buildBackgroundLinkMaps(
     const infoOf = (id: string): LinkNodeInfo => {
       const n = byId.get(id)!
       const sticky = n.kind === 'sticky'
-      const simulator = n.kind === 'simulator'
+      const simulator = n.kind === 'agentsim'
       const agentId = sticky || simulator ? undefined : (n.agentId ?? agentIdOf?.(id))
       return {
         id,

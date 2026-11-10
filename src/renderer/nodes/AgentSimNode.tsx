@@ -168,7 +168,7 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(out)
 }
 
-export function SimulatorNode({ id, data, selected, dragging }: NodeProps<CanvasNode>) {
+export function AgentSimNode({ id, data, selected, dragging }: NodeProps<CanvasNode>) {
   const { updateNodeData, deleteElements, setNodes, getNode } = useReactFlow()
   const { api } = useSession()
   const sim = api.sim
@@ -594,14 +594,14 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
     <>
     <div
       ref={rootRef}
-      className={`sim-node${pinned ? ' is-open' : ''}${selected ? ' selected' : ''}${collapsed ? ' collapsed' : ''}${keyed ? ' keyed' : ''}${driving ? ' driving' : ''}`}
+      className={`agentsim-node${pinned ? ' is-open' : ''}${selected ? ' selected' : ''}${collapsed ? ' collapsed' : ''}${keyed ? ' keyed' : ''}${driving ? ' driving' : ''}`}
       style={rootStyle}
     >
       {/* Paint only: the old resize box in its old place (see .nt-resize-ghost in styles.css). */}
       <NodeResizer isVisible={selected && !collapsed} color={data.color as string} lineClassName="nt-resize-ghost" handleClassName="nt-resize-ghost" />
       {/* The terminal node's header: the same metrics, the same 22px icon buttons. Its strip is
           reserved (absolute, SIM_HEADER_H) so rolling it open never moves the screen. */}
-      <div className="sim-node__header term-node__header">
+      <div className="agentsim-node__header term-node__header">
         <button className="term-node__collapse nodrag" title={collapsed ? 'Expand' : 'Collapse'} aria-label={collapsed ? 'Expand' : 'Collapse'} onClick={toggleCollapse}>
           {collapsed ? '▸' : '▾'}
         </button>
@@ -655,12 +655,12 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
           </span>
         )}
         <button
-          className="sim-node__chip nodrag"
+          className="agentsim-node__chip nodrag"
           title={`${view.title}${view.detail ? ` — ${view.detail}` : ''} · choose device`}
           aria-label="Choose device"
           onClick={(e) => void openPicker(e.currentTarget)}
         >
-          <span className={`sim-node__dot sim-node__dot--${dot}`} aria-hidden />
+          <span className={`agentsim-node__dot agentsim-node__dot--${dot}`} aria-hidden />
           {runtime}
           <svg width="8" height="8" viewBox="0 0 10 10" aria-hidden="true">
             <path d="M2 3.5l3 3 3-3" stroke="currentColor" strokeWidth="1.5" fill="none" strokeLinecap="round" strokeLinejoin="round" />
@@ -670,7 +670,7 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
         {PLATFORM_BUTTONS[platform].map((b) => (
           <button
             key={b.name}
-            className="term-node__refresh sim-node__tool nodrag"
+            className="term-node__refresh agentsim-node__tool nodrag"
             title={b.title}
             aria-label={b.title}
             disabled={!isLive}
@@ -680,7 +680,7 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
           </button>
         ))}
         <button
-          className="term-node__refresh sim-node__tool nodrag"
+          className="term-node__refresh agentsim-node__tool nodrag"
           title="Screenshot — saves a PNG and copies its path"
           aria-label="Screenshot"
           disabled={!isLive}
@@ -697,13 +697,13 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
       {!collapsed && (
         <div
           ref={bodyRef}
-          className="sim-node__body"
+          className="agentsim-node__body"
           onMouseEnter={onBodyEnter}
           onMouseLeave={onBodyLeave}
         >
           <div
             ref={screenRef}
-            className={`sim-node__screen${isLive && !armed ? ' nodrag nowheel' : ''}${driving ? ' driving' : ''}`}
+            className={`agentsim-node__screen${isLive && !armed ? ' nodrag nowheel' : ''}${driving ? ' driving' : ''}`}
             style={{
               left: screenBox.left,
               top: screenBox.top,
@@ -721,20 +721,20 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
             onLostPointerCapture={onLostCapture}
             onWheel={onWheel}
           >
-            <canvas ref={canvasRef} className="sim-node__canvas" />
+            <canvas ref={canvasRef} className="agentsim-node__canvas" />
             {/* The agent's touch, at the real point: a dot that springs in and two ripples. A new
                 `seq` remounts it so the next tap replays. */}
             {tapPx && driving?.tap && (
-              <span key={`tap-${driving.tap.seq}`} className="sim-node__tap" style={{ left: tapPx.x, top: tapPx.y }} aria-hidden>
-                <span className="sim-node__tap-ripple" />
-                <span className="sim-node__tap-ripple sim-node__tap-ripple--2" />
-                <span className="sim-node__tap-dot" />
+              <span key={`tap-${driving.tap.seq}`} className="agentsim-node__tap" style={{ left: tapPx.x, top: tapPx.y }} aria-hidden>
+                <span className="agentsim-node__tap-ripple" />
+                <span className="agentsim-node__tap-ripple agentsim-node__tap-ripple--2" />
+                <span className="agentsim-node__tap-dot" />
               </span>
             )}
             {swipeFrom && swipeTo && swipe && (
               <svg
                 key={`swipe-${swipe.seq}`}
-                className="sim-node__swipe"
+                className="agentsim-node__swipe"
                 width={screenBox.width}
                 height={screenBox.height}
                 viewBox={`0 0 ${screenBox.width} ${screenBox.height}`}
@@ -757,25 +757,25 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
           )}
 
           {!isLive && (
-            <div className="sim-node__overlay">
-              <div className="sim-node__card">
-                <div className="sim-node__card-title">{booting ? bootingTitle(platform) : view.title}</div>
+            <div className="agentsim-node__overlay">
+              <div className="agentsim-node__card">
+                <div className="agentsim-node__card-title">{booting ? bootingTitle(platform) : view.title}</div>
                 {booting && platform === 'android' && (
-                  <div className="sim-node__card-detail">A cold boot takes about 20 seconds.</div>
+                  <div className="agentsim-node__card-detail">A cold boot takes about 20 seconds.</div>
                 )}
-                {view.detail && !booting && <div className="sim-node__card-detail">{view.detail}</div>}
+                {view.detail && !booting && <div className="agentsim-node__card-detail">{view.detail}</div>}
                 {view.action === 'pick' && (
-                  <button className="sim-node__action nodrag" onClick={(e) => void openPicker(e.currentTarget)}>
+                  <button className="agentsim-node__action nodrag" onClick={(e) => void openPicker(e.currentTarget)}>
                     Choose device
                   </button>
                 )}
                 {view.action === 'boot' && !booting && (
-                  <button className="sim-node__action nodrag" onClick={() => void boot()}>
+                  <button className="agentsim-node__action nodrag" onClick={() => void boot()}>
                     Boot
                   </button>
                 )}
                 {view.action === 'reconnect' && (
-                  <button className="sim-node__action nodrag" onClick={() => setAttachNonce((n) => n + 1)}>
+                  <button className="agentsim-node__action nodrag" onClick={() => setAttachNonce((n) => n + 1)}>
                     Reconnect
                   </button>
                 )}
@@ -784,14 +784,14 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
           )}
           {/* The flash and the helper's notice share one unobtrusive toast over the bottom of the glass. */}
           {(flash || (view.notice && isLive)) && (
-            <div className="sim-node__toast" role="status" style={{ left: screenBox.left + 8, width: Math.max(0, screenBox.width - 16), bottom: bodySize.height - screenBox.top - screenBox.height + 14 }}>
+            <div className="agentsim-node__toast" role="status" style={{ left: screenBox.left + 8, width: Math.max(0, screenBox.width - 16), bottom: bodySize.height - screenBox.top - screenBox.height + 14 }}>
               {flash || view.notice}
             </div>
           )}
 
           <textarea
             ref={keysRef}
-            className="sim-node__keys nokey"
+            className="agentsim-node__keys nokey"
             aria-label={`${platform === 'android' ? 'Emulator' : 'Simulator'} keyboard input`}
             spellCheck={false}
             autoCapitalize="off"
@@ -818,15 +818,15 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
         Siblings of the root, like the handles and the resizer. */}
     {driving && (
       <div
-        className="sim-node__drivechip"
+        className="agentsim-node__drivechip"
         role="status"
         aria-live="polite"
         // Folded, the frame and header are invisible: sit just above the PHONE, not above the frame.
         style={phone ? ({ '--sim-phone-top': `${Math.round(phone.top)}px` } as React.CSSProperties) : undefined}
       >
-        <span className="sim-node__drivechip-live" aria-hidden />
-        <span className="sim-node__drivechip-who">{drivingTitle}</span>
-        {driving.action && <span className="sim-node__drivechip-what">{driving.action}</span>}
+        <span className="agentsim-node__drivechip-live" aria-hidden />
+        <span className="agentsim-node__drivechip-who">{drivingTitle}</span>
+        {driving.action && <span className="agentsim-node__drivechip-what">{driving.action}</span>}
       </div>
     )}
     {/* Link handles, as on a terminal / sticky node: drag to or from an agent so the device becomes
@@ -854,8 +854,8 @@ export function SimulatorNode({ id, data, selected, dragging }: NodeProps<Canvas
     {/* Sibling of the root, after it (see FilesNode): focus mode reparents the root, and the
         glass appearance makes the root a containing block that would clip these edges. */}
     <NodeResizer
-      minWidth={NODE_MIN_SIZES.simulator.width}
-      minHeight={NODE_MIN_SIZES.simulator.height}
+      minWidth={NODE_MIN_SIZES.agentsim.width}
+      minHeight={NODE_MIN_SIZES.agentsim.height}
       isVisible={selected && !collapsed}
       color={data.color as string}
     />

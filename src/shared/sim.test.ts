@@ -4,6 +4,7 @@ import {
   SIM_FRAME_HEADER_BYTES,
   combineSimViews,
   isQuietEligible,
+  migrateLegacyAgentSimKind,
   normalizeSimName,
   normalizeSimUdid,
   normalizeSimViewOptions,
@@ -169,5 +170,16 @@ describe('parseSimFrame', () => {
   it('refuses a short frame and a zero-sized one', () => {
     expect(parseSimFrame(new Uint8Array(12))).toBeNull()
     expect(parseSimFrame(frame(0, 20, [1]))).toBeNull()
+  })
+})
+
+describe('migrateLegacyAgentSimKind', () => {
+  it('reads a pre-rename fork simulator node as agentsim', () => {
+    expect(migrateLegacyAgentSimKind({ kind: 'simulator', simUdid: 'x' }).kind).toBe('agentsim')
+    expect(migrateLegacyAgentSimKind({ kind: 'simulator' }).kind).toBe('agentsim')
+  })
+  it('leaves an upstream simulator node (has a simulator config) and other kinds alone', () => {
+    expect(migrateLegacyAgentSimKind({ kind: 'simulator', simulator: {} }).kind).toBe('simulator')
+    expect(migrateLegacyAgentSimKind({ kind: 'terminal' }).kind).toBe('terminal')
   })
 })

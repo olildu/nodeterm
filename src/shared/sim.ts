@@ -423,3 +423,17 @@ export interface SimApi {
   /** The user removed an agent↔Simulator link: core's auto-link ledger never re-creates it this run. */
   linkRemoved(ownerNodeId: string, simNodeId: string): void
 }
+
+/**
+ * Fork migration: this fork's agent-drivable Simulator node used to persist as kind `'simulator'`.
+ * Upstream later shipped its OWN, unrelated `'simulator'` node (it always persists a `simulator`
+ * config object), so the fork's node is now kind `'agentsim'`. A `'simulator'` node WITHOUT that
+ * upstream config field is one of ours from before the rename, and is read back as `'agentsim'`.
+ * Applied at the core load seam (`sanitizeNodeTriggers`) and in the renderer's `nodeStatesToFlow`.
+ */
+export function migrateLegacyAgentSimKind<T extends { kind?: string }>(n: T): T {
+  if ((n.kind as string) === 'simulator' && (n as { simulator?: unknown }).simulator === undefined) {
+    return { ...n, kind: 'agentsim' }
+  }
+  return n
+}

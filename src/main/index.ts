@@ -4215,7 +4215,7 @@ app.whenReady().then(async () => {
     emit: (event) => getMainWindow()?.webContents.send(IPC.simAgentEvent, event),
     simulatorNodes: (projectId) =>
       (workspaceStore.persistedCanvases().find((c) => c.id === projectId)?.nodes ?? [])
-        .filter((n) => n.kind === 'simulator')
+        .filter((n) => n.kind === 'agentsim')
         .map((n) => ({ id: n.id, title: n.title ?? '', ...(n.simUdid ? { udid: n.simUdid } : {}) })),
     projectCwd: (projectId) => workspaceStore.projectCwdFor(projectId),
     tempDir: () => tmpdir(),

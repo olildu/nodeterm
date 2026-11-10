@@ -28,7 +28,7 @@ const FILTERED_ROOTS: Record<string, string> = {
   'VideoNode.tsx': 'term-node video-node',
   'WebNode.tsx': 'term-node web-node',
   'FilesNode.tsx': 'files-node${',
-  'SimulatorNode.tsx': 'sim-node${',
+  'AgentSimNode.tsx': 'agentsim-node${',
   'LoopNode.tsx': 'loop-node',
   'SubagentNode.tsx': 'subagent-node',
   'TriggerNode.tsx': 'trigger-node',

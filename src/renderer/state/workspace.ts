@@ -34,7 +34,7 @@ import { codexApprovalCaps } from './codexCli'
 import { folderTitle } from '../lib/explorerCreate'
 import { sshHostKey } from '@shared/ssh'
 import { normalizeNodeIcon } from '@shared/node-icon'
-import { normalizeSimName, normalizeSimUdid } from '@shared/sim'
+import { migrateLegacyAgentSimKind, normalizeSimName, normalizeSimUdid } from '@shared/sim'
 import { normalizeIssueRef, type IssueRef } from '@shared/github-issue-ref'
 import { isSafeNodeId } from '@shared/safe-id'
 import { openerByTarget, recordedOpenerOf } from '../lib/teamProgress'
@@ -75,7 +75,7 @@ const BROWSER_SIZE = { width: 800, height: 560 }
 const FILES_SIZE = { width: 340, height: 460 }
 // Phone-shaped: an iPhone's screen is ~0.46 wide-to-tall, plus a header and a button row. Narrow on
 // purpose — the canvas is zoomable, and the node is a handheld, not a window.
-const SIMULATOR_SIZE = { width: 400, height: 780 }
+const AGENTSIM_SIZE = { width: 400, height: 780 }
 
 /** Height of a node when collapsed (header only). */
 export const COLLAPSED_HEIGHT = 40
@@ -83,7 +83,7 @@ export const COLLAPSED_HEIGHT = 40
 /** The node kinds that render a header-only collapsed state. Any other kind squashed to
  *  COLLAPSED_HEIGHT crushes its content (a group frame strands its children outside it), so
  *  neither the menu nor the toggle offers collapse to them. */
-export const COLLAPSIBLE_KINDS: ReadonlySet<string> = new Set(['terminal', 'sticky', 'files', 'simulator'])
+export const COLLAPSIBLE_KINDS: ReadonlySet<string> = new Set(['terminal', 'sticky', 'files', 'agentsim'])
 export const isCollapsible = (n: Pick<CanvasNode, 'type'>): boolean =>
   COLLAPSIBLE_KINDS.has(n.type ?? 'terminal')
 /** Whether the collapse toggle may act on `n`: a collapsible kind either way, or ANY node that is
@@ -1276,7 +1276,7 @@ export function createFilesNode(
  * `simUdid`. The device is a MACHINE fact (does this Mac have it?), so the node checks it at mount
  * rather than trusting a UDID that arrived in a shared project file.
  */
-export function createSimulatorNode(
+export function createAgentSimNode(
   index: number,
   center?: { x: number; y: number },
   device?: { udid: string; name?: string }
@@ -1285,8 +1285,8 @@ export function createSimulatorNode(
   const simName = normalizeSimName(device?.name)
   return {
     id: nextId('sim'),
-    type: 'simulator',
-    ...placeNode('simulator', center, index, SIMULATOR_SIZE.width, SIMULATOR_SIZE.height),
+    type: 'agentsim',
+    ...placeNode('agentsim', center, index, AGENTSIM_SIZE.width, AGENTSIM_SIZE.height),
     data: {
       title: simName ?? 'Simulator',
       // Tracks the device's name until the user renames it (same contract as an agent's session name).
@@ -2824,7 +2824,7 @@ export function nodeStatesToFlow(states: CanvasNodeState[]): CanvasNode[] {
     // keeps its place and tells the user how to continue the conversation — chat sessions are
     // ordinary Claude sessions, resumable in any terminal. (position/size are normalized
     // defensively so a legacy chat node still lands even if its shape is minimal.)
-    let n = raw
+    let n = migrateLegacyAgentSimKind(raw)
     // Legacy read: `chat` is no longer a NodeKind, so a persisted chat node arrives as an
     // unknown-kind blob — detect it by its string kind and read its old `chatSessionId` field.
     if ((n.kind as string) === 'chat') {
@@ -2942,8 +2942,8 @@ export function flowToNodeStates(nodes: CanvasNode[], retainInitialCommand = tru
                       ? TRIGGER_SIZE
                       : kind === 'files'
                         ? FILES_SIZE
-                        : kind === 'simulator'
-                          ? SIMULATOR_SIZE
+                        : kind === 'agentsim'
+                          ? AGENTSIM_SIZE
                           : TERMINAL_SIZE
   return nodes
     .map((n) => {

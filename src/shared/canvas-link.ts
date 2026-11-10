@@ -26,7 +26,7 @@ export const LINK_NOT_LINKABLE =
 export type LinkKind = 'context' | 'note' | 'sim'
 
 /** The node kind a Simulator node carries (`NodeKind` in types.ts); spelled once for the planner. */
-export const SIMULATOR_KIND = 'simulator'
+export const SIMULATOR_KIND = 'agentsim'
 
 /** The endpoints of a context link, plus its optional one-way reader (issue #852). */
 export interface LinkEdge {

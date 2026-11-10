@@ -1,4 +1,5 @@
 import path from 'path'
+import { migrateLegacyAgentSimKind } from '../shared/sim'
 import { healPathAsName } from '../shared/project-name'
 import type { AgentPermissionMode } from '../shared/agents/config'
 import { collisionSeed, derivedProjectId, legacyFileId } from '../shared/project-id'
@@ -50,7 +51,8 @@ function sanitizeBrowserPartitions(nodes: CanvasNodeState[], projectId: string):
  * a freshly loaded file can never answer it. See @shared/trigger for the trust model.
  */
 export function sanitizeNodeTriggers(nodes: CanvasNodeState[]): CanvasNodeState[] {
-  return nodes.map((n) => {
+  return nodes.map((raw) => {
+    const n = migrateLegacyAgentSimKind(raw)
     if (n.trigger === undefined) return n
     if (n.kind === 'trigger') {
       const safe = sanitizeTriggerSpec(n.trigger)

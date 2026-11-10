@@ -20,7 +20,7 @@ const KIND_LABEL: Partial<Record<NodeKind, string>> = {
   web: 'web',
   browser: 'browser',
   dino: 'dino',
-  simulator: 'simulator',
+  agentsim: 'simulator',
   group: 'group'
 }
 

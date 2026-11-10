@@ -21,7 +21,7 @@ export const NODE_MIN_SIZES: Record<NodeKind, { width: number; height: number }>
   browser: { width: 360, height: 240 },
   files: { width: 220, height: 160 },
   // Narrow enough to be a handheld; tall enough that the screen (≈0.46 aspect) is not a postage stamp.
-  simulator: { width: 340, height: 440 },
+  agentsim: { width: 340, height: 440 },
   subagent: { width: 180, height: 84 },
   loop: { width: 180, height: 84 },
   dino: { width: 400, height: 160 },

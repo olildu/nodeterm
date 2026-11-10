@@ -41,7 +41,7 @@ export function useContextLinkSync(live: LiveContextLinks): void {
         Object.assign(map, buildLinkMap(edges, (id) => {
           const n = byId.get(id)!
           const sticky = n.type === 'sticky'
-          const simulator = n.type === 'simulator'
+          const simulator = n.type === 'agentsim'
           const agentId = n.type !== 'terminal' ? undefined : (
             n.data.agentId as string | undefined ??
             ((n.data.tags as string[] | undefined)?.includes('claude') ? 'claude' : undefined) ??

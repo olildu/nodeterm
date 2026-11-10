@@ -92,7 +92,7 @@ describe('a Simulator node in the link map', () => {
   })
   it('background projects build it from the serialized node (udid + name, no agent, no account)', () => {
     const nodes = [
-      { id: 'dev', kind: 'simulator', title: 'Phone', simUdid: sim.udid, simName: sim.name, accountId: 'x' },
+      { id: 'dev', kind: 'agentsim', title: 'Phone', simUdid: sim.udid, simName: sim.name, accountId: 'x' },
       { id: 'a', kind: 'terminal', title: 'A', agentId: 'claude' }
     ] as unknown as CanvasNodeState[]
     const map = buildBackgroundLinkMaps(

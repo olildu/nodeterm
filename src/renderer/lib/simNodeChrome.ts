@@ -12,7 +12,7 @@ import type { Box, Point, Rect } from './simPointer'
 
 /** Header strip height (22px buttons + 6px padding either side). */
 export const SIM_HEADER_H = 34
-/** Border widths of `.sim-node` (the top one is the node colour edge). */
+/** Border widths of `.agentsim-node` (the top one is the node colour edge). */
 export const SIM_BORDER_TOP = 3
 export const SIM_BORDER_X = 1
 export const SIM_BORDER_BOTTOM = 1

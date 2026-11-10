@@ -31,7 +31,7 @@ const handlers = (overrides: Partial<AddHandlers> = {}): AddHandlers => ({
   files: noop,
   run: noop,
   dino: noop,
-  simulator: noop,
+  agentsim: noop,
   trigger: noop,
   openFile: noop,
   newFile: noop,
@@ -49,7 +49,7 @@ const allKinds: AddItem['kind'][] = [
   'sticky',
   'files',
   'dino',
-  'simulator',
+  'agentsim',
   'trigger',
   'open-file',
   'new-file',
@@ -60,19 +60,19 @@ const allKinds: AddItem['kind'][] = [
 describe('Simulator row', () => {
   const reason = 'Simulators run in the desktop app on macOS'
   it('is offered, enabled, by default — the node explains a missing helper itself', () => {
-    const [row] = contentAddItemsToMenuItems([{ kind: 'simulator' }], handlers(), { hasCwd: false, isSshProject: false })
+    const [row] = contentAddItemsToMenuItems([{ kind: 'agentsim' }], handlers(), { hasCwd: false, isSshProject: false })
     expect(row).toMatchObject({ label: 'New simulator / emulator' })
     expect((row as { disabled?: boolean }).disabled).toBeFalsy()
   })
   it('is disabled with its reason on the menu and the Dock alike (browser tab, team tab, not macOS)', () => {
     const ctx = { hasCwd: true, isSshProject: false, simulatorUnavailable: reason }
-    const [row] = contentAddItemsToMenuItems([{ kind: 'simulator' }], handlers(), ctx)
+    const [row] = contentAddItemsToMenuItems([{ kind: 'agentsim' }], handlers(), ctx)
     expect(row).toMatchObject({ label: 'New simulator / emulator', disabled: true, hint: reason })
-    const [dock] = contentAddItemsToDockRows([{ kind: 'simulator' }], handlers(), ctx)
-    expect(dock).toMatchObject({ kind: 'simulator', disabled: true, hint: reason })
+    const [dock] = contentAddItemsToDockRows([{ kind: 'agentsim' }], handlers(), ctx)
+    expect(dock).toMatchObject({ kind: 'agentsim', disabled: true, hint: reason })
   })
   it('is enabled in an SSH project: the device is this machine\'s, not the project\'s host', () => {
-    const [row] = contentAddItemsToMenuItems([{ kind: 'simulator' }], handlers(), { hasCwd: true, isSshProject: true })
+    const [row] = contentAddItemsToMenuItems([{ kind: 'agentsim' }], handlers(), { hasCwd: true, isSshProject: true })
     expect((row as { disabled?: boolean }).disabled).toBeFalsy()
   })
 })
@@ -190,7 +190,7 @@ describe('contentAddItemsToMenuItems', () => {
       web: () => calls.push('web'),
       sticky: () => calls.push('sticky'),
       dino: () => calls.push('dino'),
-      simulator: () => calls.push('simulator'),
+      agentsim: () => calls.push('agentsim'),
       spawnTeam: () => calls.push('spawnTeam'),
       worktree: () => calls.push('worktree')
     })
@@ -201,7 +201,7 @@ describe('contentAddItemsToMenuItems', () => {
     for (const item of items) {
       if ('onClick' in item) item.onClick()
     }
-    expect(calls.sort()).toEqual(['browser', 'dino', 'simulator', 'spawnTeam', 'sticky', 'terminal', 'web', 'worktree'])
+    expect(calls.sort()).toEqual(['agentsim', 'browser', 'dino', 'spawnTeam', 'sticky', 'terminal', 'web', 'worktree'])
   })
 })
 
@@ -220,7 +220,7 @@ describe('contentAddItemsToDockRows', () => {
       'sticky',
       'files',
       'dino',
-      'simulator',
+      'agentsim',
       'trigger',
       'open-file',
       'new-file',
@@ -480,7 +480,7 @@ describe('buildGroupedAddMenu', () => {
       sticky: () => calls.push('sticky'),
       files: () => calls.push('files'),
       dino: () => calls.push('dino'),
-      simulator: () => calls.push('simulator'),
+      agentsim: () => calls.push('agentsim'),
       trigger: () => calls.push('trigger'),
       openFile: () => calls.push('openFile'),
       newFile: () => calls.push('newFile'),
@@ -495,6 +495,7 @@ describe('buildGroupedAddMenu', () => {
     }
     // Every content handler is reachable — nothing was orphaned by the move into a flyout.
     expect(calls.sort()).toEqual([
+      'agentsim',
       'browser',
       'dino',
       'files',
@@ -502,7 +503,6 @@ describe('buildGroupedAddMenu', () => {
       'openFile',
       'remote',
       'scopedCheckout',
-      'simulator',
       'spawnTeam',
       'sticky',
       'terminal',

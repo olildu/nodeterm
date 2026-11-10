@@ -93,7 +93,7 @@ describe('planBridges oneWay', () => {
 })
 
 const agent = (contextCapable = true): LinkEndpoint => ({ kind: 'terminal', contextCapable })
-const device: LinkEndpoint = { kind: 'simulator', contextCapable: false }
+const device: LinkEndpoint = { kind: 'agentsim', contextCapable: false }
 const note: LinkEndpoint = { kind: 'sticky', contextCapable: false }
 
 describe('classifyLink — Simulator nodes', () => {

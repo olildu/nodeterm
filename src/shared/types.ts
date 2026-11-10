@@ -395,7 +395,7 @@ export interface RecycledInfo {
 // 'subagent' and 'loop' are render-only (ephemeral hook-driven viz) and never persisted.
 // 'trigger' is a first-class PERSISTED kind (issue #493) — the canvas-owned schedule node; its
 // spec rides `CanvasNodeState.trigger` and is sanitized on every load path (@shared/trigger).
-export type NodeKind = 'terminal' | 'sticky' | 'group' | 'editor' | 'diff' | 'video' | 'web' | 'browser' | 'files' | 'simulator' | 'subagent' | 'loop' | 'dino' | 'trigger'
+export type NodeKind = 'terminal' | 'sticky' | 'group' | 'editor' | 'diff' | 'video' | 'web' | 'browser' | 'files' | 'agentsim' | 'subagent' | 'loop' | 'dino' | 'trigger'
 
 /** Persisted state of a single canvas node (terminal, sticky note, group frame, or editor). */
 /**

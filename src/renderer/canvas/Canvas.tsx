@@ -103,7 +103,7 @@ import { StickyNode } from '../nodes/StickyNode'
 import { GroupNode, setWorktreeActionHandler } from '../nodes/GroupNode'
 import { LazyEditorNode, LazyDiffNode } from '../nodes/lazyMonacoNodes'
 import { DinoNode } from '../nodes/DinoNode'
-import { SimulatorNode } from '../nodes/SimulatorNode'
+import { AgentSimNode } from '../nodes/AgentSimNode'
 import { simulatorUnavailableReason } from '../lib/simulatorView'
 import { TriggerNode } from '../nodes/TriggerNode'
 import BrowserNode from '../nodes/BrowserNode'
@@ -876,7 +876,7 @@ import {
   createAgentNode,
   createBrowserNode,
   createDinoNode,
-  createSimulatorNode,
+  createAgentSimNode,
   createTriggerNode,
   createFilesNode,
   createRunNode,
@@ -2278,7 +2278,7 @@ export function Canvas() {
       subagent: withNodeBoundary(SubagentNode),
       loop: withNodeBoundary(LoopNode),
       dino: withNodeBoundary(DinoNode),
-      simulator: withNodeBoundary(SimulatorNode),
+      agentsim: withNodeBoundary(AgentSimNode),
       trigger: withNodeBoundary(TriggerNode),
       video: withNodeBoundary(VideoNode),
       web: withNodeBoundary(WebNode),
@@ -2830,7 +2830,7 @@ export function Canvas() {
   const simSig = useMemo(
     () =>
       nodes
-        .filter((n) => n.type === 'simulator')
+        .filter((n) => n.type === 'agentsim')
         .map((n) => n.id)
         .sort()
         .join('|'),
@@ -4843,7 +4843,7 @@ export function Canvas() {
       // Note edges are stored sticky→terminal and sim edges device→agent regardless of drag
       // direction, so styling and the link map can key off "the source is passive".
       const source =
-        (kind === 'note' && te.kind === 'sticky') || (kind === 'sim' && te.kind === 'simulator')
+        (kind === 'note' && te.kind === 'sticky') || (kind === 'sim' && te.kind === 'agentsim')
           ? c.target
           : c.source
       const target = source === c.source ? c.target : c.source
@@ -4908,7 +4908,7 @@ export function Canvas() {
       const nodeOf = (id: string) => nodesRef.current.find((n) => n.id === id)
       const passiveType = (id: string): boolean => {
         const t = nodeOf(id)?.type
-        return t === 'sticky' || t === 'simulator'
+        return t === 'sticky' || t === 'agentsim'
       }
       if (passiveType(link.source) || passiveType(link.target)) return
       e.preventDefault()
@@ -5104,8 +5104,8 @@ export function Canvas() {
     for (const e of linkEdges) {
       const s = types.get(e.source)
       const t = types.get(e.target)
-      if (s === 'simulator' && t === 'terminal') pairs.set(e.id, [e.target, e.source])
-      else if (t === 'simulator' && s === 'terminal') pairs.set(e.id, [e.source, e.target])
+      if (s === 'agentsim' && t === 'terminal') pairs.set(e.id, [e.target, e.source])
+      else if (t === 'agentsim' && s === 'terminal') pairs.set(e.id, [e.source, e.target])
     }
     const prev = simLinkPairsRef.current
     if (prev.project === renderedProjectId) {
@@ -6342,10 +6342,10 @@ export function Canvas() {
    * so adding one never boots, attaches or starts anything. The rows that reach here are disabled
    * with a reason where it cannot work (`simulatorUnavailable`), so this does not re-check.
    */
-  const addSimulator = useCallback(
+  const addAgentSim = useCallback(
     (center?: { x: number; y: number }, groupId?: string) => {
       setNodes((ns) => {
-        const node = createSimulatorNode(ns.length, center ?? emptyNodePos())
+        const node = createAgentSimNode(ns.length, center ?? emptyNodePos())
         return [...ns, groupId ? parentInto(node, groupId) : node]
       })
       markDirty()
@@ -10302,7 +10302,7 @@ export function Canvas() {
       // Same gate as the add rows: a refused chord falls through rather than being swallowed.
       'node.newSimulator': () => {
         if (simulatorUnavailable) return false
-        addSimulator()
+        addAgentSim()
         return true
       },
       'node.newFile': () => {
@@ -11026,7 +11026,7 @@ export function Canvas() {
       files: (at) => addFiles(at),
       run: (at) => void addRun(at),
       dino: (at) => addDino(at),
-      simulator: (at) => addSimulator(at),
+      agentsim: (at) => addAgentSim(at),
       trigger: (at) => addTrigger(at),
       openFile: (at) => void openFileDialog(at),
       newFile: (at) => void newProjectFile(at),
@@ -11042,7 +11042,7 @@ export function Canvas() {
       addWebView,
       addSticky,
       addDino,
-      addSimulator,
+      addAgentSim,
       addTrigger,
       openFileDialog,
       newProjectFile,
@@ -14571,14 +14571,14 @@ export function Canvas() {
               intoGroupId = g.id
             }
             const simDevice = args.udid ? { udid: args.udid, name: args['device-name'] } : undefined
-            let simNode = createSimulatorNode(nodeCount(), placeBelow(), simDevice)
+            let simNode = createAgentSimNode(nodeCount(), placeBelow(), simDevice)
             if (intoGroupId) simNode = parentInto(simNode, intoGroupId)
             const id = addAndConnect(simNode)
             // The device link: the caller's default `sim` target (planBridges 'sim'). Silent, like
             // every control-drawn link; the sim edge needs both ends in THIS project's lookup.
             const simLookup = (nid: string): LinkEndpoint | null =>
               nid === id
-                ? { kind: 'simulator', contextCapable: false }
+                ? { kind: 'agentsim', contextCapable: false }
                 : ctlLinkEndpointOf(nid)
             const linkedToCaller = ctlLinkEndpointOf(sourceNodeId)?.contextCapable === true
             if (linkedToCaller) bridgeTo(sourceNodeId, [id], simLookup)
@@ -18232,7 +18232,7 @@ export function Canvas() {
       // The palette has no disabled state, so an unavailable row is omitted (like New file…).
       ...(simulatorUnavailable
         ? []
-        : [{ id: 'new-simulator', label: 'New simulator / emulator', icon: <IconSimulator />, run: () => addSimulator() }]),
+        : [{ id: 'new-simulator', label: 'New simulator / emulator', icon: <IconSimulator />, run: () => addAgentSim() }]),
       { id: 'open-file', label: 'Open file…', icon: <IconEditor />, run: () => void openFileDialog() },
       // "New file…" needs a project folder to create into — hidden when the project has no cwd.
       ...(newFileHasCwd
@@ -18541,7 +18541,7 @@ export function Canvas() {
     addSticky,
     addRun,
     addDino,
-    addSimulator,
+    addAgentSim,
     simulatorUnavailable,
     addWebView,
     addBrowser,
@@ -19862,7 +19862,7 @@ export function Canvas() {
         onAddSticky={addSticky}
         onSpawnTeam={() => setSpawnTeamDialog({})}
         onAddDino={addDino}
-        onAddSimulator={addSimulator}
+        onAddAgentSim={addAgentSim}
         onAddTrigger={addTrigger}
         onAddFiles={() => addFiles()}
         onAddRun={() => void addRun()}

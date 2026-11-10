@@ -13,7 +13,7 @@ import {
   createStickyNode,
   createDinoNode,
   createFilesNode,
-  createSimulatorNode,
+  createAgentSimNode,
   createRunNode,
   isAccountLoginNode
 } from '@renderer/state/workspace'
@@ -204,8 +204,8 @@ function buildBase(snapshot: ReopenNodeSnapshot, ctx: RecreateContext): CanvasNo
     // here (registering a kind in neither this switch nor UNRESTORABLE is the trap the 'trigger'
     // and 'files' comments describe). The UDID crosses the same validator hydration uses; a node
     // with none reopens as an empty one that asks for a device.
-    case 'simulator':
-      return createSimulatorNode(0, undefined, d.simUdid ? { udid: d.simUdid, name: d.simName } : undefined)
+    case 'agentsim':
+      return createAgentSimNode(0, undefined, d.simUdid ? { udid: d.simUdid, name: d.simName } : undefined)
     case 'diff':
       return d.cwd && d.filePath ? createDiffNode(0, d.cwd, d.filePath, !!d.diffStaged, undefined, d.commitOid) : null
     case 'web':

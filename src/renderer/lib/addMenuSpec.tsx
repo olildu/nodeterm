@@ -64,7 +64,7 @@ export type AddItem =
   | { kind: 'sticky' }
   | { kind: 'files' } // requiresCwd
   | { kind: 'dino' }
-  | { kind: 'simulator' } // disabled unless the desktop app on macOS
+  | { kind: 'agentsim' } // disabled unless the desktop app on macOS
   | { kind: 'trigger' }
   | { kind: 'open-file' }
   | { kind: 'new-file' } // requiresCwd
@@ -87,7 +87,7 @@ export const CONTENT_ADD_ITEMS: readonly AddItem[] = [
   { kind: 'sticky' },
   { kind: 'files' },
   { kind: 'dino' },
-  { kind: 'simulator' },
+  { kind: 'agentsim' },
   { kind: 'trigger' },
   { kind: 'open-file' },
   { kind: 'new-file' },
@@ -128,7 +128,7 @@ export interface AddHandlers {
   files: (at?: AddPos) => void
   dino: (at?: AddPos) => void
   /** Adds a simulator node: an iOS Simulator or Android emulator of this host, drawn inside the canvas (desktop, macOS). */
-  simulator: (at?: AddPos) => void
+  agentsim: (at?: AddPos) => void
   /** Adds a trigger node (issue #493) — a canvas-owned schedule that fires into another node. */
   trigger: (at?: AddPos) => void
   openFile: (at?: AddPos) => void
@@ -221,13 +221,13 @@ export function contentAddItemsToMenuItems(
       case 'dino':
         out.push({ label: 'New dino game', icon: <IconDino />, onClick: () => handlers.dino(at) })
         break
-      case 'simulator':
+      case 'agentsim':
         out.push({
           label: 'New simulator / emulator',
           icon: <IconSimulator />,
           disabled: !!ctx.simulatorUnavailable,
           hint: ctx.simulatorUnavailable,
-          onClick: () => handlers.simulator(at)
+          onClick: () => handlers.agentsim(at)
         })
         break
       case 'trigger':
@@ -337,14 +337,14 @@ export function contentAddItemsToDockRows(
       case 'dino':
         out.push({ kind: 'dino', label: 'Dino Game', icon: <IconDino />, onClick: () => handlers.dino() })
         break
-      case 'simulator':
+      case 'agentsim':
         out.push({
-          kind: 'simulator',
+          kind: 'agentsim',
           label: 'Simulator / emulator',
           icon: <IconSimulator />,
           disabled: !!ctx.simulatorUnavailable,
           hint: ctx.simulatorUnavailable,
-          onClick: () => handlers.simulator()
+          onClick: () => handlers.agentsim()
         })
         break
       case 'trigger':
@@ -422,7 +422,7 @@ export const ADD_ITEM_GROUP: Record<AddItem['kind'], AddGroupId> = {
   sticky: 'view',
   files: 'view',
   dino: 'view',
-  simulator: 'view',
+  agentsim: 'view',
   'open-file': 'files',
   'new-file': 'files',
   'spawn-team': 'orchestrate',
