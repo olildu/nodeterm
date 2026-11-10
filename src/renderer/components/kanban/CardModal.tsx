@@ -10,12 +10,14 @@ import {
   IconMarkdown,
   IconMaximize,
   IconMic,
+  IconMore,
   IconRestoreSize,
   IconSearch,
   IconSmiley,
   IconTrash
 } from '../icons'
-import { ContextMenu } from '../ContextMenu'
+import { ContextMenu, type MenuItem } from '../ContextMenu'
+import { closeThen } from './closeThen'
 import { NodeIconView } from '../NodeIcon'
 import { nodeIconDialog } from '../NodeIconPicker'
 import { applyIconChoice } from '../../lib/nodeIconChoice'
@@ -30,11 +32,11 @@ import { isBrowserRuntime } from '@renderer/bridge/runtime'
 import { IssueRefChip } from '../IssueRefChip'
 import { TeamProgressChip } from '../TeamProgressChip'
 import { PortsChip } from '../PortsChip'
+import { QueuedLaunchChip } from './QueuedLaunchChip'
 import { useProjects } from '../../state/projects'
 import type { TeamStation } from '../../lib/teamProgress'
 import { sessionNameRepeatsTitle } from '../../lib/cardRedundancy'
 import type { IssueRef } from '@shared/github-issue-ref'
-import { useAgentStatus } from '../../state/agentStatus'
 import { useSessionNaming } from '../../state/sessionNaming'
 import { useCardPanel } from '../../state/cardPanel'
 import {
@@ -45,14 +47,16 @@ import {
   CARD_MODAL_MIN_W,
   CARD_MODAL_MIN_H
 } from '../../state/cardModalSize'
-import { useSession } from '../../session/session'
+import { useSession, useSessionStores } from '../../session/session'
 // The same wake trigger the canvas node's SLEEPING/PAUSED chip and mount/visibility auto-wakes
 // use — NOT a bespoke resume path, so a click here gets the same WakeInputBuffer protection and
 // retries. Importing one function out of the canvas node module is safe: TerminalNode.tsx already
 // imports from `components/kanban/*`, and none of those re-import CardModal.
 import { nodeUploadScope, wakeHibernatedNode } from '../../nodes/TerminalNode'
 import { StationFailedChip } from '../StationFailedChip'
-import { droppedPaths } from '../../terminal/file-drop'
+import { dropDialect, droppedPaths } from '../../terminal/file-drop'
+import { hostPlatformFor } from '../../terminal/host-platform'
+import { isWindowsPlatform } from '@shared/platform-utils'
 import { requestTerminalFocusOnExit } from '../../terminal/useMdModeFocus'
 import type { ProjectKanban } from '@shared/types'
 import type { KanbanSession } from './KanbanView'
@@ -85,9 +89,11 @@ const ChatPanel = lazy(() => import('../../nodes/ChatPanel').then((m) => ({ defa
 interface CardModalProps {
   session: KanbanSession
   /** The project whose board this card is on — the active one on the per-project board, the lane's
-   *  on the Omni board. The modal sits OUTSIDE that project's `SessionProvider` (`useSession()`
-   *  here is the app's local session), so anything that depends on which machine the node runs
-   *  on resolves through this id: the LIVE chip (R57) and the "Share live link" action (H4). */
+   *  on the Omni board. Both boards mount the modal under THAT project's session
+   *  (`ProjectSessionScope`: `sessionForProject(projectId)` + `OwningProjectContext`), so
+   *  `useSession()` here and in the terminal, chat and file views below is the core the node runs
+   *  on — a team tab's relay session, never this desktop's local one. The LIVE chip (R57) and the
+   *  "Share live link" action (H4) still resolve through this id. */
   projectId: string
   /** Owning project, supplied by the board (not necessarily the active project in Omni). */
   projectName?: string
@@ -134,14 +140,20 @@ interface CardModalProps {
    *  row uses, so the header ✦ and the menu row cannot disagree: it reports a failure, asks the
    *  card's OWN core, and drives the shared per-node naming spinner. */
   onAiName?: () => void
+  /** Session-management rows for the header ⋯ button (Canvas: `BOARD_MODAL_ACTION_IDS`). Called
+   *  each time the menu renders, so the rows are fresh; every runnable row closes the modal before
+   *  it acts (`closeThen`). Terminal cards only. Absent = no button. */
+  sessionActions?: () => MenuItem[]
+  /** ▶ on the header's QUEUED chip (the card's held launch). Absent = chip without ▶. */
+  onRunQueued?: () => void
 }
 
 /** Trello-style card popup over the board. Scrim click / Esc close it; the board (and the
  *  canvas under it) stay mounted. Terminal cards carry the node header's actions too:
  *  search / dictate / AI-name / the ⌘M view — ChatPanel or the output markdown, the same face the
  *  canvas node shows (the node itself is hidden under the board). */
-export function CardModal({ session, projectId, projectName, projectColor, columnTitle, board, onChangeBoard, onClose, portsProjectId, onOpenCanvas, onRename, onEditSticky, onBrowserNav, onSetIcon, onOpenIssue, mentionables, team, onTravel, initialView, onSetColor, onDelete, onAiName }: CardModalProps) {
-  const { api } = useSession()
+export function CardModal({ session, projectId, projectName, projectColor, columnTitle, board, onChangeBoard, onClose, portsProjectId, onOpenCanvas, onRename, onEditSticky, onBrowserNav, onSetIcon, onOpenIssue, mentionables, team, onTravel, initialView, onSetColor, onDelete, onAiName, sessionActions, onRunQueued }: CardModalProps) {
+  const { api, source: coreSource } = useSession()
   // The header slot decides "icon or smiley" on the NORMALIZED value, the answer NodeIconView
   // itself gives — on the raw one, an invalid stored icon drew an empty, un-muted slot.
   const sessionIcon = normalizeNodeIcon(session.icon)
@@ -166,21 +178,25 @@ export function CardModal({ session, projectId, projectName, projectColor, colum
   // Sticky body: rendered markdown until clicked, the plain textarea while editing (mirrors
   // StickyNode's toggle, so the canvas and the card can't disagree about how a note reads).
   const [editingNote, setEditingNote] = useState(false)
-  const agentSessionId = useAgentStatus((st) => st.byId[session.id]?.sessionId)
-  const observedAgentId = useAgentStatus((st) => st.byId[session.id]?.agentId)
-  const paused = useAgentStatus((st) => !!st.byId[session.id]?.paused)
-  const dropped = useAgentStatus((st) => !!st.byId[session.id]?.dropped)
-  const hibernated = useAgentStatus((st) => !!st.byId[session.id]?.hibernated)
-  const wakeBlocked = useAgentStatus((st) => st.byId[session.id]?.wakeBlocked)
+  // The agent status of the session this card's PROJECT runs under (the board mounts the modal
+  // through `ProjectSessionScope`): a team tab's card reads its relay session's store, never the
+  // default one, which holds the handed-off SSH project's entry under the same node id.
+  const agentStatusStore = useSessionStores().agentStatus.store
+  const agentSessionId = agentStatusStore((st) => st.byId[session.id]?.sessionId)
+  const observedAgentId = agentStatusStore((st) => st.byId[session.id]?.agentId)
+  const paused = agentStatusStore((st) => !!st.byId[session.id]?.paused)
+  const dropped = agentStatusStore((st) => !!st.byId[session.id]?.dropped)
+  const hibernated = agentStatusStore((st) => !!st.byId[session.id]?.hibernated)
+  const wakeBlocked = agentStatusStore((st) => st.byId[session.id]?.wakeBlocked)
   // Same chip as the card and the canvas node header — the modal is where a user checks WHICH
   // session this is, so the account belongs in its header chips, not only two views away.
-  const observedAccount = useAgentStatus((st) => st.byId[session.id]?.account)
+  const observedAccount = agentStatusStore((st) => st.byId[session.id]?.account)
   // The session name, where it is not already the title (lib/cardRedundancy — the rule the card
   // and the canvas node header use). The card carries it on its detail line; the modal, which
   // hides the node, carries it here so the session's name is never two views away.
-  const sessionName = useAgentStatus((st) => st.byId[session.id]?.session)
+  const sessionName = agentStatusStore((st) => st.byId[session.id]?.session)
   const portsRemote = useProjects((s) => !!(portsProjectId && s.getProject(portsProjectId)?.ssh))
-  const accountChip = useAccountChip(session.spawn.accountId, observedAccount)
+  const accountChip = useAccountChip(session.spawn.accountId, observedAccount, agentStatusStore)
   const [naming, setNaming] = useState(false)
   // The board funnel's progress for this node (`onAiName`), shared with the card menu's row.
   const funnelNaming = useSessionNaming((st) => !!st.byId[session.id])
@@ -189,11 +205,19 @@ export function CardModal({ session, projectId, projectName, projectColor, colum
   // would recolor the card the modal moved TO, not the one the menu was opened for.
   const [colorMenu, setColorMenu] = useState<{ x: number; y: number; id: string } | null>(null)
   const colorMenuOpen = colorMenu !== null && colorMenu.id === session.id
+  // The header ⋯ session-actions menu, keyed by node id for the same reason as the swatches: rows
+  // opened for one card must never act on the card a J/K step moved to.
+  const [actionsMenu, setActionsMenu] = useState<{ x: number; y: number; id: string } | null>(null)
+  const actionsMenuOpen = actionsMenu !== null && actionsMenu.id === session.id
   // Comments & activity panel: OPEN by default in the modal; the header 💬 collapses it. The
   // choice is remembered (localStorage) — once collapsed, later cards open collapsed too.
   const panelOpen = useCardPanel((s) => s.open)
   const togglePanel = useCardPanel((s) => s.toggle)
   const isTerminal = session.kind === 'terminal'
+  // Built every render so the rows are always current. A card with no session rows (a plain shell,
+  // an agent we cannot quit and resume) gets NO button: an empty menu would be a dead click.
+  const sessionRows = isTerminal && sessionActions ? sessionActions() : []
+  const hasSessionRows = sessionRows.some((r) => r.type !== 'separator')
   const isBrowser = session.kind === 'browser'
 
   // ── The ⌘M view (board parity with the canvas node's markdown / chat face) ─────────────────
@@ -342,6 +366,16 @@ export function CardModal({ session, projectId, projectName, projectColor, colum
   useEffect(() => {
     colorMenuOpenRef.current = colorMenuOpen
   }, [colorMenuOpen])
+  // A J/K step drops both header menus. Keying them by id hides them on the next card, but without
+  // this a step back to the card they were opened for would show them again.
+  useEffect(() => {
+    setColorMenu(null)
+    setActionsMenu(null)
+  }, [session.id])
+  const actionsMenuOpenRef = useRef(false)
+  useEffect(() => {
+    actionsMenuOpenRef.current = actionsMenuOpen
+  }, [actionsMenuOpen])
   // Ref mirrors: the capture-phase listener below closes over stale state otherwise.
   const editingTitleRef = useRef(false)
   useEffect(() => {
@@ -370,6 +404,13 @@ export function CardModal({ session, projectId, projectName, projectColor, colum
         e.preventDefault()
         e.stopPropagation()
         setColorMenu(null)
+        return
+      }
+      // …and so does the ⋯ session-actions menu.
+      if (actionsMenuOpenRef.current) {
+        e.preventDefault()
+        e.stopPropagation()
+        setActionsMenu(null)
         return
       }
       // A rename in progress owns Esc first (cancel the edit, not the modal).
@@ -488,7 +529,10 @@ export function CardModal({ session, projectId, projectName, projectColor, colum
             <span className="kanban-modal__column" title={columnTitle ?? 'Ungrouped'}>{columnTitle ?? 'Ungrouped'}</span>
           </div>
           {isTerminal && onOpenIssue && <IssueRefChip issueRef={session.issueRef} onOpen={onOpenIssue} />}
-          {isTerminal && team && team.length > 0 && onTravel && <TeamProgressChip stations={team} onTravel={onTravel} />}
+          {isTerminal && team && team.length > 0 && onTravel && <TeamProgressChip stations={team} onTravel={onTravel} statusStore={agentStatusStore} />}
+          {isTerminal && session.pendingLaunch && (
+            <QueuedLaunchChip nodeId={session.id} pending={session.pendingLaunch} firstOpen={session.launchFirstOpen} onRun={onRunQueued} />
+          )}
           {/* The same Ports chip as the canvas node header. Opening a port places the browser node
               beside this node ON THE CANVAS, so the modal hands over to the canvas to show it. */}
           {isTerminal && portsProjectId && (
@@ -625,6 +669,20 @@ export function CardModal({ session, projectId, projectName, projectColor, colum
               >
                 <IconBroadcast />
               </button>
+              {hasSessionRows && (
+                <button
+                  className="kanban-modal__action"
+                  data-action="session-actions"
+                  title="Session actions"
+                  aria-label="Session actions"
+                  onClick={(e) => {
+                    const r = e.currentTarget.getBoundingClientRect()
+                    setActionsMenu({ x: r.left, y: r.bottom, id: session.id })
+                  }}
+                >
+                  <IconMore />
+                </button>
+              )}
             </>
           )}
           {onSetColor && (
@@ -683,6 +741,15 @@ export function CardModal({ session, projectId, projectName, projectColor, colum
             zIndex={65}
             items={[{ type: 'colors', onPick: onSetColor }]}
             onClose={() => setColorMenu(null)}
+          />
+        )}
+        {actionsMenu && actionsMenuOpen && hasSessionRows && (
+          <ContextMenu
+            x={actionsMenu.x}
+            y={actionsMenu.y}
+            zIndex={65}
+            items={closeThen(sessionRows, onClose)}
+            onClose={() => setActionsMenu(null)}
           />
         )}
         <CardMetaBar nodeId={session.id} board={board} onChange={onChangeBoard} />
@@ -778,10 +845,18 @@ export function CardModal({ session, projectId, projectName, projectColor, colum
                             agentId={createdAgent!}
                             // Same resolution as a drop onto this card's live viewer (ModalTerminal):
                             // an SSH node uploads over the master its PTY runs on.
-                            pathsForFiles={(files) =>
+                            // The composer feeds the agent CLI, so a Windows core gets quoted paths.
+                            pathsForFiles={async (files) =>
                               droppedPaths(files, {
                                 sshRemoteTmux: !!session.spawn.sshRemoteTmux,
-                                projectId: session.spawn.sshRemoteTmux ? nodeUploadScope(session.spawn.ssh) : ''
+                                projectId: session.spawn.sshRemoteTmux ? nodeUploadScope(session.spawn.ssh) : '',
+                                dialect: dropDialect({
+                                  corePlatform: await hostPlatformFor(api),
+                                  remote: !!session.spawn.sshRemoteTmux || !!session.spawn.ssh,
+                                  agentPane: true,
+                                  localDesktop: coreSource === 'local' && !isBrowserRuntime(),
+                                  viewerWindows: isWindowsPlatform()
+                                })
                               })
                             }
                             sshProjectId={session.spawn.sshRemoteTmux ? nodeUploadScope(session.spawn.ssh) : undefined}

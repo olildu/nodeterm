@@ -5,6 +5,12 @@ import type { CodexAccount } from '@shared/codex-account'
 import { E_UNSUPPORTED } from '@shared/rpc'
 import { sshHostKey } from '@shared/ssh'
 import { useAgentStatus } from '../../../state/agentStatus'
+import { transport } from '../../../terminal/local-transport'
+import {
+  activeCanvasAccountMover,
+  otherProjectSessions,
+  removalBlockedText
+} from '../../../lib/accountRemoval'
 import { useSettings } from '../../../state/settings'
 import { useSystemAccount } from '../../../state/systemAccount'
 import { useSystemCodexAccount } from '../../../state/systemCodexAccount'
@@ -414,6 +420,9 @@ function SkillSharingRow({
   )
 }
 
+/** How long removal waits after ending other projects' local sessions before deleting the dir. */
+const LOCAL_KILL_SETTLE_MS = 1500
+
 /** Counts nodes bound to an account across every project's SERIALIZED nodes. The active
  *  project's live React Flow edits since the last commit aren't reflected here, so the count
  *  can be slightly stale for the active canvas — acceptable for a confirmation warning. */
@@ -726,9 +735,81 @@ export function AccountsSection({ isActive }: { isActive: boolean }): React.JSX.
     }
   }
 
+  /**
+   * Move every Claude session on `account` onto the system account before its dir is deleted (see
+   * lib/accountRemoval.ts). Returns the refusal line, or null once nothing runs under it any more.
+   * Busy sessions refuse the removal up front, before anything is touched.
+   */
+  const moveSessionsOffAccount = async (account: ClaudeAccount): Promise<string | null> => {
+    const mover = activeCanvasAccountMover()
+    const live = mover?.sessions(account.id, account.host) ?? { ready: [], busy: [] }
+    const { projects, activeProjectId } = useProjects.getState()
+    const byId = useAgentStatus.getState().byId
+    const others = otherProjectSessions({
+      accountId: account.id,
+      accountHost: account.host,
+      activeProjectId,
+      projects: projects.map((p) => ({
+        id: p.id,
+        hostKey: p.ssh ? sshHostKey(p.ssh.server) : undefined,
+        nodes: p.nodes
+          .filter((n) => !n.kind || n.kind === 'terminal')
+          .map((n) => ({
+            id: n.id,
+            agentId: n.agentId,
+            accountId: n.accountId,
+            login: isAccountLoginNode(n)
+          }))
+      })),
+      stateOf: (id) => byId[id]?.state,
+      sessionIdOf: (id) =>
+        byId[id]?.sessionId ||
+        projects.flatMap((p) => p.nodes).find((n) => n.id === id)?.agentSessionId ||
+        undefined
+    })
+    const busy = removalBlockedText(account.label, live.busy.length + others.busy.length, 0)
+    if (busy) return busy
+    const projectId = account.host ? connectedProjectIdForHost(account.host) : undefined
+    const ctx = projectId ? { projectId } : undefined
+    // Other projects first: copying is the only step that can fail there, and it changes nothing.
+    for (const o of others.ready) {
+      if (!o.sessionId) continue
+      const copy = await window.nodeTerminal.claudeAccounts
+        .copySession(o.sessionId, account.id, undefined, ctx)
+        .catch(() => ({ ok: false as const }))
+      if (!copy.ok) return removalBlockedText(account.label, 0, 1)
+    }
+    const stuck = mover && live.ready.length ? await mover.moveToSystem(account.id, live.ready, ctx) : []
+    if (stuck.length) return removalBlockedText(account.label, 0, stuck.length)
+    // End the other projects' tmux sessions: their next open cold-starts under the system account
+    // (the store update in confirmRemove clears their accountId) and auto-resumes the copy.
+    const otherIds = others.ready.map((o) => o.nodeId)
+    if (otherIds.length) {
+      if (projectId) {
+        await window.nodeTerminal.sshProject.killSessions(projectId, otherIds).catch(() => {})
+      } else {
+        for (const id of otherIds) transport.recycle(id)
+        // Fire-and-forget kills: let the old CLIs go before the dir is deleted, or one still alive
+        // writes its files straight back into it.
+        await new Promise((r) => setTimeout(r, LOCAL_KILL_SETTLE_MS))
+      }
+    }
+    return null
+  }
+
   const confirmRemove = async (account: ClaudeAccount): Promise<void> => {
     setPendingRemove(null)
     setRemoveError(null)
+    // Only a removal that DELETES the dir needs the move: a linked folder and a remote account on a
+    // disconnected host are only forgotten, and their sessions keep running unharmed.
+    const deletes = !account.configDir && (!account.host || !!connectedProjectIdForHost(account.host))
+    if (deletes && !account.pending) {
+      const blocked = await moveSessionsOffAccount(account)
+      if (blocked) {
+        setRemoveError(blocked)
+        return
+      }
+    }
     try {
       // Removing a pending account: stop the 5-minute waitLogin poll loop first.
       if (account.pending) await window.nodeTerminal.claudeAccounts.cancelWaitLogin(account.id)
@@ -777,9 +858,9 @@ export function AccountsSection({ isActive }: { isActive: boolean }): React.JSX.
     if (a.host && !connectedProjectIdForHost(a.host)) {
       return `Remove account "${a.label}"? ${a.host} is not connected, so nodeterm only forgets it — its login and transcripts stay on that host. ${fallout}`
     }
-    return `Remove account "${a.label}"? Its logged-in credentials and all its Claude transcripts${
+    return `Remove account "${a.label}"? Its logged-in credentials and Claude transcripts${
       a.host ? ` on ${a.host}` : ''
-    } will be deleted. ${fallout}`
+    } will be deleted. Its running Claude sessions move to the system account first and resume there. ${fallout}`
   }
 
   // ── Codex ────────────────────────────────────────────────────────────────────────────────────

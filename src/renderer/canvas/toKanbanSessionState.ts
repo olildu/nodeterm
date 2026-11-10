@@ -63,6 +63,7 @@ export function toKanbanSessionState(n: CanvasNodeState): KanbanSession | null {
     color: n.color ?? SYSTEM_NODE_COLORS[0],
     kind: 'terminal',
     agentId: n.agentId,
+    ...(n.pendingLaunch ? { pendingLaunch: n.pendingLaunch } : {}),
     spawn
   }
 }

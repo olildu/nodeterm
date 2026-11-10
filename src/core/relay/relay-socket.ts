@@ -31,6 +31,7 @@
 // production passes a `ws` WebSocket wrapped via `wrapWebSocket`.
 
 import {
+  canonicalB64ToBytes,
   decrypt,
   deriveSessionKey,
   deriveSharedKey,
@@ -148,10 +149,13 @@ type HandshakeControl =
 function nonceToB64(n: Uint8Array): string {
   return Buffer.from(n).toString('base64')
 }
+// Canonical base64 only (e2ee.ts canonicalB64ToBytes): a nonce with junk around it is not a nonce.
 function nonceFromB64(b64: unknown): Uint8Array | null {
-  if (typeof b64 !== 'string') return null
-  const n = Uint8Array.from(Buffer.from(b64, 'base64'))
-  return n.length === 16 ? n : null
+  try {
+    return canonicalB64ToBytes(b64, 16, 'session nonce')
+  } catch {
+    return null
+  }
 }
 
 type State = 'connecting' | 'handshaking' | 'ready' | 'closed'
@@ -163,6 +167,11 @@ export function connectRelay(opts: ConnectRelayOptions): RelaySocket {
   if (opts.role === 'client' && !opts.theirPubB64) {
     throw new Error('connectRelay: client role requires theirPubB64 (the host public key)')
   }
+  // A client derives its identity key from the PINNED host key before anything is opened: a key
+  // that is not canonical base64, or is a low-order point (WeakPeerKeyError — a public-constant
+  // shared secret), throws HERE, so no socket is dialed for a session that could never be private.
+  const clientBaseKey =
+    opts.role === 'client' ? deriveSharedKey(opts.theirPubB64!, opts.ourKeys.secretKey) : null
 
   let transport: RelayTransport | null = null
   // baseKey = the stable ECDH precompute (for the SAS, which represents the pinned identity).
@@ -233,7 +242,7 @@ export function connectRelay(opts: ConnectRelayOptions): RelaySocket {
     if (opts.role === 'client') {
       // Client knows the host pubkey: derive the base (identity) key now and greet with our
       // session nonce. The traffic key is derived once the host's nonce arrives in e2ee_ready.
-      baseKey = deriveSharedKey(opts.theirPubB64!, opts.ourKeys.secretKey)
+      baseKey = clientBaseKey
       sendControl({
         type: 'e2ee_hello',
         publicKeyB64: publicKeyToB64(opts.ourKeys.publicKey),
@@ -376,8 +385,23 @@ export function connectRelay(opts: ConnectRelayOptions): RelaySocket {
       if (typeof control.publicKeyB64 !== 'string' || !clientNonce || !ourNonce) {
         return
       }
+      // Refuse a key that is not canonical base64 or is a LOW-ORDER point (WeakPeerKeyError): with
+      // the latter the shared secret is a public constant — a secret-less peer would complete the
+      // handshake, both humans would read the same fixed SAS, and anyone on the wire could derive
+      // the session key. FAIL CLOSED: no key is learned or bound (peerPubB64 is set only after a
+      // successful derive, so nothing can pin or auto-approve the refused key), no `e2ee_ready` is
+      // sent, and the transport is closed so the caller's onClose runs its usual teardown. Never a
+      // throw here: this runs inside the WebSocket's synchronous message emit.
+      let derived: Uint8Array
+      try {
+        derived = deriveSharedKey(control.publicKeyB64, opts.ourKeys.secretKey)
+      } catch (err) {
+        console.warn(`[relay] refused a peer handshake key: ${err instanceof Error ? err.message : String(err)}`)
+        transport?.close()
+        return
+      }
       peerPubB64 = control.publicKeyB64
-      baseKey = deriveSharedKey(control.publicKeyB64, opts.ourKeys.secretKey)
+      baseKey = derived
       // salt = hostNonce ‖ clientNonce (host's nonce first, both roles agree on the order).
       sessionKey = deriveSessionKey(baseKey, ourNonce, clientNonce)
       sendControl({ type: 'e2ee_ready', nonceB64: nonceToB64(ourNonce) })

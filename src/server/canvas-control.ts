@@ -7,6 +7,7 @@ import {
   deliverStationNotice,
   messagingEnabledVia,
   onMessagingAgentEvent,
+  ptyPaneProbeDeps,
   restoreDeliveryQueue,
   type AgentMessagingDeps
 } from '../core/agents/agent-messaging'
@@ -28,6 +29,7 @@ import {
 } from '../core/agent-status-mirror'
 import type { BoardLogHandlers } from '../core/board-log-handlers'
 import { buildControlShimScript } from '../core/canvas-control-core'
+import { syncWindowsShLauncher } from '../core/agents/hooks/install-helper'
 import { codexIdentityCaps } from '../core/codex-identity-caps'
 import { codexThreadIdentityRoot } from '../core/codex-identity-proxy'
 import { claudeCliCaps, type ClaudeCliCaps } from '../core/claude-cli'
@@ -109,6 +111,9 @@ function writeShim(): void {
   } catch {
     /* best effort on filesystems without POSIX modes */
   }
+  // The `.cmd` launcher the skill names on a Windows host (skillsFor picks that dialect from this
+  // core's platform); a no-op removal on the Linux hosts the Server Edition targets.
+  syncWindowsShLauncher(dir, 'nodeterm.sh')
   // Same upgrade sweep as desktop: the POSIX shim replaced this Electron-as-Node script.
   try {
     fs.rmSync(path.join(dir, 'canvas-control-cli.mjs'), { force: true })
@@ -212,7 +217,7 @@ export async function initServerCanvasControl(
   factoryRef = factory
 
   const messaging: AgentMessagingDeps = {
-    paneOwner: (nodeId) => deps.ptyManager.paneOwner(nodeId),
+    ...ptyPaneProbeDeps(deps.ptyManager),
     // Server delivery has no renderer/xterm echo stream. Capture the headless pane instead and
     // separate paste from Enter so a fresh TUI cannot swallow the first submit keystroke.
     sendEnvelope: (nodeId, envelope) =>
@@ -255,17 +260,23 @@ export async function initServerCanvasControl(
   // station), and the canvas leg is the board log plus a push to every attached browser tab.
   // DROPPED arrives only from a browser tab that shows the node (its liveness check); a server with
   // no tab attached reports errored and long-blocked stations only.
-  const stationNotices = new StationNoticeMonitor({
-    now: () => Date.now(),
-    recipientFor: (stationNodeId) =>
+  // Shared with `report-outcome --notify-opener` (#1356): same recipient, same delivery.
+  const opener = {
+    recipientFor: (stationNodeId: string) =>
       stationRecipientFromOwner(
         deps.workspaceStore.persistedCanvases(),
         stationNodeId,
         factory.openerOf(stationNodeId)
       ),
+    deliver: (notice: Parameters<typeof deliverStationNotice>[0]) =>
+      deliverStationNotice(notice, messaging)
+  }
+  const stationNotices = new StationNoticeMonitor({
+    now: () => Date.now(),
+    recipientFor: opener.recipientFor,
     pendingQuestionOf: (nodeId) => mirrorEntry(nodeId)?.pendingQuestion?.toolUseId,
     appendBoardLog: (projectId, entry) => deps.boardLog.append(projectId, entry),
-    deliver: (notice) => deliverStationNotice(notice, messaging),
+    deliver: opener.deliver,
     publish: (views) => platform().broadcast(IPC.stationNoticeChanged, views),
     exists: (nodeId) => deps.workspaceStore.projectIdsForNode(nodeId).length > 0
   })
@@ -300,7 +311,8 @@ export async function initServerCanvasControl(
             return ids.length === 1 ? ids[0] : undefined
           },
           appendBoardLog: (projectId, entry) => deps.boardLog.append(projectId, entry),
-          onRecorded: () => void factory.refreshArmed()
+          onRecorded: () => void factory.refreshArmed(),
+          opener
         }
       ),
     // The board's GitHub lane, read-only, from the GitHub service's cache — the same core module the

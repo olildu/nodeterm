@@ -68,7 +68,9 @@ vi.mock('child_process', () => {
     const cb = (typeof a === 'function' ? a : b) as Cb | undefined
     const ok = (stdout: string): void => cb?.(null, { stdout, stderr: '' })
     if (args.includes('has-session')) {
-      const target = args[args.indexOf('-t') + 1]
+      // Production asks with the EXACT form (`=nt-…` / `=nt-…:`); tmux matches it against the name.
+      const raw = args[args.indexOf('-t') + 1]
+      const target = raw.startsWith('=') ? raw.slice(1).replace(/:$/, '') : raw
       if (liveTmuxSessions.has(target)) ok('')
       else cb?.(Object.assign(new Error('no such session'), { code: 1 }))
     } else if (args[0] === '-ilc') {
@@ -146,7 +148,7 @@ const ALICE = 1
 const BOB = 2
 
 /** `ls\n` as the wire sees it: hex bytes, because a control-mode command is one text line. */
-const LS_KEYS = (target: string): string => `send-keys -t ${target} -H 6c 73 0a\n`
+const LS_KEYS = (target: string): string => `send-keys -t =${target}: -H 6c 73 0a\n`
 
 /**
  * A machine with pty devices to spare, always.
@@ -226,7 +228,7 @@ describe('background writes into released sessions', () => {
     '-C',
     'attach-session',
     '-t',
-    sessionName(key)
+    `=${sessionName(key)}`
   ]
 
   it('types into a released session over a control client — no pty, exact send-keys line', async () => {

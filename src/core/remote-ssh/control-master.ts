@@ -14,6 +14,7 @@ import {
   TMUX_SOCKET,
   assertPasteTarget,
   assertPasteBuffer,
+  exactPaneTarget,
   pasteBufferName,
   type PasteDelivery
 } from '../tmux-naming'
@@ -342,11 +343,16 @@ export function remoteTmuxPasteArgs(
 ): string[] {
   assertPasteTarget(sessionId, buffer)
   const tmux = `tmux -L ${RMT_TMUX_SOCKET}`
+  // EXACT target (`exactPaneTarget`): a bare name prefix-matches a longer session on a miss.
+  // Quoted for the remote shell where it is a word of its own (zsh expands a leading `=`); inside
+  // the single-quoted `if-shell` body tmux's own lexer reads it.
+  const pane = exactPaneTarget(sessionId)
+  const t = posixQuote(pane)
   let cmd =
     `${tmux} load-buffer -b ${buffer} - ';' ` +
-    `if-shell -F -t ${sessionId} '#{pane_in_mode}' 'send-keys -t ${sessionId} -X cancel' ';' ` +
-    `paste-buffer -d -p -r -b ${buffer} -t ${sessionId}`
-  if (enter) cmd += ` ';' send-keys -t ${sessionId} Enter`
+    `if-shell -F -t ${t} '#{pane_in_mode}' 'send-keys -t ${pane} -X cancel' ';' ` +
+    `paste-buffer -d -p -r -b ${buffer} -t ${t}`
+  if (enter) cmd += ` ';' send-keys -t ${t} Enter`
   return childArgs(conn, controlPath, tmuxCmd(cmd))
 }
 
@@ -400,7 +406,11 @@ export function remoteTmuxEnterArgs(
   sessionId: string
 ): string[] {
   assertPasteTarget(sessionId)
-  return childArgs(conn, controlPath, tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} send-keys -t ${sessionId} Enter`))
+  return childArgs(
+    conn,
+    controlPath,
+    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} send-keys -t ${posixQuote(exactPaneTarget(sessionId))} Enter`)
+  )
 }
 
 /** `delete-buffer` on the REMOTE server — the sweep for a remote paste that never ran. */
@@ -514,7 +524,8 @@ export function remoteTmuxKillArgs(
   sessionId: string,
   socket: string = RMT_TMUX_SOCKET
 ): string[] {
-  return childArgs(conn, controlPath, tmuxCmd(`tmux -L ${socket} kill-session -t ${exactTarget(sessionId)}`))
+  // Quoted: on a zsh login shell an unquoted word starting with `=` is a command-path lookup.
+  return childArgs(conn, controlPath, tmuxCmd(`tmux -L ${socket} kill-session -t ${posixQuote(exactTarget(sessionId))}`))
 }
 
 /**
@@ -538,7 +549,7 @@ export function remoteCapturePaneArgs(conn: SshConnection, controlPath: string, 
   return childArgs(
     conn,
     controlPath,
-    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} capture-pane -p -e -t ${sessionId} -S ${full ? '-' : '-200'}`)
+    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} capture-pane -p -e -t ${posixQuote(exactPaneTarget(sessionId))} -S ${full ? '-' : '-200'}`)
   )
 }
 /**
@@ -649,7 +660,27 @@ export function remotePaneCommandArgs(conn: SshConnection, controlPath: string, 
   return childArgs(
     conn,
     controlPath,
-    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${sessionId} '#{pane_current_command}'`)
+    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${posixQuote(exactPaneTarget(sessionId))} '#{pane_current_command}'`)
+  )
+}
+
+/**
+ * One closed-set key into a remote pane (`PtyManager.sendKeys`, the phone's relay `agent.key`).
+ * `keyArgs` comes from `relay-keys.tmuxKeyArgs` — a digit 1–9 after `-l`, or a fixed key name —
+ * and is re-checked here before it lands on a remote command line.
+ */
+export function remoteSendKeyArgs(
+  conn: SshConnection,
+  controlPath: string,
+  sessionId: string,
+  keyArgs: readonly string[]
+): string[] {
+  const safe = keyArgs.every((a) => /^(-l|[1-9]|Escape|Enter|Right)$/.test(a))
+  if (!safe || !/^[A-Za-z0-9._-]+$/.test(sessionId)) throw new Error('unsafe remote send-keys')
+  return childArgs(
+    conn,
+    controlPath,
+    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} send-keys -t ${posixQuote(exactPaneTarget(sessionId))} ${keyArgs.join(' ')}`)
   )
 }
 
@@ -658,7 +689,7 @@ export function remotePaneCwdArgs(conn: SshConnection, controlPath: string, sess
   return childArgs(
     conn,
     controlPath,
-    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${sessionId} '#{pane_current_path}'`)
+    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${posixQuote(exactPaneTarget(sessionId))} '#{pane_current_path}'`)
   )
 }
 
@@ -671,7 +702,7 @@ export function remotePaneProcessArgs(
   return childArgs(
     conn,
     controlPath,
-    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${sessionId} '#{pane_pid}|#{pane_current_command}'`)
+    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${posixQuote(exactPaneTarget(sessionId))} '#{pane_pid}|#{pane_current_command}'`)
   )
 }
 
@@ -738,7 +769,7 @@ export function remotePaneOwnerCombinedArgs(
   assertPasteTarget(sessionId)
   const ps = PS_FOREGROUND_FLAGS.join(' ')
   const script =
-    `o=$(${tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${sessionId} '${PANE_OWNER_FMT}'`)}) || exit 9; ` +
+    `o=$(${tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${posixQuote(exactPaneTarget(sessionId))} '${PANE_OWNER_FMT}'`)}) || exit 9; ` +
     `printf '%s\\n' "${COMBINED_PANE_MARKER.trimEnd()} $o"; ` +
     'tty=${o#*|}; tty=${tty%%|*}; ' +
     `case "$tty" in /dev/*) ps ${ps} -t "$tty" 2>/dev/null || : ;; esac`
@@ -769,7 +800,7 @@ export function remotePaneCursorArgs(
   return childArgs(
     conn,
     controlPath,
-    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${sessionId} '#{cursor_x} #{cursor_y} #{cursor_flag}'`)
+    tmuxCmd(`tmux -L ${RMT_TMUX_SOCKET} display-message -p -t ${posixQuote(exactPaneTarget(sessionId))} '#{cursor_x} #{cursor_y} #{cursor_flag}'`)
   )
 }
 export function tmuxProbeArgs(conn: SshConnection, controlPath: string): string[] {
@@ -847,6 +878,27 @@ export function hookForwardArgs(conn: SshConnection, controlPath: string, remote
 }
 export function hookForwardCancelArgs(conn: SshConnection, controlPath: string, remoteSock: string, hookPort: number): string[] {
   return ['-O', 'cancel', '-R', fwdSpec(remoteSock, hookPort), '-o', `ControlPath=${controlPath}`, ...portArgs(conn), target(conn)]
+}
+/**
+ * The loopback-TCP twin of `hookForwardArgs`: `-R 127.0.0.1:<remotePort>:127.0.0.1:<hookPort>`.
+ *
+ * Used ONLY as a fallback when the unix-socket forward binds but fails verification. Field case:
+ * Tailscale SSH. `tailscaled` serves the session as root and creates the `-R` stream-local socket
+ * owned by root with mode 0600, so the login user's `curl --unix-socket` can never connect and the
+ * project silently runs without hooks (no status badges, no session names, no canvas control). A
+ * loopback TCP listener carries no file ownership, and every generated client already speaks the
+ * `NODETERM_HOOK_PORT` transport. Bound to 127.0.0.1 explicitly so it is never exposed off-host.
+ */
+function tcpFwdSpec(remotePort: number, hookPort: number): string {
+  const okPort = (n: number): boolean => Number.isInteger(n) && n >= 1 && n <= 65535
+  if (!okPort(remotePort) || !okPort(hookPort)) throw new Error('invalid forward spec')
+  return `127.0.0.1:${remotePort}:127.0.0.1:${hookPort}`
+}
+export function hookTcpForwardArgs(conn: SshConnection, controlPath: string, remotePort: number, hookPort: number): string[] {
+  return ['-O', 'forward', '-R', tcpFwdSpec(remotePort, hookPort), '-o', `ControlPath=${controlPath}`, ...portArgs(conn), target(conn)]
+}
+export function hookTcpForwardCancelArgs(conn: SshConnection, controlPath: string, remotePort: number, hookPort: number): string[] {
+  return ['-O', 'cancel', '-R', tcpFwdSpec(remotePort, hookPort), '-o', `ControlPath=${controlPath}`, ...portArgs(conn), target(conn)]
 }
 /**
  * A dev-server LOCAL forward over the existing master (`ssh -O forward -L`): this machine's
@@ -929,6 +981,25 @@ export function remoteEndpointFileContents(
     `NODETERM_HOOK_VERSION=${posixQuote(version)}\n` +
     // The REMOTE token dir ($HOME/.nodeterm/node-tokens on the host), not ours. The host stores
     // per-node tokens only; it never holds a secret and can never mint.
+    `NODETERM_NODE_TOKEN_DIR=${posixQuote(tokenDir)}\n`
+  )
+}
+/**
+ * Endpoint file for the loopback-TCP fallback tunnel (`hookTcpForwardArgs`). `NODETERM_HOOK_SOCK` is
+ * written EMPTY on purpose: every client tries the socket first (`[ -n "$NODETERM_HOOK_SOCK" ]`), so
+ * a socket path inherited from a session env or an earlier endpoint must not shadow the port.
+ */
+export function remoteTcpEndpointFileContents(
+  remotePort: number,
+  token: string,
+  version: string,
+  tokenDir: string
+): string {
+  return (
+    `NODETERM_HOOK_SOCK=''\n` +
+    `NODETERM_HOOK_PORT=${posixQuote(String(remotePort))}\n` +
+    `NODETERM_HOOK_TOKEN=${posixQuote(token)}\n` +
+    `NODETERM_HOOK_VERSION=${posixQuote(version)}\n` +
     `NODETERM_NODE_TOKEN_DIR=${posixQuote(tokenDir)}\n`
   )
 }

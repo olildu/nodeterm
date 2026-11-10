@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import http from 'http'
 import fs from 'fs'
 import os from 'os'
@@ -6,9 +6,9 @@ import path from 'path'
 import WebSocket from 'ws'
 import { Auth } from './auth'
 import { ServerPlatform } from './platform-server'
-import { attachWsServer, WS_MAX_PAYLOAD } from './ws'
+import { attachWsServer, WS_MAX_PAYLOAD, WS_CLOSE_SIGNED_OUT } from './ws'
 import { SESSION_COOKIE } from './http'
-import { parseTrustedNets } from './proxy-trust'
+import { parseTrustedNets, PROXY_SECRET_HEADER } from './proxy-trust'
 import { initPlatform, resetPlatformForTests } from '../core/platform'
 import { presenceHub } from '../core/presence/hub'
 import { IPC } from '../shared/ipc'
@@ -201,14 +201,15 @@ describe('ws endpoint', () => {
     expect(gone).toEqual([1]) // the uiId this socket attached as
   })
 
-  it('proxy header trust: upgrade allowed via trusted header, still origin-checked', async () => {
+  it('proxy header trust: upgrade allowed via trusted header + secret, still origin-checked (S2)', async () => {
     const HDR = 'Tailscale-User-Login'
-    const mk = async (netsSpec: string): Promise<{ srv: http.Server; p: number }> => {
+    const SECRET = 'w'.repeat(40)
+    const mk = async (netsSpec: string, secret?: string): Promise<{ srv: http.Server; p: number }> => {
       const srv = http.createServer((_q, s2) => { s2.statusCode = 404; s2.end() })
       attachWsServer(srv, {
         platform,
         auth,
-        trustProxy: { header: HDR, nets: parseTrustedNets(netsSpec) }
+        trustProxy: { header: HDR, nets: parseTrustedNets(netsSpec), ...(secret ? { secret } : {}) }
       })
       await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r))
       return { srv, p: (srv.address() as { port: number }).port }
@@ -221,28 +222,143 @@ describe('ws endpoint', () => {
         ws.on('error', reject)
       })
 
-    const { srv, p: pTrusted } = await mk('127.0.0.0/8')
-    const { srv: srvFar, p: pFar } = await mk('10.0.0.0/8')
+    const { srv, p: pTrusted } = await mk('127.0.0.0/8', SECRET)
+    const { srv: srvBare, p: pBare } = await mk('127.0.0.0/8')
+    const { srv: srvFar, p: pFar } = await mk('10.0.0.0/8', SECRET)
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     try {
-      // No cookie, trusted peer + header → accepted (same-host Origin passes the origin check).
-      const ok = await dial(pTrusted, { [HDR]: 'dev@corp', origin: `http://127.0.0.1:${pTrusted}` })
+      const sec = { [PROXY_SECRET_HEADER]: SECRET }
+      // No cookie, trusted peer + header + secret → accepted (same-host Origin passes the origin check).
+      const ok = await dial(pTrusted, { ...sec, [HDR]: 'dev@corp', origin: `http://127.0.0.1:${pTrusted}` })
       expect(ok.readyState).toBe(WebSocket.OPEN)
+      // S2, the audit's repro: a local process with the header and no secret → was accepted as OWNER.
+      await expect(dial(pTrusted, { [HDR]: 'x' })).rejects.toThrow()
+      await expect(dial(pTrusted, { [HDR]: 'x', [PROXY_SECRET_HEADER]: 'nope' })).rejects.toThrow()
+      await expect(dial(pBare, { [HDR]: 'x' })).rejects.toThrow()
       // Cross-site Origin is still rejected even when proxy-authed.
       await expect(
-        dial(pTrusted, { [HDR]: 'dev@corp', origin: 'https://evil.example.com' })
+        dial(pTrusted, { ...sec, [HDR]: 'dev@corp', origin: 'https://evil.example.com' })
       ).rejects.toThrow()
       // Header without cookie from a peer outside the trusted nets → rejected.
-      await expect(dial(pFar, { [HDR]: 'dev@corp' })).rejects.toThrow()
+      await expect(dial(pFar, { ...sec, [HDR]: 'dev@corp' })).rejects.toThrow()
       // Cookie still works on a trust-enabled server.
       const viaCookie = await dial(pFar, { cookie })
       expect(viaCookie.readyState).toBe(WebSocket.OPEN)
+      expect(warn.mock.calls.flat().join(' ')).not.toContain('nope')
       for (const ws of sockets) ws.terminate()
       sockets = []
       await until(() => presenceHub.peers().length === 0, 'trust-test peers drain')
     } finally {
+      warn.mockRestore()
       await new Promise((r) => srv.close(r))
+      await new Promise((r) => srvBare.close(r))
       await new Promise((r) => srvFar.close(r))
     }
+  }, 30_000)
+
+  it('NODETERM_PUBLIC_ORIGIN: an Origin equal to it passes even when the proxy rewrote Host', async () => {
+    const srv = http.createServer((_q, s2) => { s2.statusCode = 404; s2.end() })
+    attachWsServer(srv, { platform, auth, publicOrigin: 'https://term.example.com' })
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r))
+    const p2 = (srv.address() as { port: number }).port
+    const dial = (headers: Record<string, string>): Promise<WebSocket> =>
+      new Promise((resolve, reject) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${p2}/ws`, { headers })
+        sockets.push(ws)
+        ws.on('open', () => resolve(ws))
+        ws.on('error', reject)
+      })
+    try {
+      const ok = await dial({ cookie, origin: 'https://term.example.com' })
+      expect(ok.readyState).toBe(WebSocket.OPEN)
+      await expect(dial({ cookie, origin: 'https://evil.example.com' })).rejects.toThrow()
+      for (const ws of sockets) ws.terminate()
+      sockets = []
+      await until(() => presenceHub.peers().length === 0, 'public-origin peers drain')
+    } finally {
+      await new Promise((r) => srv.close(r))
+    }
+  }, 30_000)
+
+  // S3: an open WebSocket was authenticated once, at upgrade, and never again.
+  describe('signing out closes the sockets riding on that session (S3)', () => {
+    const closeCode = (ws: WebSocket): Promise<number> =>
+      new Promise((resolve) => ws.on('close', (code) => resolve(code)))
+
+    it('/auth/logout of one session closes exactly its sockets, and nothing it sends after reaches dispatch', async () => {
+      const casts: unknown[] = []
+      platform.on('fire', (v: unknown) => casts.push(v))
+      const other = `${SESSION_COOKIE}=${auth.createSession()}`
+      const mine = await connect({ cookie })
+      const theirs = await connect({ cookie: other })
+      const closed = closeCode(mine)
+      auth.revokeSession(cookie.split('=')[1])
+      mine.send(JSON.stringify({ t: 'cast', method: 'fire', args: ['after-revoke'] }))
+      expect(await closed).toBe(WS_CLOSE_SIGNED_OUT)
+      expect(casts).toEqual([])
+      expect(theirs.readyState).toBe(WebSocket.OPEN)
+      // And it cannot come back with the same cookie.
+      await expect(connect({ cookie })).rejects.toThrow()
+    }, 30_000)
+
+    it('sign out everywhere closes every cookie socket; a proxy-authenticated one stays (its identity is the proxy)', async () => {
+      const SECRET = 'v'.repeat(40)
+      const HDR = 'X-Forwarded-User'
+      const srv = http.createServer((_q, s2) => { s2.statusCode = 404; s2.end() })
+      attachWsServer(srv, {
+        platform,
+        auth,
+        trustProxy: { header: HDR, nets: parseTrustedNets('127.0.0.0/8'), secret: SECRET }
+      })
+      await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r))
+      const p2 = (srv.address() as { port: number }).port
+      try {
+        const viaProxy = await new Promise<WebSocket>((resolve, reject) => {
+          // It carries a cookie too: the socket is bound to the proxy's identity, not to that cookie.
+          const ws = new WebSocket(`ws://127.0.0.1:${p2}/ws`, {
+            headers: { [HDR]: 'dev', [PROXY_SECRET_HEADER]: SECRET, cookie: `${SESSION_COOKIE}=${auth.createSession()}` }
+          })
+          sockets.push(ws)
+          ws.on('open', () => resolve(ws))
+          ws.on('error', reject)
+        })
+        const a = await connect({ cookie })
+        const b = await connect({ cookie: `${SESSION_COOKIE}=${auth.createSession()}` })
+        const codes = Promise.all([closeCode(a), closeCode(b)])
+        auth.revokeAll()
+        expect(await codes).toEqual([WS_CLOSE_SIGNED_OUT, WS_CLOSE_SIGNED_OUT])
+        expect(viaProxy.readyState).toBe(WebSocket.OPEN)
+        for (const ws of sockets) ws.terminate()
+        sockets = []
+        await until(() => presenceHub.peers().length === 0, 'peers drain')
+      } finally {
+        await new Promise((r) => srv.close(r))
+      }
+    }, 30_000)
+
+    it('a session that EXPIRES is noticed by the heartbeat (expiry announces nothing)', async () => {
+      const hbServer = http.createServer((_q, s) => { s.statusCode = 404; s.end() })
+      attachWsServer(hbServer, { platform, auth, heartbeatMs: 50 })
+      await new Promise<void>((r) => hbServer.listen(0, '127.0.0.1', r))
+      const hbPort = (hbServer.address() as { port: number }).port
+      try {
+        const ws = new WebSocket(`ws://127.0.0.1:${hbPort}/ws`, { headers: { cookie } })
+        sockets.push(ws)
+        await new Promise<void>((res, rej) => {
+          ws.on('open', () => res())
+          ws.on('error', rej)
+        })
+        const closed = closeCode(ws)
+        // Only Date moves: the heartbeat's real timer keeps running.
+        vi.useFakeTimers({ toFake: ['Date'] })
+        vi.setSystemTime(Date.now() + 31 * 24 * 60 * 60 * 1000)
+        expect(await closed).toBe(WS_CLOSE_SIGNED_OUT)
+      } finally {
+        vi.useRealTimers()
+        await until(() => presenceHub.peers().length === 0, 'expired peer drains')
+        await new Promise((r) => hbServer.close(r))
+      }
+    }, 30_000)
   })
 
   it('heartbeat: terminates a socket that never answers a ping, dropping its presence peer', async () => {

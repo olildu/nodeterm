@@ -39,6 +39,7 @@ import {
 import { assembleLaunchCommand } from '../shared/agents/launch'
 import type { AgentState, NormalizedAgentEvent } from '../shared/agents/normalize'
 import { oneLine } from '../shared/one-line'
+import { rootPositionWith } from '../shared/root-position'
 import { RUN_NOW_AFTER_REFUSAL, runNowRequested } from '../shared/control-verbs'
 import {
   RUN_NOW_AFTER_SUCCESS_REFUSAL,
@@ -69,6 +70,13 @@ import type {
   Settings,
   Workspace
 } from '../shared/types'
+import {
+  NODE_SIZE_MAX,
+  STICKY_NODE_MIN_SIZE,
+  STICKY_NODE_SIZE,
+  TERMINAL_NODE_SIZE_MIN,
+  resolveDefaultNodeSize
+} from '../shared/default-node-size'
 
 export interface ServerControlReply {
   ok: boolean
@@ -235,7 +243,6 @@ const AGENT_LIMIT = 5
 const TERMINAL_COLS = 120
 const TERMINAL_ROWS = 36
 const TERMINAL_SIZE = { width: 640, height: 440 }
-const STICKY_SIZE = { width: 240, height: 200 }
 const H_GAP = 80
 const V_GAP = 36
 const GROUP_PAD = 28
@@ -267,8 +274,8 @@ function terminalSize(
     return Math.min(max, Math.max(min, n))
   }
   const fallback = {
-    width: clamp(settings.defaultNodeWidth, 280, 2400, TERMINAL_SIZE.width),
-    height: clamp(settings.defaultNodeHeight, 160, 1600, TERMINAL_SIZE.height)
+    width: clamp(settings.defaultNodeWidth, TERMINAL_NODE_SIZE_MIN.width, NODE_SIZE_MAX.width, TERMINAL_SIZE.width),
+    height: clamp(settings.defaultNodeHeight, TERMINAL_NODE_SIZE_MIN.height, NODE_SIZE_MAX.height, TERMINAL_SIZE.height)
   }
   if (resolveNewNodeSize(settings.newNodeSize) !== 'matchLargest') return fallback
   // A persisted size is already the expanded one for a collapsed node; a maximized node counts at
@@ -278,8 +285,8 @@ function terminalSize(
   )
   if (!largest) return fallback
   return {
-    width: clamp(largest.width, 280, 2400, fallback.width),
-    height: clamp(largest.height, 160, 1600, fallback.height)
+    width: clamp(largest.width, TERMINAL_NODE_SIZE_MIN.width, NODE_SIZE_MAX.width, fallback.width),
+    height: clamp(largest.height, TERMINAL_NODE_SIZE_MIN.height, NODE_SIZE_MAX.height, fallback.height)
   }
 }
 
@@ -316,32 +323,16 @@ function sourceCanControl(
   return !!agentId && canControlCanvas(agentId)
 }
 
-function absolutePosition(project: Project, node: CanvasNodeState): { x: number; y: number } {
-  let x = node.position.x
-  let y = node.position.y
-  let parent = node.parentId
-  const seen = new Set<string>()
-  while (parent && !seen.has(parent)) {
-    seen.add(parent)
-    const p = project.nodes.find((candidate) => candidate.id === parent)
-    if (!p) break
-    x += p.position.x
-    y += p.position.y
-    parent = p.parentId
-  }
-  return { x, y }
-}
-
 function placeRight(
   project: Project,
   source: CanvasNodeState,
   size: { width: number; height: number },
   reserved: readonly CanvasNodeState[] = []
 ): { x: number; y: number } {
-  const origin = absolutePosition(project, source)
+  const origin = rootPosition(project.nodes, source)
   const sourceWidth = source.size?.width || TERMINAL_SIZE.width
   const occupied = [...project.nodes, ...reserved].map((node) => {
-    const position = absolutePosition(project, node)
+    const position = rootPosition(project.nodes, node)
     return {
       x: position.x,
       y: position.y,
@@ -599,19 +590,7 @@ function rootPosition(
   node: CanvasNodeState
 ): { x: number; y: number } {
   const byId = new Map(nodes.map((candidate) => [candidate.id, candidate]))
-  const seen = new Set<string>([node.id])
-  let x = node.position.x
-  let y = node.position.y
-  let parentId = node.parentId
-  while (parentId && !seen.has(parentId)) {
-    seen.add(parentId)
-    const parent = byId.get(parentId)
-    if (!parent) break
-    x += parent.position.x
-    y += parent.position.y
-    parentId = parent.parentId
-  }
-  return { x, y }
+  return rootPositionWith(node, (id) => byId.get(id))
 }
 
 /** Desktop `ungroupNodes` semantics over persisted nodes: direct children move up one level. */
@@ -1817,11 +1796,16 @@ export class HeadlessNodeFactory {
       if ('id' in resolved) node = source.project.nodes.find((candidate) => candidate.id === resolved.id)
       else if (parsed.create) {
         created = true
+        const stickySize = resolveDefaultNodeSize(
+          this.deps.settings().defaultNodeSizes?.sticky,
+          STICKY_NODE_SIZE,
+          STICKY_NODE_MIN_SIZE
+        )
         node = {
           id: nextId('sticky'),
           kind: 'sticky',
-          position: placeRight(source.project, source.node, STICKY_SIZE),
-          size: { ...STICKY_SIZE },
+          position: placeRight(source.project, source.node, stickySize),
+          size: stickySize,
           title: oneLine(parsed.ref) || 'Note',
           color: '#ffd60a',
           group: null,

@@ -117,6 +117,15 @@ export interface DeliveryDeps {
   /** Kernel truth about the target's pane. Unbounded by contract — this module bounds it. */
   paneOwner(nodeId: string): Promise<PaneOwner | null>
   /**
+   * How long THIS target's pane read may take before it is abandoned as unreadable. Optional:
+   * absent ⇒ `PANE_PROBE_TIMEOUT_MS`, i.e. byte-identical to before this existed.
+   *
+   * It is per TARGET, not global, because the backends differ by an order of magnitude and the 2s
+   * default encodes an ssh-specific hazard (see `WINDOWS_PANE_PROBE_TIMEOUT_MS`). A Windows
+   * session-host pane is read by enumerating the process table and simply cannot answer in 2s.
+   */
+  paneProbeTimeoutMs?(nodeId: string): number
+  /**
    * Did the target's pane request bracketed paste? UNIMPLEMENTED — nothing wires this yet, and
    * `PtyManager.bracketPasteRequested` (which read `#{bracket_paste_flag}`, a tmux-3.7+ format) was
    * deleted when `sendText` stopped needing to ask. See the long note at the refusal that uses it.
@@ -128,9 +137,10 @@ export interface DeliveryDeps {
    * must carry no ESC byte of ours, because tmux ≥ 3.7 passes paste-buffer content through vis(3),
    * which renders an embedded frame as literal `^[` text (issue #453). Resolves false only when
    * the envelope did not reach the pane; a post-paste submit failure remains eligible for the
-   * receipt watch's honest `stalled` outcome.
+   * receipt watch's honest `stalled` outcome. `'dialog'`: nothing was written because the agent's
+   * own dialog owns the keyboard (`PtyManager.sendEnvelope`, Cursor).
    */
-  sendEnvelope(nodeId: string, envelope: string, expected?: PaneOwner): Promise<boolean>
+  sendEnvelope(nodeId: string, envelope: string, expected?: PaneOwner): Promise<boolean | 'dialog'>
   /** The target's status mirror entry — gate 2's whole input. */
   mirrorEntry(nodeId: string): MirrorEntry | undefined
   /** `nodeTokenFilePresent(nodeId)`. */
@@ -380,7 +390,8 @@ export async function deliverAgentMessage(
     // ssh-controlmaster-fallback). This module probes AT MOST TWICE per delivery and never loops;
     // any caller that wants to retry an `unknown` needs backoff plus a per-target cap BEFORE its
     // second attempt, not after the incident.
-    const before = await probeWithin(() => deps.paneOwner(req.targetNodeId), PANE_PROBE_TIMEOUT_MS)
+    const probeMs = deps.paneProbeTimeoutMs?.(req.targetNodeId) ?? PANE_PROBE_TIMEOUT_MS
+    const before = await probeWithin(() => deps.paneOwner(req.targetNodeId), probeMs)
     const verdict = isAgentPane(before, req.targetAgentId, req.targetBinaries)
     const facts: DeliveryFacts = {
       notPermitted: req.notPermitted,
@@ -461,6 +472,12 @@ export async function deliverAgentMessage(
     // demonstrably landed. See `watchForReceipt`: that miss is what makes an LLM send it twice.
     const watch = watchForReceipt(req.targetNodeId, deps.subscribeEvents)
     const wrote = await deps.sendEnvelope(req.targetNodeId, payload, owner)
+    // A dialog owned the keyboard and nothing was written: the pane waits on a person, which the
+    // idle gate already reports as `targetBusy` / `blocked` (retryable, queued when queueing is on).
+    if (wrote === 'dialog') {
+      watch.cancel()
+      return refuse({ kind: 'targetBusy', state: 'blocked' })
+    }
     // The pane went away between the gate and the write. Not a failure of ours and not retryable:
     // the node is gone. It IS traced: a `sendEnvelope` that fails after a partial write has left
     // bytes in somebody's pane, and that must not be the one event with no record.
@@ -473,7 +490,7 @@ export async function deliverAgentMessage(
     // stranger's shell. The post-check CANNOT un-send the bytes; the residual window is unchanged.
     // What it buys is that the sender is TOLD and the trace records it, and that
     // `deliveredToReplacedTarget` is never reported as success.
-    const after = await probeWithin(() => deps.paneOwner(req.targetNodeId), PANE_PROBE_TIMEOUT_MS)
+    const after = await probeWithin(() => deps.paneOwner(req.targetNodeId), probeMs)
     if (!samePane(owner, after, req.targetAgentId, req.targetBinaries)) {
       watch.cancel()
       const t = await trace('deliveredToReplacedTarget')

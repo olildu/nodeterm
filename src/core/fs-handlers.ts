@@ -4,6 +4,7 @@ import type { CorePlatform } from './platform'
 import * as fsOps from './fs-ops'
 import { saveUpload } from './uploads'
 import { saveCanvasImage } from './canvas-images'
+import { readWhiteboard, saveWhiteboard, type WhiteboardLocation } from './whiteboards'
 import { clearAlertSound, readAlertSound, saveAlertSound } from './alert-sounds'
 import type { AlertSoundKind } from '../shared/alert-sound'
 import { IPC } from '../shared/ipc'
@@ -50,9 +51,21 @@ export function registerFsHandlers(
      * the durable app-local fallback, which is a coherent degrade, not a failure.
      */
     localProjectCwd?: (projectId: string) => string | undefined
+    /**
+     * Where a project's whiteboards go (`WorkspaceStore.whiteboardLocationForProject`), derived the
+     * same way from this shell's own index. Not `localProjectCwd`: a folder project kept in app data
+     * keeps its boards in its own app-data root rather than in the app's shared folder, where two
+     * projects holding the same committed canvas — the same node ids — would share boards. Absent ⇒
+     * `localProjectCwd`'s folder.
+     */
+    whiteboardLocation?: (projectId: string) => Omit<WhiteboardLocation, 'userDataDir'>
   } = {}
 ): void {
   const home = expandHomePath
+  const boardLocation = (projectId: string): WhiteboardLocation => ({
+    ...(deps.whiteboardLocation ? deps.whiteboardLocation(projectId) : { projectCwd: deps.localProjectCwd?.(projectId) }),
+    userDataDir: platform.userDataDir
+  })
   platform.handle(IPC.fsList, (dirPath: string) => fsOps.listDir(home(dirPath)))
   platform.handle(IPC.fsRead, (filePath: string) => fsOps.readText(home(filePath)))
   platform.handle(IPC.fsReadBinary, (filePath: string) => fsOps.readBinary(home(filePath)))
@@ -78,6 +91,20 @@ export function registerFsHandlers(
         name,
         dataBase64
       })
+  )
+  // A whiteboard's scene + picture: beside project.json when the project has a local cwd (in its
+  // app-data root when its canvas is kept there), else in this core's data dir. Addressed by node id
+  // only — see core/whiteboards.ts for why a path is never accepted.
+  // `expectedRev` is the compare-and-set revision (see `saveWhiteboard`): a stale one is refused.
+  platform.handle(
+    IPC.filesSaveWhiteboard,
+    (projectId: string, nodeId: string, scene: string, thumbnailBase64?: string, expectedRev?: string | null) =>
+      saveWhiteboard(boardLocation(projectId), nodeId, scene, thumbnailBase64, expectedRev)
+  )
+  platform.handle(
+    IPC.filesReadWhiteboard,
+    (projectId: string, nodeId: string, sourceId?: string, withScene?: boolean) =>
+      readWhiteboard(boardLocation(projectId), nodeId, sourceId, withScene !== false)
   )
   // Custom alert sounds (issue #289): bytes in, a FIXED per-kind file under this core's data dir
   // out. Reads and deletes take only a kind, so no caller can aim them at another file. See

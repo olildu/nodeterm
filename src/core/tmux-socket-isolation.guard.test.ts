@@ -105,6 +105,11 @@ const REAL_SOCKET_ALLOWED = new Map<string, string>([
     'PtyManager binds TMUX_SOCKET itself, so the verb can only be measured on that name'
   ],
   [
+    'src/core/pty-exact-target.realtmux.test.ts',
+    'drives a real PtyManager (which binds TMUX_SOCKET itself) to prove every node-keyed verb uses an ' +
+      'exact target; its own per-run unique nt-sxt<pid>… sessions, killed by exact target, never the server'
+  ],
+  [
     'test/server/canvas-control-boot-e2e.test.ts',
     'boots a real Server Edition, whose PtyManager binds TMUX_SOCKET itself: the assertion is that ' +
       'boot spawns NOTHING, and only that socket can answer it. Reads with has-session and kills ' +

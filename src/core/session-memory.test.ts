@@ -419,6 +419,36 @@ describe('collectSessionMemory on darwin', () => {
       expect((rows as { selfMb: number }[])[0].selfMb).toBe(Math.round(200000 / 1024))
     })
   )
+
+  it(
+    'the "nodeterm itself" group reuses that SAME top read — footprint for a covered pid, nothing for a missed one',
+    asDarwin(async () => {
+      const calls: string[] = []
+      const r = await collectSessionMemory({
+        tmuxBin: () => '/usr/bin/tmux',
+        sockets: ['s1'],
+        exec: async (bin) => {
+          calls.push(bin)
+          if (bin.includes('tmux')) return 'nt-a|4242|claude\n'
+          // 900 = the GPU helper: rss 120 MB. 901 = a renderer top did not list.
+          if (bin === 'ps') return 'PID PPID RSS\n4242 1 100000\n900 1 122880\n901 1 307200\n'
+          return 'PID    MEM  \n4242   200000K\n900    1600M\n'
+        },
+        readTable: undefined,
+        readMem: () => null,
+        appProcesses: () => [
+          { pid: 900, type: 'GPU' },
+          { pid: 901, type: 'Tab' }
+        ]
+      })
+      // ONE top for the whole panel, sessions and app together (~0.5 s each, measured).
+      expect(calls.filter((c) => c === 'top')).toHaveLength(1)
+      expect(r.app?.groups).toEqual([
+        { kind: 'gpu', count: 1, mb: 1600 },
+        { kind: 'renderer', count: 1 }
+      ])
+    })
+  )
 })
 
 import { parseMemInfoText, parsePsiMemory, readMemInfo } from './session-memory'
@@ -445,7 +475,9 @@ describe('parseMemInfoText', () => {
       availableMb: 13481,
       totalMb: 64158,
       swapTotalMb: 8192,
-      swapFreeMb: 2141
+      swapFreeMb: 2141,
+      // The pill's copy of the same instant, in the display-only object the reaper never reads.
+      display: { swapUsedMb: 8192 - 2141, swapTotalMb: 8192 }
     })
   })
 
@@ -518,5 +550,187 @@ describe('readMemInfo on this Linux host (integration)', () => {
     const m = readMemInfo()
     expect(m).not.toBeNull()
     if (m!.psiFullAvg60 !== undefined) expect(m!.psiFullAvg60).toBeGreaterThanOrEqual(0)
+  })
+})
+
+import {
+  appProcessKind,
+  appSelfMemory,
+  parsePressureLevel,
+  parseSwapUsage,
+  type AppProcessSample
+} from './session-memory'
+
+/** Captured live on a Mac, 2026-10-19 (`sysctl vm.swapusage`). */
+const SWAPUSAGE = 'vm.swapusage: total = 9216.00M  used = 7853.62M  free = 1362.38M  (encrypted)\n'
+
+describe('parseSwapUsage (darwin)', () => {
+  it('reads used and total from the live string, prefixed or not', () => {
+    expect(parseSwapUsage(SWAPUSAGE)).toEqual({ swapUsedMb: 7854, swapTotalMb: 9216 })
+    expect(parseSwapUsage(SWAPUSAGE.replace('vm.swapusage: ', ''))).toEqual({ swapUsedMb: 7854, swapTotalMb: 9216 })
+  })
+
+  it('accepts K and G, and passes a real zero through', () => {
+    expect(parseSwapUsage('total = 2.00G  used = 512.00K  free = 1.99G')).toEqual({ swapUsedMb: 1, swapTotalMb: 2048 })
+    expect(parseSwapUsage('total = 0.00M  used = 0.00M  free = 0.00M')).toEqual({ swapUsedMb: 0, swapTotalMb: 0 })
+  })
+
+  it('an unknown unit or a missing half yields NOTHING, never a guessed scale or a zero', () => {
+    expect(parseSwapUsage('total = 9216.00T  used = 1.00M  free = 1.00M')).toEqual({})
+    expect(parseSwapUsage('total = 9216.00M  free = 1.00M')).toEqual({})
+    expect(parseSwapUsage('')).toEqual({})
+  })
+})
+
+describe('parsePressureLevel (darwin)', () => {
+  it('maps xnu levels 1/2/4 and nothing else', () => {
+    expect(parsePressureLevel('1')).toBe('normal')
+    expect(parsePressureLevel('kern.memorystatus_vm_pressure_level: 2\n')).toBe('warn')
+    expect(parsePressureLevel('4')).toBe('critical')
+    for (const junk of ['0', '3', '12', '', 'unknown oid', 'kern.memorystatus_vm_pressure_level: 21'])
+      expect(parsePressureLevel(junk)).toBeUndefined()
+  })
+})
+
+describe('darwinMemInfo display extras', () => {
+  /** One `sysctl <names…>` run: the known oids print their `name: value` lines, in order; an
+   *  unknown one makes the run exit non-zero, which the caller hands over as the partial stdout
+   *  (`readMemInfo`'s runner) — so here a run with no known oid at all throws. */
+  const sysctl = (answers: Record<string, string>) => (names: string[]): string => {
+    const lines = names.filter((n) => answers[n] !== undefined).map((n) => answers[n])
+    if (lines.length === 0) throw new Error(`unknown oid ${names.join(' ')}`)
+    return lines.join('\n') + '\n'
+  }
+
+  it('reads swap and pressure in ONE sysctl run, never one per field', () => {
+    const runs: string[][] = []
+    const both = sysctl({
+      'vm.swapusage': SWAPUSAGE.trimEnd(),
+      'kern.memorystatus_vm_pressure_level': 'kern.memorystatus_vm_pressure_level: 4'
+    })
+    const m = darwinMemInfo(() => VM_STAT, TOTAL_BYTES, (names) => {
+      runs.push(names)
+      return both(names)
+    })
+    expect(runs).toEqual([['vm.swapusage', 'kern.memorystatus_vm_pressure_level']])
+    expect(m?.display).toEqual({ swapUsedMb: 7854, swapTotalMb: 9216, pressureLevel: 'critical' })
+  })
+
+  it('the one run answers each field from its own line, in either order', () => {
+    const reversed = (): string =>
+      'kern.memorystatus_vm_pressure_level: 1\n' + SWAPUSAGE
+    expect(darwinMemInfo(() => VM_STAT, TOTAL_BYTES, reversed)?.display).toEqual({
+      swapUsedMb: 7854,
+      swapTotalMb: 9216,
+      pressureLevel: 'normal'
+    })
+  })
+
+  it('adds swap and pressure under `display` and NEVER fills the reaper pair', () => {
+    const m = darwinMemInfo(() => VM_STAT, TOTAL_BYTES, sysctl({
+      'vm.swapusage': SWAPUSAGE.trimEnd(),
+      'kern.memorystatus_vm_pressure_level': 'kern.memorystatus_vm_pressure_level: 2'
+    }))
+    expect(m).toEqual({
+      availableMb: 8951,
+      totalMb: 24576,
+      display: { swapUsedMb: 7854, swapTotalMb: 9216, pressureLevel: 'warn' }
+    })
+    // The reaper's Linux swap term reads these; on this Mac (16% free) it would fire all day.
+    expect(m).not.toHaveProperty('swapTotalMb')
+    expect(m).not.toHaveProperty('swapFreeMb')
+  })
+
+  it('a failed sysctl omits only its own field; both failing leaves the vm_stat reading untouched', () => {
+    const swapOnly = darwinMemInfo(() => VM_STAT, TOTAL_BYTES, sysctl({ 'vm.swapusage': SWAPUSAGE.trimEnd() }))
+    expect(swapOnly?.display).toEqual({ swapUsedMb: 7854, swapTotalMb: 9216 })
+    const none = darwinMemInfo(() => VM_STAT, TOTAL_BYTES, sysctl({}))
+    expect(none).toEqual({ availableMb: 8951, totalMb: 24576 })
+    // vm_stat failing still wins: no reading at all, never a display-only one.
+    expect(darwinMemInfo(() => { throw new Error('no vm_stat') }, TOTAL_BYTES, sysctl({ 'vm.swapusage': SWAPUSAGE.trimEnd() }))).toBeNull()
+  })
+
+  it.skipIf(process.platform !== 'darwin')('reads this Mac\'s real swap and pressure (darwin-only: sysctl oids)', () => {
+    const m = readMemInfo()
+    expect(m).not.toBeNull()
+    expect(m).not.toHaveProperty('swapTotalMb')
+    expect(typeof m?.display?.swapTotalMb).toBe('number')
+    expect(['normal', 'warn', 'critical']).toContain(m?.display?.pressureLevel)
+  })
+})
+
+describe('appSelfMemory — "nodeterm itself"', () => {
+  const S = (pid: number, type: string, cpuSeconds?: number): AppProcessSample => ({
+    pid,
+    type,
+    ...(cpuSeconds !== undefined ? { cpuSeconds } : {})
+  })
+  // The live shape: GPU footprint 1.6 GB while its rss was ~120 MB; two renderers (canvas + HUD).
+  const SAMPLES = [S(10, 'Browser', 60), S(11, 'GPU', 3600), S(12, 'Tab', 900), S(13, 'Tab', 5), S(14, 'Utility', 2)]
+  const FP = (pid: number, kb: number) => ({ pid, ppid: 1, rssKb: kb, footprint: true as const })
+  const TABLE = [FP(10, 180 * 1024), FP(11, 1600 * 1024), FP(12, 300 * 1024), FP(13, 40 * 1024), FP(14, 20 * 1024)]
+
+  it('folds Electron types into gpu / renderer / main / helper, GPU first', () => {
+    expect(['Browser', 'Tab', 'GPU', 'Utility', 'Zygote'].map(appProcessKind)).toEqual(['main', 'renderer', 'gpu', 'helper', 'helper'])
+    const r = appSelfMemory(SAMPLES, TABLE, 'darwin')
+    expect(r).toEqual({
+      ok: true,
+      groups: [
+        { kind: 'gpu', count: 1, mb: 1600, cpuSeconds: 3600 },
+        { kind: 'renderer', count: 2, mb: 340, cpuSeconds: 905 },
+        { kind: 'main', count: 1, mb: 180, cpuSeconds: 60 },
+        { kind: 'helper', count: 1, mb: 20, cpuSeconds: 2 }
+      ],
+      totalMb: 2140
+    })
+  })
+
+  it('darwin: a pid top did not cover keeps NO figure — its rss is the blind number this replaces', () => {
+    const table = TABLE.map((e) => (e.pid === 11 ? { pid: 11, ppid: 1, rssKb: 120 * 1024 } : e))
+    const r = appSelfMemory(SAMPLES, table, 'darwin')
+    expect(r.ok).toBe(true)
+    expect(r.groups.find((g) => g.kind === 'gpu')).toEqual({ kind: 'gpu', count: 1, cpuSeconds: 3600 })
+    // No total over a missing GPU: it would understate by the very 1.5 GB at issue.
+    expect(r).not.toHaveProperty('totalMb')
+    // Linux / Windows read the table's own accounting (VmRSS / working set) — same as the rows.
+    expect(appSelfMemory(SAMPLES, table, 'linux').groups[0]).toMatchObject({ kind: 'gpu', mb: 120 })
+  })
+
+  it('a group with one missing pid has no partial sum', () => {
+    const r = appSelfMemory(SAMPLES, TABLE.filter((e) => e.pid !== 13), 'darwin')
+    expect(r.groups.find((g) => g.kind === 'renderer')).toEqual({ kind: 'renderer', count: 2, cpuSeconds: 905 })
+  })
+
+  it('CPU time is omitted, not zeroed, when Electron did not report it', () => {
+    const r = appSelfMemory([S(10, 'Browser'), S(11, 'GPU', 7)], TABLE, 'darwin')
+    expect(r.groups).toEqual([
+      { kind: 'gpu', count: 1, mb: 1600, cpuSeconds: 7 },
+      { kind: 'main', count: 1, mb: 180 }
+    ])
+  })
+
+  it('ok:false — never an empty ok group — when nothing could be measured', () => {
+    expect(appSelfMemory(null, TABLE, 'darwin')).toEqual({ ok: false, groups: [] })
+    expect(appSelfMemory([], TABLE, 'darwin')).toEqual({ ok: false, groups: [] })
+    expect(appSelfMemory(SAMPLES, null, 'darwin')).toEqual({ ok: false, groups: [] })
+    expect(appSelfMemory(SAMPLES, [], 'linux')).toEqual({ ok: false, groups: [] })
+  })
+
+  it('rides on the tmux sweep\'s own table, and a throwing reader is not-measured', async () => {
+    const base = {
+      tmuxBin: () => '/usr/bin/tmux',
+      sockets: ['s1'],
+      exec: async () => 'nt-a|100|claude\n',
+      readTable: () => [P(100, 1, 40 * 1024), { pid: 7, ppid: 1, rssKb: 512 * 1024, footprint: true as const }],
+      readMem: () => null
+    }
+    const ok = await collectSessionMemory({ ...base, appProcesses: () => [S(7, 'GPU')] })
+    expect(ok.app).toEqual({ ok: true, groups: [{ kind: 'gpu', count: 1, mb: 512 }], totalMb: 512 })
+    // The session rows are untouched by it.
+    expect(ok.rows.map((r) => r.nodeId)).toEqual(['a'])
+    const threw = await collectSessionMemory({ ...base, appProcesses: () => { throw new Error('gone') } })
+    expect(threw.app).toEqual({ ok: false, groups: [] })
+    // No reader injected (Server Edition) → no field at all: "not available", not "could not measure".
+    expect(await collectSessionMemory(base)).not.toHaveProperty('app')
   })
 })

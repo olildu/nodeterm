@@ -16,7 +16,13 @@ import { formatBytes } from '@shared/fsLimits'
 import { useAgentStatus } from '../state/agentStatus'
 import { useProjects } from '../state/projects'
 import { useSessionMemory } from '../state/sessionMemory'
-import { resolveSessionRows, totalMb } from '../lib/sessionMemoryRows'
+import {
+  appGroupLabel,
+  formatCpuTime,
+  hostOverheadLabel,
+  resolveSessionRows,
+  totalMb
+} from '../lib/sessionMemoryRows'
 import { usageScopeKey } from '../lib/usageScope'
 import type { SessionPauseOffer } from '../lib/sessionPause'
 import { unmeasuredNote } from '../lib/sessionMemoryNote'
@@ -79,6 +85,9 @@ export function SessionMemoryPanel({
   const ok = useSessionMemory((s) => s.ok)
   const rows = useSessionMemory((s) => s.rows)
   const unmeasured = useSessionMemory((s) => s.unmeasured)
+  const unmeasuredBackend = useSessionMemory((s) => s.unmeasuredBackend)
+  const hostCost = useSessionMemory((s) => s.host)
+  const appSelf = useSessionMemory((s) => s.app)
   const loading = useSessionMemory((s) => s.loading)
   const loadedScope = useSessionMemory((s) => s.loadedScope)
   const refreshFull = useSessionMemory((s) => s.refreshFull)
@@ -144,9 +153,10 @@ export function SessionMemoryPanel({
   } else if (!measured) {
     body = <div className="sessmem-panel__note">Measuring…</div>
   } else if (views.length === 0 && unmeasured !== 0) {
-    // The sweep reads tmux; Zellij-backed sessions are alive and simply not in it. "No sessions"
+    // The sweep reads tmux (and, on Windows, the session host); Zellij-backed sessions, and those
+    // of a session host too old to describe them, are alive and simply not in it. "No sessions"
     // here would be the ok:true-with-no-rows lie this panel exists to avoid.
-    body = <div className="sessmem-panel__note">{unmeasuredNote(unmeasured)}</div>
+    body = <div className="sessmem-panel__note">{unmeasuredNote(unmeasured, unmeasuredBackend)}</div>
   } else if (views.length === 0) {
     // We looked, and there really is nothing — a different sentence from the two above.
     body = <div className="sessmem-panel__note">No sessions are running here.</div>
@@ -237,13 +247,15 @@ export function SessionMemoryPanel({
       body = (
         <>
           {body}
-          <div className="sessmem-panel__note">{unmeasuredNote(unmeasured)}</div>
+          <div className="sessmem-panel__note">{unmeasuredNote(unmeasured, unmeasuredBackend)}</div>
         </>
       )
   }
 
   return (
-    <div className="sessmem-panel" id="sessmem-panel" role="region" aria-label="Session memory">
+    // `nowheel`: the panel sits inside `.flow-wrap`, whose capture-phase wheel listener zooms the
+    // canvas on a plain wheel when "Scroll wheel zooms" is on — the row list could not scroll.
+    <div className="sessmem-panel nowheel" id="sessmem-panel" role="region" aria-label="Session memory">
       <div className="sessmem-panel__head">
         <span className="sessmem-panel__title">Session memory</span>
         {/* Which machine these numbers describe. The SSH panel is visually identical to the local
@@ -251,10 +263,24 @@ export function SessionMemoryPanel({
         <span className="sessmem-panel__scope">{scopeKey || 'This machine'}</span>
         {/* No total unless we measured one: a grand total of `0 MB` beside a failure is the exact
             conflation this panel exists to end. */}
-        {measured && <span className="sessmem-panel__total">{formatMb(totalMb(views))}</span>}
+        {measured && <span className="sessmem-panel__total">{formatMb(totalMb(views, hostCost))}</span>}
       </div>
 
       {body}
+
+      {/* The Windows session host's own cost — the one process whose size grows with session count
+          and that no row's tree reaches (its conhost/OpenConsole children are the shells'
+          siblings). Not a session: not travelable, not killable, not in the session count. Only
+          under the `measured` gate, like the total it is part of. */}
+      {measured && !relay && hostCost && (
+        <div
+          className="sessmem-host"
+          title="Measured working set of nodeterm's session host and the console hosts it runs for each terminal. It is shared, so it belongs to no session above."
+        >
+          <span className="sessmem-host__label">{hostOverheadLabel(hostCost)}</span>
+          <span className="sessmem-host__mb">{formatMb(hostCost.totalMb)}</span>
+        </div>
+      )}
 
       {/* Whose memory this is. The feature exists because a user reported "Claude terminals are
           killing my memory" — their NUMBER was right and their attribution was wrong: it is the
@@ -266,6 +292,40 @@ export function SessionMemoryPanel({
         Memory held by each session's own processes — the agent CLI and what it spawned, not
         nodeterm itself.
       </div>
+
+      {/* nodeterm's OWN processes, below the attribution line on purpose: they
+          are not a session and are NOT in the header total. The GPU helper is the reason this
+          exists — `ps` said 96-153 MB while its footprint was 1557-1845 MB, mostly IOSurfaces (the
+          window's swap chain and raster tiles, and the terminals' WebGL buffers), and no surface
+          attributed it. LOCAL scope only (`scopeKey === ''`): never beside an SSH host's numbers.
+          Absent = this surface cannot enumerate its processes (Server Edition) → nothing drawn;
+          `ok:false` = it tried and could not, which is said, never printed as 0 B. */}
+      {measured && !relay && scopeKey === '' && appSelf && (
+        <div
+          className="sessmem-app"
+          title="nodeterm's own processes, in the same accounting as the rows above (on macOS: physical footprint, which includes graphics memory that ps does not show). CPU is time used since each process started."
+        >
+          <div className="sessmem-host">
+            <span className="sessmem-host__label">nodeterm itself</span>
+            <span className="sessmem-host__mb">
+              {appSelf.ok ? (appSelf.totalMb !== undefined ? formatMb(appSelf.totalMb) : '—') : ''}
+            </span>
+          </div>
+          {appSelf.ok ? (
+            appSelf.groups.map((g) => (
+              <div key={g.kind} className="sessmem-row__kids sessmem-app__group">
+                └ {appGroupLabel(g)}
+                {g.cpuSeconds !== undefined && (
+                  <span className="sessmem-app__cpu"> · CPU {formatCpuTime(g.cpuSeconds)}</span>
+                )}{' '}
+                <span>{g.mb !== undefined ? formatMb(g.mb) : 'not measured'}</span>
+              </div>
+            ))
+          ) : (
+            <div className="sessmem-panel__note">Could not measure nodeterm&apos;s own processes.</div>
+          )}
+        </div>
+      )}
 
       <div className="sessmem-panel__foot">
         <span className="sessmem-panel__count">

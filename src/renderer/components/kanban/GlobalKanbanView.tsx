@@ -4,6 +4,7 @@ import { AGENT_CONFIG, BUILTIN_AGENT_IDS, type AgentId } from '@shared/agents/co
 import { useProjects } from '../../state/projects'
 import { useSettings } from '../../state/settings'
 import { useBoardWallpaperStyle } from '../../state/wallpaper'
+import { AerialWallpaper } from '../AerialWallpaper'
 import {
   addColumn, assignNode, assignedTo, boardLabels, cardMatchesLabelFilter, cardMeta, columnForNode,
   deleteColumn, labelsForCard, moveColumn,
@@ -17,7 +18,8 @@ import { createAgentNode, createBrowserNode, createStickyNode, createTerminalNod
 import { markCanvasCovered } from '../../lib/canvasCovered'
 import { showCanvas, useViewMode } from '../../state/viewMode'
 import { KanbanScopeSwitch } from './KanbanScopeSwitch'
-import { sessionForProject } from '../../session/session'
+import { agentStatusForProject, sessionForProject, useSessionRegistryVersion } from '../../session/session'
+import { ProjectSessionScope } from '../../session/owning-project'
 import { isHostedReadOnly } from '../../state/hostedTeams'
 import { activePermissionMode } from '../../state/permissionMode'
 import { CardModal } from './CardModal'
@@ -87,14 +89,19 @@ interface SwimlaneProps {
    *  lane's project: a background lane gets its stored nodes, its own session source and its own
    *  write router, so nothing acts on the canvas of another project. */
   nodeActionItems?: (nodeId: string, projectId: string) => MenuItem[]
+  /** The card modal's ⋯ session rows (BOARD_MODAL_ACTION_IDS), asked for this lane's project. */
+  sessionActionItems?: (nodeId: string, projectId: string) => MenuItem[]
   /** "Name with AI" on a card of this lane. */
   onAiName?: (projectId: string, nodeId: string) => void
   /** Set a card's node color (the card modal's Color button), routed by the lane's project. */
   onSetColor?: (projectId: string, nodeId: string, color: string) => void
+  /** Start a card's held launch now (its QUEUED chip's ▶) — Canvas's `run` path, headless for a
+   *  background lane. */
+  onRunQueued?: (projectId: string, nodeId: string) => void
 }
 
 const Swimlane = memo(function Swimlane({
-  projectId, projectName, projectIndex, projectColor, board, sessions, ropes, nodes, onChangeBoard, onOpenNode, onCreateNode, onDeleteNode, onRenameNode, onEditSticky, onBrowserNav, onSetIcon, modalNodeId, modalView, onModalChange, liveTeams, highlight, nodeActionItems, onAiName, onSetColor
+  projectId, projectName, projectIndex, projectColor, board, sessions, ropes, nodes, onChangeBoard, onOpenNode, onCreateNode, onDeleteNode, onRenameNode, onEditSticky, onBrowserNav, onSetIcon, modalNodeId, modalView, onModalChange, liveTeams, highlight, nodeActionItems, sessionActionItems, onAiName, onSetColor, onRunQueued
 }: SwimlaneProps) {
   const dragRef = useRef<{ kind: 'column'; id: string } | { kind: 'card'; id: string } | null>(null)
   const setModalNodeId = useCallback(
@@ -118,6 +125,11 @@ const Swimlane = memo(function Swimlane({
       onOpenNode(nodeId, projectId)
     },
     [onOpenNode, projectId]
+  )
+  // Stable per lane, because SessionCard is memoized.
+  const runQueued = useMemo(
+    () => (onRunQueued ? (nodeId: string) => onRunQueued(projectId, nodeId) : undefined),
+    [onRunQueued, projectId]
   )
   const customAgents = useSettings((s) => s.settings.customAgents)
   const disabledAgents = useSettings((s) => s.settings.disabledAgents)
@@ -143,6 +155,16 @@ const Swimlane = memo(function Swimlane({
   const travel = useCallback((nodeId: string) => onOpenNode(nodeId, projectId), [onOpenNode, projectId])
   // Which machine this lane's nodes run on: only a local lane shows this machine's LIVE chips (R57).
   const liveLinkSource = projectSessionSource(projectId)
+  // The agent-status store of the session this LANE's project belongs to — a lane is not the
+  // active project, and a team lane's cards read its relay session's store (they share node ids
+  // with the handed-off SSH project, whose entries are the default store's).
+  const registryVersion = useSessionRegistryVersion()
+  const statusStore = useMemo(
+    () => agentStatusForProject(projectId).store,
+    // `registryVersion`: a reconnect swaps the project's session (and its store) under the same id.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [projectId, registryVersion]
+  )
   const sessionIds = useMemo(() => sessions.map(s => s.id), [sessions])
 
   const paletteLabels = useMemo(() => boardLabels(board), [board])
@@ -251,6 +273,8 @@ const Swimlane = memo(function Swimlane({
           liveLinkSource={liveLinkSource}
           ports={cardPorts}
           onOpenPort={openPort}
+          onRunQueued={runQueued}
+          statusStore={statusStore}
         />
       ))
     }]
@@ -337,6 +361,9 @@ const Swimlane = memo(function Swimlane({
         <ContextMenu x={cardMenu.x} y={cardMenu.y} zIndex={60} items={cardMenuItems(cardMenu.nodeId)} onClose={() => setCardMenu(null)} />
       )}
       {modalNodeId && byId.has(modalNodeId) && (
+        // The overview renders under App's LOCAL provider: the modal runs under THIS lane's
+        // project's session, so a team lane's terminal attaches to the host's core.
+        <ProjectSessionScope projectId={projectId}>
         <CardModal
           projectName={projectName}
           projectColor={projectColor}
@@ -354,11 +381,14 @@ const Swimlane = memo(function Swimlane({
           onBrowserNav={(patch) => onBrowserNav(projectId, modalNodeId, patch)}
           onSetIcon={(icon) => onSetIcon(projectId, modalNodeId, icon)}
           onSetColor={onSetColor ? (color) => onSetColor(projectId, modalNodeId, color) : undefined}
+          sessionActions={sessionActionItems ? () => sessionActionItems(modalNodeId, projectId) : undefined}
+          onRunQueued={runQueued ? () => runQueued(modalNodeId) : undefined}
           onDelete={() => onDeleteNode(projectId, modalNodeId)}
           onAiName={onAiName ? () => onAiName(projectId, modalNodeId) : undefined}
           team={teams.get(modalNodeId) ?? NO_STATIONS}
           onTravel={(nodeId) => { setModalNodeId(null); travel(nodeId) }}
         />
+        </ProjectSessionScope>
       )}
     </div>
   )
@@ -382,17 +412,23 @@ export interface GlobalKanbanViewProps {
   /** Canvas's node rows for a card (`boardNodeActionItems`), asked per lane's project.
    *  Optional: an overview with no canvas behind it offers none. */
   nodeActionItems?: (nodeId: string, projectId: string) => MenuItem[]
+  /** Canvas's card-modal ⋯ session rows (`boardSessionActionItems`), asked per lane's project.
+   *  Optional: no ⋯ button without it. */
+  sessionActionItems?: (nodeId: string, projectId: string) => MenuItem[]
   /** Canvas's "Name with AI" for a card of any lane (`aiNameFromKanban`). Optional. */
   onAiName?: (projectId: string, nodeId: string) => void
   /** Canvas's color write for a card of any lane (`setCardColor`, routed per project). Optional. */
   onSetColor?: (projectId: string, nodeId: string, color: string) => void
+  /** Start a card's held launch now (its QUEUED chip's ▶) — Canvas's `run` path, headless for a
+   *  background lane. */
+  onRunQueued?: (projectId: string, nodeId: string) => void
   /** Canvas's `setKanbanModalNode` — the same hook the per-project board reports to. It is what
    *  makes an open card "watched" (Eco must not hibernate it), wakes a hibernated agent on open,
    *  and points the dictation shortcut at the card instead of the selected canvas node. */
   onModalNodeChange?: (nodeId: string | null) => void
 }
 
-export const GlobalKanbanView = memo(function GlobalKanbanView({ live = null, onModalNodeChange, nodeActionItems, onAiName, onSetColor }: GlobalKanbanViewProps) {
+export const GlobalKanbanView = memo(function GlobalKanbanView({ live = null, onModalNodeChange, nodeActionItems, sessionActionItems, onAiName, onSetColor, onRunQueued }: GlobalKanbanViewProps) {
   // Same rule as the per-project board: the canvas is covered but mounted underneath.
   useEffect(() => markCanvasCovered(document.documentElement), [])
   const boardStyle = useBoardWallpaperStyle()
@@ -405,7 +441,14 @@ export const GlobalKanbanView = memo(function GlobalKanbanView({ live = null, on
     setModal(nodeId ? { projectId, nodeId, view } : null)
   }, [])
   const modalNodeId = modal?.nodeId ?? null
-  useEffect(() => { onModalNodeChange?.(modalNodeId) }, [modalNodeId, onModalNodeChange])
+  const modalProjectId = modal?.projectId ?? null
+  // Same rule as the per-project board: opening a card marks its completion read — on the store of
+  // the card's OWN lane project, so a team lane's read stays on this desktop and never clears the
+  // handed-off SSH project's entry under the same node id.
+  useEffect(() => {
+    onModalNodeChange?.(modalNodeId)
+    if (modalNodeId) agentStatusForProject(modalProjectId).store.getState().clearUnread(modalNodeId)
+  }, [modalNodeId, modalProjectId, onModalNodeChange])
   // Closing the overview with a card open must not leave the node "watched" forever.
   const onModalNodeChangeRef = useRef(onModalNodeChange)
   onModalNodeChangeRef.current = onModalNodeChange
@@ -500,6 +543,7 @@ export const GlobalKanbanView = memo(function GlobalKanbanView({ live = null, on
   if (projects.length === 0) {
     return (
       <div className="kanban-overlay global-kanban" style={boardStyle}>
+        {boardStyle && <AerialWallpaper board />}
         <div className="kanban-header"><span className="kanban-header__name">All Projects</span><KanbanScopeSwitch scope="all" /></div>
         <div className="kanban-empty">No projects yet. Create a project to see its swimlane.</div>
       </div>
@@ -508,6 +552,7 @@ export const GlobalKanbanView = memo(function GlobalKanbanView({ live = null, on
 
   return (
     <div className="kanban-overlay global-kanban" ref={containerRef} style={boardStyle}>
+      {boardStyle && <AerialWallpaper board />}
       <div className="kanban-header">
         <span className="kanban-header__name">All Projects</span>
         <KanbanScopeSwitch scope="all" />
@@ -545,8 +590,10 @@ export const GlobalKanbanView = memo(function GlobalKanbanView({ live = null, on
               liveTeams={isLive ? live.teams : undefined}
               highlight={highlightId === p.id}
               nodeActionItems={nodeActionItems}
+              sessionActionItems={sessionActionItems}
               onAiName={onAiName}
               onSetColor={onSetColor}
+              onRunQueued={onRunQueued}
             />
           )
         })}

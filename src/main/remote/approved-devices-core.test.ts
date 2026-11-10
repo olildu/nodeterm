@@ -6,6 +6,7 @@ import {
   pinDevice,
   unpinDevice
 } from './approved-devices-core'
+import { lowOrderKeysB64 } from '../../core/relay/low-order-keys.test-support'
 
 describe('approved-devices-core', () => {
   describe('parseApprovedDevices', () => {
@@ -56,6 +57,17 @@ describe('approved-devices-core', () => {
       expect(unpinDevice({ pubkeys: ['a', 'b'] }, 'a')).toEqual({ pubkeys: ['b'] })
       const store = { pubkeys: ['a'] }
       expect(unpinDevice(store, 'zzz')).toBe(store)
+    })
+  })
+
+  describe('low-order keys (a public-constant shared secret: no device holds one)', () => {
+    it('are never pinned, and never count as pinned even when the file holds one', () => {
+      for (const weak of lowOrderKeysB64()) {
+        expect(pinDevice(emptyApprovedDevices(), weak), weak).toEqual({ pubkeys: [] })
+        expect(isPinned({ pubkeys: [weak] }, weak), weak).toBe(false)
+        // Another spelling Node decodes to the same key is refused too.
+        expect(isPinned({ pubkeys: ['!' + weak] }, '!' + weak)).toBe(false)
+      }
     })
   })
 })

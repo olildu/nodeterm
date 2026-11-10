@@ -49,3 +49,30 @@ describe('WorkspaceStore.relayNodePlacements', () => {
     expect(store.relayNodePlacements('nope')).toEqual([])
   })
 })
+
+// Issue #1186: an SSH project's cache holds the shared file's NEUTRAL form (no routing fields — the
+// host's own desktop wrote some of those nodes). Every reader that decides where a node runs must see
+// it routed to the project's host, with its cwd resolved against the remote folder.
+describe('SSH project nodes read back routed (issue #1186)', () => {
+  it('relayNodePlacements and getNodeResolved route a host-created node', async () => {
+    const server = { id: 'mini', label: 'Mini', host: 'mini.local', user: 'host', port: 22 }
+    const store = new WorkspaceStore()
+    await store.save(
+      ws([
+        {
+          ...project('ssh-p', undefined, [node('host-made', { cwd: '.', agentId: 'codex' })]),
+          ssh: { server, remoteCwd: '/Users/host/project' }
+        }
+      ])
+    )
+    // What landed in the machine-local cache is the neutral form…
+    expect(store.getNode('host-made')?.sshRemoteTmux).toBeUndefined()
+    // …and what the routing readers see is the host.
+    const resolved = store.getNodeResolved('host-made')
+    expect(resolved).toMatchObject({ sshRemoteTmux: true, cwd: '/Users/host/project' })
+    expect(resolved?.ssh?.host).toBe('mini.local')
+    const [placement] = store.relayNodePlacements('host-made')
+    expect(placement.projectServer?.host).toBe('mini.local')
+    expect(placement.node).toMatchObject({ sshRemoteTmux: true, cwd: '/Users/host/project' })
+  })
+})

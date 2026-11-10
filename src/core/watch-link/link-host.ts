@@ -27,7 +27,12 @@
 // attempts end that connection (`attempts`), WRONG_PER_LINK across the link lock it. The link count is
 // the record's: the host starts from `record.control.wrong` and reports every new count to the service
 // (`onWrongAttempt`), which writes it — an app restart does not reset it. `allowControl` and a password
-// change reset it. A verification is re-checked after its await: an
+// change reset it. A lock lifts by itself (finding L2): the service sets `record.control.lockedUntil`
+// with it and calls `allowControl` when it passes; every `locked` this host sends carries how long is
+// left (`lockedForMs`), and the lock's notice names who tipped it (`onControlLocked(by)`). The unlock
+// itself is SEALED to a key pair of the connection's own (finding L3, unlock-seal.ts): made with the
+// first meta, offered in every meta (`unlockKey`), zeroed at the end; a plain unlock (an older page) is
+// still read, except on a connection that already sent a sealed one. A verification is re-checked after its await: an
 // ended viewer, a stopped host, or any change to control meanwhile (off, locked, a new password — the
 // control epoch) voids it, uncounted. A join whose input route is `none` (Zellij, an unknown session;
 // also what a missing or unknown route reads as) makes that viewer's state `off`/`unsupported`: its
@@ -96,9 +101,9 @@
 // keyframe needs a capture STARTED after it asked. A per-viewer sequence makes sure an older result
 // is never painted after a newer one, and streaming resumes only on the newest.
 //
-// NO CAPTURE IS NOT AN EMPTY SCREEN (R36). A backend with no visible-only capture (the Windows session
-// host, a direct Windows pty, a plain shell) and a capture that failed answer `unavailable`, and then
-// NO keyframe is sent: the viewer paints a keyframe as reset + clear, so an empty one would erase what
+// NO CAPTURE IS NOT AN EMPTY SCREEN (R36). A backend with no visible-only capture (a session host from
+// a build before `captureVisible`, a direct Windows pty, a plain shell) and a capture that failed answer
+// `unavailable`, and then NO keyframe is sent: the viewer paints a keyframe as reset + clear, so an empty one would erase what
 // the stream had drawn. The viewer follows the stream instead (at the join it still gets meta), and a
 // throttled viewer resumes streaming without a repaint. Residual: on such a backend a throttled
 // viewer shows gaps until the application repaints them.
@@ -142,15 +147,18 @@ import type { RpcErr } from '../../shared/rpc'
 import { bytesToB64, bytesToHex } from '../../shared/watch-link/bytes'
 import { deriveWatchLinkKeys } from '../../shared/watch-link/keys'
 import {
+  CONTROL_LOCK_MAX_MS,
   INPUT_MAX,
   PASSWORD_MAX,
   TYPING_NAMES_MAX,
   WATCH_CHAT_CAST,
   WATCH_EVENT,
+  WATCH_HISTORY_CAST,
   WATCH_INPUT_CAST,
   WATCH_PROTOCOL_VERSION,
   WATCH_RELEASE_CAST,
   WATCH_UNLOCK_CAST,
+  readHistoryRequest,
   sanitizeChatName,
   sanitizeChatText,
   type WatchChatMessage,
@@ -165,7 +173,9 @@ import { createInputSplitter, createTypingTracker, type InputSplitter } from './
 import { PANE_INPUT_DEADLINE_MS, WATCHER_INPUT_ROUTES, type ControlInputChunk, type WatcherInputRoute } from './pane-input'
 import { isTerminalReport } from '../terminal-reports'
 import { createStreamFilter, type StreamFilter } from './stream-filter'
+import { historyPageFrom, type HistoryRead } from './history'
 import { createTokenBucket, type TokenBucket } from './token-bucket'
+import { isSealedUnlock, openUnlock } from '../../shared/watch-link/unlock-seal'
 import {
   WATCHER_BUFFER_LIMIT,
   WATCHER_REFUSAL,
@@ -174,11 +184,13 @@ import {
   wrapWatcherSink
 } from './watcher-policy'
 import { CONTROL_WRONG_MAX, type WatchLinkRecord } from './store'
+import { errorText } from '../../shared/error-text'
 
 export const MAX_VIEWERS_PER_LINK = 10
 /** While the link is full (no idle listener, so no mint), how often the API is asked whether the link
- *  was revoked or expired server-side. */
-export const FULL_STATUS_POLL_MS = 5 * 60_000
+ *  was revoked or expired server-side: a Stop all from another machine reaches the viewers of a full
+ *  link within this (finding L6; it was 5 minutes). Only while full: otherwise the next mint learns it. */
+export const FULL_STATUS_POLL_MS = 60_000
 export const CHAT_MIN_INTERVAL_MS = 2_000
 export const CHAT_HISTORY_MAX = 200
 export const KEYFRAME_MIN_INTERVAL_MS = 1_000
@@ -213,6 +225,10 @@ export const INPUT_CHUNKS_MAX = 64
 export const TYPING_EVENT_MIN_MS = 1000
 /** A viewer is told its input was dropped at most this often. */
 export const DROPPED_NOTICE_MIN_MS = 10_000
+/** Read-back reads start at most this often per viewer; one runs at a time, and a request that arrives
+ *  meanwhile waits (the newest one wins). Each read is a transcript read on the host (an ssh round trip
+ *  for an SSH node), so a viewer that asks in a loop must not turn into a read loop. */
+export const HISTORY_MIN_INTERVAL_MS = 500
 /** Input from a connection that stopped controlling this recently is dropped silently: keystrokes in
  *  flight when control ended are not a breach. Later than this, they are. */
 export const INPUT_GRACE_MS = 5000
@@ -286,12 +302,20 @@ export interface LinkHostDeps {
   /** A viewer unlocked control, under this sanitized, self-chosen name. */
   onControlTaken(name: string): void
   /** WRONG_PER_LINK wrong attempts across the link. The service sets `record.control.locked = true`
-   *  before it returns (the host reads the record live and never writes it). */
-  onControlLocked(): void
+   *  (and when it lifts, `lockedUntil`) before it returns (the host reads the record live and never
+   *  writes it). `by`: the name the attempt that tipped it gave, else the chat name of the connection
+   *  that sent it, else null — a self-chosen claim, for the owner's notice. */
+  onControlLocked(by?: string | null): void
   /** A wrong unlock attempt: the link-wide count is now `count` (1..WRONG_PER_LINK). The service puts it
    *  on `record.control.wrong` and writes it (the 10th rides the lock's own write), so a restart does
    *  not reset it. Called before `onControlLocked`. */
   onWrongAttempt(count: number): void
+  /** Read-back (`watch:history`, ./history.ts): one transcript page of the link's node ending at
+   *  `before` (null: the newest). Rejects on a failed read. Absent: every request is answered
+   *  `unsupported`. The cutoff at the link's creation is applied HERE, not by the reader. */
+  history?(before: number | null): Promise<HistoryRead>
+  /** Whether the node is an agent with a readable conversation; asked for every (re)join's meta. */
+  historySupported?(): boolean
 }
 export type LinkRuntimeStatus = 'live' | 'reconnecting' | 'refused'
 export interface LinkViewer {
@@ -323,7 +347,8 @@ export interface LinkHost {
   /** The password was replaced: every controller is demoted and must unlock with the new one, and the
    *  link-wide wrong count starts over (the service resets the record's). */
   passwordChanged(): void
-  /** The owner cleared the lock: the link-wide wrong count starts over, then as `controlChanged`. */
+  /** The lock was cleared — the owner's Allow control again, or its time ran out (the service's timer,
+   *  finding L2): the link-wide wrong count starts over, then as `controlChanged`. */
   allowControl(): void
 }
 
@@ -370,6 +395,11 @@ interface Conn {
   lastDroppedAt: number
   /** The name control was taken under (the unlock's); a later chat name does not change who typed. */
   controlName: string | null
+  /** A Control link: the key pair THIS connection's unlock is sealed to (finding L3), made with the
+   *  first meta and kept for the connection's life (its public half rides every meta); zeroed at the end. */
+  unlockKeys: nacl.BoxKeyPair | null
+  /** This connection sent a sealed unlock: a later one in the clear is refused (counted as malformed). */
+  sealedOnly: boolean
   // The watched session (null while waiting).
   sessionId: string | null
   altScreen: boolean
@@ -396,6 +426,12 @@ interface Conn {
   stableTimer: unknown
   rejoinAttempt: number
   rejoinTimer: unknown
+  /** Read-back: a read is running; the request that arrived meanwhile (the newest wins); when the last
+   *  read started; the timer holding the next one to HISTORY_MIN_INTERVAL_MS. */
+  historyBusy: boolean
+  historyNext: { before: number | null } | null
+  historyLastAt: number
+  historyTimer: unknown
   warned: Set<string>
 }
 
@@ -412,7 +448,6 @@ interface CaptureSlot {
   next: { result: Promise<VisibleCapture>; start(): void } | null
 }
 
-const errorText = (err: unknown): string => (err instanceof Error ? err.message : String(err))
 /** The same members, in any order (the typing set is a set: a new order alone is no news). */
 function sameMembers(a: string[], b: string[]): boolean {
   if (a.length !== b.length) return false
@@ -465,7 +500,12 @@ function normalizeCapture(c: unknown): VisibleCapture {
   if ((c as VisibleCapture).unavailable === true) return unavailableCapture()
   const cur = (c as VisibleCapture).cursor
   const ok = !!cur && Number.isInteger(cur.x) && Number.isInteger(cur.y) && cur.x >= 0 && cur.y >= 0
-  return { screen: (c as VisibleCapture).screen, cursor: ok ? { x: cur!.x, y: cur!.y } : null }
+  const alt = (c as VisibleCapture).altScreen
+  return {
+    screen: (c as VisibleCapture).screen,
+    cursor: ok ? { x: cur!.x, y: cur!.y } : null,
+    ...(typeof alt === 'boolean' ? { altScreen: alt } : {})
+  }
 }
 
 export function createLinkHost(record: WatchLinkRecord, deps: LinkHostDeps): LinkHost {
@@ -570,8 +610,9 @@ export function createLinkHost(record: WatchLinkRecord, deps: LinkHostDeps): Lin
     if (c.ended) return
     c.ended = true
     conns.delete(c)
-    for (const h of [c.confirmTimer, c.rejoinTimer, c.keyframeTimer, c.settleTimer, c.stableTimer]) clearTimer(h)
-    c.confirmTimer = c.rejoinTimer = c.keyframeTimer = c.settleTimer = c.stableTimer = null
+    for (const h of [c.confirmTimer, c.rejoinTimer, c.keyframeTimer, c.settleTimer, c.stableTimer, c.historyTimer]) clearTimer(h)
+    c.confirmTimer = c.rejoinTimer = c.keyframeTimer = c.settleTimer = c.stableTimer = c.historyTimer = null
+    c.historyNext = null
     const sid = c.sessionId
     c.sessionId = null
     c.streaming = false
@@ -581,6 +622,8 @@ export function createLinkHost(record: WatchLinkRecord, deps: LinkHostDeps): Lin
     // A delivery still waiting for the pane must not hold every other controller's batch.
     c.delivery?.settle(false)
     forgetTyping(c)
+    c.unlockKeys?.secretKey.fill(0)
+    c.unlockKeys = null
     if (sid !== null) leave(c.clientId, sid, c.viewerId, c)
     safe('the scheduler', () => c.ev.onClose())
     updateSyncTimer()
@@ -675,7 +718,8 @@ export function createLinkHost(record: WatchLinkRecord, deps: LinkHostDeps): Lin
         sessionId: sid,
         // A FRESH filter: the capture starts in ground state, and carries OSC 8 links verbatim (R9).
         screen: createStreamFilter().push(cap.screen),
-        altScreen: c.altScreen,
+        // The join's answer (R18), unless the capture knows the stream's buffer itself (session host).
+        altScreen: cap.altScreen ?? c.altScreen,
         ...(cap.cursor ? { cursor: { x: cap.cursor.x, y: cap.cursor.y } } : {})
       }
       if (!send(c, WATCH_EVENT.keyframe, kf)) return
@@ -811,8 +855,14 @@ export function createLinkHost(record: WatchLinkRecord, deps: LinkHostDeps): Lin
       cols: res.cols,
       rows: res.rows
     }
-    // A Control link's state for THIS viewer rides every (re)join; absent on every other role.
-    if (record.role === 'controller') meta.control = controlStateFor(c)
+    // A Control link's state for THIS viewer rides every (re)join, with the key its unlock is sealed to
+    // (one per connection, the same on every rejoin); absent on every other role.
+    if (record.role === 'controller') {
+      meta.control = controlStateFor(c)
+      c.unlockKeys ??= nacl.box.keyPair()
+      meta.unlockKey = bytesToB64(c.unlockKeys.publicKey)
+    }
+    if (historySupported()) meta.history = true
     if (!send(c, WATCH_EVENT.meta, meta)) return
     // The typing set is otherwise sent only when it changes: a viewer (re)joining mid-typing would
     // never learn it.
@@ -885,6 +935,10 @@ export function createLinkHost(record: WatchLinkRecord, deps: LinkHostDeps): Lin
   }
   function onViewerCast(c: Conn, method: string, args: unknown[]): void {
     // relay-host's access hook admits exactly these (watcherAccess); anything else got past it.
+    if (method === WATCH_HISTORY_CAST) {
+      onHistory(c, args)
+      return
+    }
     if (method === WATCH_CHAT_CAST && (record.role === 'commenter' || record.role === 'controller')) {
       onChat(c, args)
       return
@@ -920,6 +974,56 @@ export function createLinkHost(record: WatchLinkRecord, deps: LinkHostDeps): Lin
     publish({ id: bytesToHex(nacl.randomBytes(8)), name, text, at: now, from: 'viewer' })
   }
 
+  // --- read-back (./history.ts) ---------------------------------------------------------------------
+
+  function historySupported(): boolean {
+    try {
+      return deps.historySupported?.() === true
+    } catch (err) {
+      warn(null, 'asking whether read-back is there failed', errorText(err))
+      return false
+    }
+  }
+  function onHistory(c: Conn, args: unknown[]): void {
+    if (c.ended || c.joinedAt === null || stopped) return
+    // A malformed request is ignored, like a malformed chat line: the cast itself is admitted.
+    const req = readHistoryRequest(args[0])
+    if (!req) return
+    c.historyNext = req
+    pumpHistory(c)
+  }
+  function pumpHistory(c: Conn): void {
+    if (c.ended || stopped || c.historyBusy || c.historyTimer !== null || c.historyNext === null) return
+    const wait = HISTORY_MIN_INTERVAL_MS - (deps.now() - c.historyLastAt)
+    if (wait > 0) {
+      c.historyTimer = deps.setTimeout(() => {
+        c.historyTimer = null
+        pumpHistory(c)
+      }, wait)
+      return
+    }
+    const { before } = c.historyNext
+    c.historyNext = null
+    c.historyBusy = true
+    c.historyLastAt = deps.now()
+    const read = async (): Promise<HistoryRead | null> => {
+      if (!deps.history) return { kind: 'unsupported' }
+      try {
+        return await deps.history(before)
+      } catch (err) {
+        warn(c, 'a read-back failed', errorText(err))
+        return null
+      }
+    }
+    void read().then((r) => {
+      c.historyBusy = false
+      if (c.ended || stopped) return
+      // The record is read now: the cutoff is the link's creation, whatever the reader returned.
+      send(c, WATCH_EVENT.history, historyPageFrom(r, record.createdAt, before))
+      pumpHistory(c)
+    })
+  }
+
   // --- control (a Control link) -----------------------------------------------------------------------
 
   /** This viewer's control state, as meta and every unprompted `watch:control` carry it. */
@@ -928,9 +1032,31 @@ export function createLinkHost(record: WatchLinkRecord, deps: LinkHostDeps): Lin
     // The watched terminal cannot take input (Zellij, an unknown session): no password changes that.
     if (c.input === 'none') return { state: 'off', reason: 'unsupported' }
     if (c.controlling && ctl && ctl.enabled && !ctl.locked) return { state: 'controlling' }
-    if (ctl?.locked) return { state: 'locked' }
+    if (ctl?.locked) return lockedState()
     if (!ctl || !ctl.enabled) return { state: 'off' }
     return { state: 'available' }
+  }
+  /** `locked`, with how long until it lifts by itself when it does (finding L2): from the record's
+   *  `lockedUntil`, which the service sets with the lock and clears when it lifts. */
+  function lockedState(reason?: 'locked'): WatchControlEvent {
+    const until = record.control?.lockedUntil
+    const ev: WatchControlEvent = reason ? { state: 'locked', reason } : { state: 'locked' }
+    if (typeof until === 'number' && Number.isFinite(until)) {
+      ev.lockedForMs = Math.min(CONTROL_LOCK_MAX_MS, Math.max(0, Math.round(until - deps.now())))
+    }
+    return ev
+  }
+  /**
+   * An unlock cast's `{ name, password }`, sealed or plain, or null when it is malformed (counted). A
+   * sealed one must open with THIS connection's key (finding L3) and latches the connection: a plain
+   * one after it is malformed — a page that seals never sends one, so it can only be a replay or a
+   * downgrade. A plain one is what a page from before sealing sends, and is read as before.
+   */
+  function unlockOf(c: Conn, arg: unknown): { name: string; password: string } | null {
+    if (!isSealedUnlock(arg)) return c.sealedOnly ? null : readUnlock(arg)
+    c.sealedOnly = true
+    const opened = c.unlockKeys ? openUnlock(arg, c.unlockKeys.secretKey) : null
+    return opened ? readUnlock(opened) : null
   }
   function sendControl(c: Conn, ev: WatchControlEvent): void {
     send(c, WATCH_EVENT.control, ev)
@@ -946,7 +1072,7 @@ export function createLinkHost(record: WatchLinkRecord, deps: LinkHostDeps): Lin
       return
     }
     if (state.state === 'locked' || state.state === 'off') {
-      sendControl(c, { state: state.state, reason: state.reason ?? state.state })
+      sendControl(c, { ...state, reason: state.reason ?? state.state })
       return
     }
     const now = deps.now()
@@ -955,10 +1081,10 @@ export function createLinkHost(record: WatchLinkRecord, deps: LinkHostDeps): Lin
       return
     }
     c.lastUnlockAt = now
-    const attempt = readUnlock(args[0])
+    const attempt = unlockOf(c, args[0])
     // A malformed attempt is still an attempt.
     if (!attempt) {
-      wrongAttempt(c)
+      wrongAttempt(c, null)
       return
     }
     verifying = true
@@ -977,7 +1103,7 @@ export function createLinkHost(record: WatchLinkRecord, deps: LinkHostDeps): Lin
       return
     }
     if (!right) {
-      wrongAttempt(c)
+      wrongAttempt(c, attempt.name)
       return
     }
     c.controlling = true
@@ -994,30 +1120,31 @@ export function createLinkHost(record: WatchLinkRecord, deps: LinkHostDeps): Lin
    *  wrong. Nothing is counted, and the viewer may try again. */
   function refuseVoid(c: Conn): void {
     const state = controlStateFor(c)
-    if (state.state === 'locked' || state.state === 'off') sendControl(c, { state: state.state, reason: state.reason ?? state.state })
+    if (state.state === 'locked' || state.state === 'off') sendControl(c, { ...state, reason: state.reason ?? state.state })
     else sendControl(c, { state: state.state, reason: 'too-soon' })
   }
-  function wrongAttempt(c: Conn): void {
+  /** `name`: the name this attempt gave, when it was well formed; the lock's notice names it. */
+  function wrongAttempt(c: Conn, name: string | null): void {
     c.wrong++
     linkWrong++
     // The service records (and writes) the link-wide count before any lock below.
     const count = Math.min(linkWrong, WRONG_PER_LINK)
     safe('onWrongAttempt', () => deps.onWrongAttempt(count))
     sendControl(c, { state: controlStateFor(c).state, reason: 'wrong' })
-    if (linkWrong >= WRONG_PER_LINK) lockLink()
+    if (linkWrong >= WRONG_PER_LINK) lockLink(name ?? c.name)
     if (c.wrong >= WRONG_PER_CONN) endConn(c, 'attempts')
   }
   /** Locked: the service records it (synchronously, in `onControlLocked`), every viewer is told, and
-   *  every controller drops back to watching. */
-  function lockLink(): void {
+   *  every controller drops back to watching. `by`: who tipped it, as it named itself (or null). */
+  function lockLink(by: string | null): void {
     controlEpoch++
-    safe('onControlLocked', () => deps.onControlLocked())
+    safe('onControlLocked', () => deps.onControlLocked(by))
     // The lock rests on the service recording it before it returns. If it did not (it threw, or a
     // wiring slip), the next attempt would be verified again: say so loudly, and still demote and tell.
     if (record.control?.locked !== true) console.error('[watch-link] onControlLocked did not lock the link')
     for (const c of joinedConns()) {
       loseControl(c)
-      sendControl(c, { state: 'locked', reason: 'locked' })
+      sendControl(c, lockedState('locked'))
     }
     safe('onChange', deps.onChange)
   }
@@ -1302,6 +1429,8 @@ export function createLinkHost(record: WatchLinkRecord, deps: LinkHostDeps): Lin
       delivery: null,
       lastDroppedAt: -Infinity,
       controlName: null,
+      unlockKeys: null,
+      sealedOnly: false,
       sessionId: null,
       altScreen: false,
       joining: false,
@@ -1321,6 +1450,10 @@ export function createLinkHost(record: WatchLinkRecord, deps: LinkHostDeps): Lin
       stableTimer: null,
       rejoinAttempt: 0,
       rejoinTimer: null,
+      historyBusy: false,
+      historyNext: null,
+      historyLastAt: -Infinity,
+      historyTimer: null,
       warned: new Set()
     }
     conns.add(c)

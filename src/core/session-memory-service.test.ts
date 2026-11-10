@@ -1,11 +1,14 @@
 // What the RPC surface DECIDES: which machine a query is answered from. The sweeps themselves are
 // covered by session-memory.test.ts / session-memory-remote.test.ts — here the only question is
 // routing, and the only dangerous answer is attributing one host's memory to another.
+import fs from 'fs'
+import path from 'path'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { IPC } from '../shared/ipc'
 import { initPlatform, resetPlatformForTests } from './platform'
 import { fakePlatform, type FakePlatform } from './platform-fake'
-import { startSessionMemoryService, sshScopePredicate } from './session-memory-service'
+import { testTmpDir } from './test-tmp'
+import { mergeLocalLegs, startSessionMemoryService, sshScopePredicate } from './session-memory-service'
 import type { MemInfo, SessionMemoryReport, SessionMemoryQuery } from '../shared/types'
 
 // The repo's own platform fake (src/core/platform-fake.ts) — a plain recording object whose
@@ -289,5 +292,201 @@ describe('startSessionMemoryService', () => {
     startSessionMemoryService({ tmuxBin: () => null })
     const r = await (platform.handlers[IPC.sessionMemory]() as Promise<SessionMemoryReport>)
     expect(r.ok).toBe(false)
+  })
+})
+
+describe('startSessionMemoryService — session-host leg (Windows)', () => {
+  const MEM = { availableMb: 8000, totalMb: 16000 }
+  const listing = {
+    running: true,
+    names: ['nt-a'],
+    sessions: [{ name: 'nt-a', pid: 100, subscribers: 0, lastOutputMs: 1, createdMs: 1, generation: 'gen-aaaaaaaa' }]
+  }
+  const table = async () => [{ pid: 100, ppid: 1, rssKb: 2048 }]
+
+  it('no tmux + a session host answers ok:true with its rows (was always ok:false)', async () => {
+    startSessionMemoryService({
+      tmuxBin: () => null,
+      readMem: () => MEM,
+      sessionHost: async () => listing,
+      sessionHostTable: table
+    })
+    const r = await read({ projectId: 'p1' })
+    expect(r.ok).toBe(true)
+    expect(r.rows.map((x) => [x.session, x.totalMb])).toEqual([['nt-a', 2]])
+  })
+
+  it('no host running is "no sessions", not a failure', async () => {
+    startSessionMemoryService({
+      tmuxBin: () => null,
+      readMem: () => MEM,
+      sessionHost: async () => ({ running: false, names: [], sessions: [] })
+    })
+    expect(await read({ projectId: 'p1' })).toEqual({ ok: true, rows: [], mem: MEM })
+  })
+
+  it('a session host that is not the backend (undefined) leaves the tmux path untouched', async () => {
+    startSessionMemoryService({ tmuxBin: () => null, readMem: () => MEM, sessionHost: () => undefined })
+    expect(await read({ projectId: 'p1' })).toEqual({ ok: false, rows: [], mem: MEM })
+  })
+
+  it('a failed host read is ok:false', async () => {
+    startSessionMemoryService({ tmuxBin: () => null, readMem: () => MEM, sessionHost: async () => null })
+    expect((await read({ projectId: 'p1' })).ok).toBe(false)
+  })
+
+  it('a Zellij count rides on top and drops the session-host label', async () => {
+    startSessionMemoryService({
+      tmuxBin: () => null,
+      readMem: () => MEM,
+      unmeasuredSessions: async () => 2,
+      sessionHost: async () => ({ ...listing, sessions: null })
+    })
+    const r = await read({ projectId: 'p1' })
+    expect(r.unmeasured).toBe(3)
+    expect(r).not.toHaveProperty('unmeasuredBackend')
+  })
+
+  it('an SSH scope never reaches the session host', async () => {
+    const sessionHost = vi.fn(async () => listing)
+    startSessionMemoryService({ tmuxBin: () => null, sessionHost, remote: { isRemoteProject: () => true } })
+    expect((await read({ projectId: 'ssh1', remote: true })).ok).toBe(false)
+    expect(sessionHost).not.toHaveBeenCalled()
+  })
+})
+
+describe('mergeLocalLegs', () => {
+  const r = (ok: boolean, totals: number[], extra: Partial<SessionMemoryReport> = {}): SessionMemoryReport => ({
+    ok,
+    rows: totals.map((t, i) => ({
+      session: `nt-${ok}-${i}`,
+      nodeId: `${ok}-${i}`,
+      panePid: i + 1,
+      command: '',
+      selfMb: t,
+      childrenMb: 0,
+      childCount: 0,
+      totalMb: t
+    })),
+    mem: null,
+    ...extra
+  })
+  it('a leg that answered is never overridden by one that failed', () => {
+    expect(mergeLocalLegs(r(false, []), r(true, [5])).ok).toBe(true)
+    expect(mergeLocalLegs(r(true, [5]), r(false, [])).ok).toBe(true)
+    expect(mergeLocalLegs(r(false, []), r(false, [])).ok).toBe(false)
+  })
+  it('rows from both legs, sorted by total descending', () => {
+    expect(mergeLocalLegs(r(true, [3, 1]), r(true, [2])).rows.map((x) => x.totalMb)).toEqual([3, 2, 1])
+  })
+  it('unmeasured adds up; unknown stays unknown; the label survives', () => {
+    const m = mergeLocalLegs(r(true, []), r(true, [], { unmeasured: 2, unmeasuredBackend: 'session-host' }))
+    expect(m.unmeasured).toBe(2)
+    expect(m.unmeasuredBackend).toBe('session-host')
+    expect(mergeLocalLegs(r(true, [], { unmeasured: null }), r(true, [], { unmeasured: 1 })).unmeasured).toBeNull()
+    expect(mergeLocalLegs(r(true, []), r(true, []))).not.toHaveProperty('unmeasured')
+  })
+  it("the session host's own cost survives the merge, but never from a leg that failed", () => {
+    const host = { pid: 9, selfMb: 60, consoleMb: 8, consoleCount: 1, totalMb: 68 }
+    expect(mergeLocalLegs(r(true, [1]), r(true, [], { host })).host).toEqual(host)
+    expect(mergeLocalLegs(r(true, [1]), r(false, [], { host }))).not.toHaveProperty('host')
+    expect(mergeLocalLegs(r(true, []), r(true, []))).not.toHaveProperty('host')
+  })
+})
+
+describe('startSessionMemoryService — "nodeterm itself"', () => {
+  const MEM = { availableMb: 8000, totalMb: 16000 }
+  const listing = {
+    running: true,
+    names: ['nt-a'],
+    sessions: [{ name: 'nt-a', pid: 100, subscribers: 0, lastOutputMs: 1, createdMs: 1, generation: 'gen-aaaaaaaa' }]
+  }
+  // pid 7 is the GPU helper; `footprint` so the darwin rule (top's figure only) is satisfied on a Mac
+  // runner too — the Windows table this leg normally reads is working set on every platform.
+  const table = async () => [
+    { pid: 100, ppid: 1, rssKb: 2048 },
+    { pid: 7, ppid: 1, rssKb: 1600 * 1024, footprint: true as const }
+  ]
+  const appProcesses = () => [{ pid: 7, type: 'GPU', cpuSeconds: 42 }]
+
+  it('a local sweep carries the group, measured from the sweep\'s own table', async () => {
+    startSessionMemoryService({
+      tmuxBin: () => null,
+      readMem: () => MEM,
+      sessionHost: async () => listing,
+      sessionHostTable: table,
+      appProcesses
+    })
+    const r = await read({ projectId: 'p1' })
+    expect(r.app).toEqual({ ok: true, groups: [{ kind: 'gpu', count: 1, mb: 1600, cpuSeconds: 42 }], totalMb: 1600 })
+    // Never folded into a session row.
+    expect(r.rows.map((x) => x.totalMb)).toEqual([2])
+  })
+
+  it('a path that read no table says NOT MEASURED rather than leaving the group out', async () => {
+    startSessionMemoryService({
+      tmuxBin: () => null,
+      readMem: () => MEM,
+      sessionHost: async () => ({ running: false, names: [], sessions: [] }),
+      appProcesses
+    })
+    expect((await read({ projectId: 'p1' })).app).toEqual({ ok: false, groups: [] })
+  })
+
+  // macOS and Linux reach the group through the TMUX path (`sessionHost` answers undefined there),
+  // not the Windows session-host leg every test above uses. The sweep reads this machine's real
+  // process table; tmux is a stub that lists no panes, so nothing touches a real tmux server.
+  it.skipIf(process.platform === 'win32')(
+    'the tmux path (macOS / Linux) carries the group too',
+    async () => {
+      const dir = testTmpDir('nt-sessmem-tmux-')
+      const tmux = path.join(dir, 'tmux')
+      fs.writeFileSync(tmux, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+      startSessionMemoryService({
+        tmuxBin: () => tmux,
+        readMem: () => MEM,
+        sessionHost: () => undefined,
+        appProcesses: () => [{ pid: process.pid, type: 'Browser', cpuSeconds: 3 }]
+      })
+      const r = await read({ projectId: 'p1' })
+      expect(r.ok).toBe(true)
+      expect(r.app?.ok).toBe(true)
+      expect(r.app?.groups.map((g) => [g.kind, g.count, g.cpuSeconds])).toEqual([['main', 1, 3]])
+    },
+    60_000
+  )
+
+  it('no reader injected (Server Edition) → no field: not available, not "could not measure"', async () => {
+    startSessionMemoryService({ tmuxBin: () => null, readMem: () => MEM, sessionHost: async () => listing, sessionHostTable: table })
+    expect(await read({ projectId: 'p1' })).not.toHaveProperty('app')
+  })
+
+  it('an SSH scope never carries this machine\'s processes, and never asks for them', async () => {
+    const reader = vi.fn(appProcesses)
+    startSessionMemoryService({
+      tmuxBin: () => null,
+      sessionHost: async () => listing,
+      sessionHostTable: table,
+      appProcesses: reader,
+      remote: { run: async () => HOST_REPLY, isRemoteProject: (id) => id === 'ssh1' }
+    })
+    const r = await read({ projectId: 'ssh1' })
+    expect(r.ok).toBe(true)
+    expect(r).not.toHaveProperty('app')
+    expect(reader).not.toHaveBeenCalled()
+  })
+
+  it('mergeLocalLegs prefers a measured group and never adopts one from a failed leg', () => {
+    const measured = { ok: true, groups: [{ kind: 'gpu' as const, count: 1, mb: 5 }], totalMb: 5 }
+    const notMeasured = { ok: false, groups: [] }
+    const leg = (ok: boolean, app?: SessionMemoryReport['app']): SessionMemoryReport => ({
+      ok,
+      rows: [],
+      mem: null,
+      ...(app ? { app } : {})
+    })
+    expect(mergeLocalLegs(leg(true, notMeasured), leg(true, measured)).app).toEqual(measured)
+    expect(mergeLocalLegs(leg(true, notMeasured), leg(true)).app).toEqual(notMeasured)
+    expect(mergeLocalLegs(leg(true), leg(false, measured))).not.toHaveProperty('app')
   })
 })

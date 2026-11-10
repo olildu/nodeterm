@@ -4,7 +4,8 @@ import { createPortal } from 'react-dom'
 import { useDialogStack } from './dialog-stack'
 import { useEntitlement } from '../state/entitlement'
 import { useProjects } from '../state/projects'
-import { hostShareOptions, relayShareGrantCopy } from '../lib/relayHostShare'
+import { relayShareGrantCopy } from '../lib/relayHostShare'
+import { useHostShareChoice } from '../lib/useHostShareChoice'
 import { thisMachine } from '../lib/machineName'
 import { Button } from '@renderer/ui/Button'
 import { CopyButton } from '@renderer/ui/CopyButton'
@@ -32,12 +33,15 @@ export function RemoteAccessDialog({ onClose }: { onClose: () => void }): React.
 
   // Which project this host shares with the joiner. Default = the active project (hoisted first
   // by hostShareOptions); the user can pick any other OPEN project before minting the offer.
-  const shareOptions = hostShareOptions(projects, activeProjectId)
-  const [shareId, setShareId] = useState('')
-  const effectiveShareId = shareOptions.some((o) => o.id === shareId)
-    ? shareId
-    : (shareOptions[0]?.id ?? '')
-  const sharedName = shareOptions.find((o) => o.id === effectiveShareId)?.name ?? ''
+  // A project whose folder is the disk root or the home directory (or contains it) is offered
+  // disabled with the host's reason, and never falls back to an unscoped invite (useHostShareChoice).
+  const {
+    options: shareOptions,
+    shareId: effectiveShareId,
+    setShareId,
+    sharedName,
+    refusal: shareRefusal
+  } = useHostShareChoice(projects, activeProjectId)
 
   // Only the topmost modal answers a key (./dialog-stack) — the host approval ConfirmDialog opens
   // on top of THIS dialog, and its Escape must not also close the one underneath.
@@ -135,8 +139,8 @@ export function RemoteAccessDialog({ onClose }: { onClose: () => void }): React.
                     onChange={(e) => setShareId(e.target.value)}
                   >
                     {shareOptions.map((o) => (
-                      <option key={o.id} value={o.id}>
-                        {o.name}
+                      <option key={o.id} value={o.id} disabled={!!o.refusal}>
+                        {o.refusal ? `${o.name} (cannot be shared)` : o.name}
                       </option>
                     ))}
                   </Select>
@@ -150,7 +154,8 @@ export function RemoteAccessDialog({ onClose }: { onClose: () => void }): React.
                 ) : null}
                 {relayShareGrantCopy(sharedName || null, thisMachine())}
               </p>
-              <Button disabled={hostBusy} onClick={() => void startHosting()}>
+              {shareRefusal ? <p className="remote-dialog__err">{shareRefusal}</p> : null}
+              <Button disabled={hostBusy || !!shareRefusal} onClick={() => void startHosting()}>
                 {hostBusy ? 'Starting…' : 'Allow remote access'}
               </Button>
             </div>

@@ -36,6 +36,7 @@ import type { ChatTranscriptPage } from '../shared/chat-page'
 import { CHAT_TOOL_ARG_MAX } from '../shared/chat-command'
 import { locateGemini } from './handoff/locate'
 import { readCappedTail } from './transcript-reader'
+import { isRecord } from '../shared/is-record'
 
 /** Same caps as claude's reader (`summarizeResult` / `metaString` in transcript-reader.ts), in
  *  UTF-16 code units — kept equal so the three readers' parts look alike. */
@@ -66,7 +67,6 @@ export interface GeminiChat {
   skipped: number
 }
 
-const isObj = (v: unknown): v is Rec => !!v && typeof v === 'object' && !Array.isArray(v)
 const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined)
 
 function isHarnessText(t: string): boolean {
@@ -81,7 +81,7 @@ function visibleTexts(content: unknown): string[] {
   if (typeof content === 'string') raw.push(content)
   else if (Array.isArray(content)) {
     for (const p of content) {
-      if (!isObj(p) || p.thought === true) continue
+      if (!isRecord(p) || p.thought === true) continue
       const t = str(p.text)
       if (t !== undefined) raw.push(t)
     }
@@ -95,14 +95,14 @@ function summarize(s: string): string {
 
 /** What the model was given back: `functionResponse.response.output`, else its `error`. */
 function responseText(part: unknown): string | undefined {
-  const fr = isObj(part) && isObj(part.functionResponse) ? part.functionResponse : undefined
-  const resp = fr && isObj(fr.response) ? fr.response : undefined
+  const fr = isRecord(part) && isRecord(part.functionResponse) ? part.functionResponse : undefined
+  const resp = fr && isRecord(fr.response) ? fr.response : undefined
   if (!resp) return undefined
   return str(resp.output) ?? str(resp.error)
 }
 
 function toolArg(args: unknown, description: unknown): string {
-  if (isObj(args)) {
+  if (isRecord(args)) {
     for (const k of ARG_KEYS) {
       const v = str(args[k])
       if (v) return v.slice(0, CHAT_TOOL_ARG_MAX)
@@ -142,7 +142,7 @@ function foldRecords(buf: string): { log: Map<string, Rec>; skipped: number } {
   const log = new Map<string, Rec>()
   let skipped = 0
   const upsert = (m: unknown): void => {
-    if (isObj(m) && typeof m.id === 'string') log.set(m.id, m)
+    if (isRecord(m) && typeof m.id === 'string') log.set(m.id, m)
   }
   for (const line of buf.split('\n')) {
     if (!line.trim()) continue
@@ -153,7 +153,7 @@ function foldRecords(buf: string): { log: Map<string, Rec>; skipped: number } {
       skipped++
       continue
     }
-    if (!isObj(o)) {
+    if (!isRecord(o)) {
       skipped++
       continue
     }
@@ -172,7 +172,7 @@ function foldRecords(buf: string): { log: Map<string, Rec>; skipped: number } {
       }
     } else if (typeof o.id === 'string') {
       upsert(o)
-    } else if (isObj(o.$set)) {
+    } else if (isRecord(o.$set)) {
       // Metadata; `$set.messages` is the model's context, not the thread (see the file comment).
     } else if (typeof o.sessionId === 'string' && typeof o.projectHash === 'string') {
       if (Array.isArray(o.messages)) for (const m of o.messages) upsert(m)
@@ -213,7 +213,7 @@ export function chatFromGemini(buf: string): GeminiChat {
       case 'user': {
         if (Array.isArray(rec.content)) {
           for (const p of rec.content) {
-            if (!isObj(p) || !isObj(p.functionResponse)) continue
+            if (!isRecord(p) || !isRecord(p.functionResponse)) continue
             const id = str(p.functionResponse.id)
             const tool = id ? toolById.get(id) : undefined
             const out = responseText(p)
@@ -233,7 +233,7 @@ export function chatFromGemini(buf: string): GeminiChat {
         const calls = Array.isArray(rec.toolCalls) ? rec.toolCalls : []
         if (calls.length) {
           for (const c of calls) {
-            if (!isObj(c)) {
+            if (!isRecord(c)) {
               skipped++
               continue
             }
@@ -244,7 +244,7 @@ export function chatFromGemini(buf: string): GeminiChat {
           }
         } else if (Array.isArray(rec.content)) {
           for (const p of rec.content) {
-            if (!isObj(p) || !isObj(p.functionCall)) continue
+            if (!isRecord(p) || !isRecord(p.functionCall)) continue
             const fc = p.functionCall
             const part: ToolPart = { kind: 'tool', name: str(fc.name) || 'tool', arg: toolArg(fc.args, undefined) }
             parts.push(part)

@@ -9,6 +9,7 @@ import {
 } from '@shared/board-comment'
 import { formatTimeAgo } from '../../lib/usageFormat'
 import { useSession } from '../../session/session'
+import { useOwningProjectId } from '../../session/owning-project'
 import { useProjects } from '../../state/projects'
 import { useBoardLog } from '../../state/boardLog'
 import { useBoardCommentDelivery } from '../../state/boardCommentDelivery'
@@ -135,9 +136,13 @@ function formatStamp(ts: number): string {
 }
 
 /** Right panel of the card modal (all card kinds): a composer on top and the card's own
- *  comments + activity feed newest-first. Reads/writes the board log for the ACTIVE project via
- *  its session api — resolved here (not threaded from Canvas). Subscribes on mount, so a teammate's
- *  comment or a board change lands live; unsubscribes on unmount / card swap.
+ *  comments + activity feed newest-first. Reads/writes the board log of the project that OWNS the
+ *  card (`OwningProjectContext`: the card's project under the card modal's `ProjectSessionScope`,
+ *  the store-held project on the canvas), falling back to the active project, through the session
+ *  api resolved for that same project. Keying it on the active project paired an Omni lane's api
+ *  with another project's id: the lane's comments read blank and a comment typed there was saved
+ *  nowhere. Subscribes on mount, so a teammate's comment or a board change lands live;
+ *  unsubscribes on unmount / card swap.
  *
  *  A comment that @mentions a session (the composer's @ picker) is also delivered to that agent —
  *  ONLY from this composer's send, with the text just typed, and only in the desktop app's own
@@ -145,7 +150,9 @@ function formatStamp(ts: number): string {
  *  instance, a relay peer, a team-presence guest) renders its mentions and types nowhere. */
 export function BoardLogPanel({ card, title, readOnly, emptyText, mentionables }: BoardLogPanelProps) {
   const { api, source } = useSession()
-  const projectId = useProjects((s) => s.activeProjectId)
+  const owningProjectId = useOwningProjectId()
+  const activeProjectId = useProjects((s) => s.activeProjectId)
+  const projectId = owningProjectId ?? activeProjectId
   const entries = useBoardLog((s) => s.entriesFor(projectId))
   const unsupported = useBoardLog((s) => !!s.unsupportedByProject[projectId])
   const error = useBoardLog((s) => !!s.errorByProject[projectId])

@@ -25,6 +25,7 @@ import {
   GLASS_READABLE_TICK,
   GLASS_TINTED_ALPHA,
   glassRefraction,
+  glassRefractionOn,
   glassSliderAlpha,
   glassTint,
   resolveGlassSlider,
@@ -34,7 +35,13 @@ import {
   keepGlassBlurWhileMoving,
   glassChipWash,
   GLASS_CHIP_HUES,
-  GLASS_CHIP_WASH_MAX
+  GLASS_CHIP_WASH_MAX,
+  GLASS_LIGHT_FROST,
+  GLASS_CLEAR_RATIO,
+  glassMinRatio,
+  glassFrostFloor,
+  glassChromeBackdropRange,
+  glassBackdropFilter
 } from './glassContrast'
 
 const WHITE = [255, 255, 255] as const
@@ -148,6 +155,25 @@ describe('glassChromeAlpha (Liquid Glass chrome, both app themes)', () => {
     }
   })
 
+  it.each([
+    ['dark', dark],
+    ['light', light]
+  ])('%s: canvas cards (subagent, files, ...) follow the slider and keep 4.5:1 at every position', (_n, theme) => {
+    const textCss = resolve(theme, '--text')
+    const panelCss = resolve(theme, '--panel')
+    const text = parseCssColor(textCss)!
+    const panel = parseCssColor(panelCss)!.rgb
+    const readable = glassChromeAlpha(textCss, panelCss)!
+    for (let i = 0; i <= 20; i++) {
+      const a = glassSurfaceAlpha(i / 20, readable)
+      const css = glassBackdropFilter(glassChromeBackdropRange(textCss, panelCss, a, glassMinRatio(i / 20), glassFrostFloor(i / 20))!)
+      for (const b of RANGE_BACKDROPS) {
+        expect(chromeContrast(text, panel, a, applyBackdropFilter(css, b)), `slider ${i / 20}, ${b}`).toBeGreaterThanOrEqual(glassMinRatio(i / 20) - 0.01)
+      }
+    }
+    expect(glassChromeBackdropRange('nope', panelCss, 0.5)).toBeNull()
+  })
+
   it('parses the colour forms the tokens use', () => {
     expect(parseCssColor('rgba(58, 48, 38, 0.85)')).toEqual({ rgb: [58, 48, 38], alpha: 0.85 })
     expect(parseCssColor('#282828')).toEqual({ rgb: [40, 40, 40], alpha: 1 })
@@ -256,7 +282,7 @@ describe('Glass slider (Clear ↔ Tinted)', () => {
     let prev = -1
     for (let i = 0; i <= 100; i++) {
       const a = glassSliderAlpha(i / 100, readable)
-      expect(a).toBeGreaterThanOrEqual(prev)
+      expect(a).toBeGreaterThanOrEqual(prev - 1e-9)
       prev = a
     }
     expect(glassSliderAlpha(0, readable)).toBe(GLASS_CLEAR_ALPHA)
@@ -273,6 +299,15 @@ describe('Glass slider (Clear ↔ Tinted)', () => {
     expect(glassRefraction(0)).toBe(0.025)
     expect(glassRefraction(0)).toBeGreaterThan(glassRefraction(GLASS_READABLE_TICK))
     expect(glassRefraction(1)).toBe(0)
+  })
+
+  // The filter was invisible from the Readable tick to Tinted (a 3px bend under a ~20px blur, 0 at
+  // Tinted) and cost as much GPU as every terminal blur together, so it runs only left of the tick.
+  it('refraction runs only left of the Readable tick', () => {
+    expect(glassRefractionOn(0)).toBe(true)
+    expect(glassRefractionOn(GLASS_READABLE_TICK - 0.01)).toBe(true)
+    expect(glassRefractionOn(GLASS_READABLE_TICK)).toBe(false)
+    expect(glassRefractionOn(1)).toBe(false)
   })
 
   it('a terminal tint follows the slider', () => {
@@ -382,5 +417,73 @@ describe('glass status chip keeps its label readable', () => {
     const rule = css.slice(css.indexOf(":root[data-nt-glass='on'] .term-node__status {"))
     const body = rule.slice(0, rule.indexOf('}'))
     expect(body).toContain('color-mix(in srgb, currentColor var(--term-glass-chip-wash, 0%), transparent)')
+  })
+})
+
+/** What Chromium does to one backdrop pixel for `glassBackdropFilter`'s CSS (contrast then
+ *  brightness, per channel in gamma sRGB, clamped). Measured live: a black backdrop under
+ *  `contrast(0.328) brightness(1.506)` at a 0.2 nodeterm-light tint rendered 154, predicted 153. */
+function applyBackdropFilter(css: string | null, [r, g, b]: readonly number[]): [number, number, number] {
+  if (!css) return [r, g, b]
+  const c = Number(/contrast\(([\d.]+)\)/.exec(css)?.[1] ?? 1)
+  const k = Number(/brightness\(([\d.]+)\)/.exec(css)?.[1] ?? 1)
+  const f = (v: number): number => Math.min(255, Math.max(0, ((v / 255 - 0.5) * c + 0.5) * k * 255))
+  return [f(r), f(g), f(b)]
+}
+
+const RANGE_BACKDROPS: number[][] = []
+for (let r = 0; r <= 255; r += 51)
+  for (let g = 0; g <= 255; g += 51) for (let b = 0; b <= 255; b += 51) RANGE_BACKDROPS.push([r, g, b])
+for (let v = 0; v <= 255; v++) RANGE_BACKDROPS.push([v, v, v])
+
+describe('glassBackdropFilter: readable at EVERY slider position, Clear included', () => {
+  const positions = Array.from({ length: 21 }, (_, i) => i / 20)
+  it('the promise slides from 3:1 at Clear to 4.5:1 at the Readable tick', () => {
+    expect(glassMinRatio(0)).toBe(GLASS_CLEAR_RATIO)
+    expect(glassMinRatio(GLASS_READABLE_TICK)).toBe(4.5)
+    expect(glassMinRatio(1)).toBe(4.5)
+    expect(glassFrostFloor(0)).toBe(0)
+    expect(glassFrostFloor(GLASS_READABLE_TICK)).toBe(GLASS_LIGHT_FROST)
+  })
+
+  it.each(TERMINAL_THEMES.map((t) => [t.id, t] as const))('%s', (_id, t) => {
+    const fg = parseHex(t.theme.foreground!)!
+    const tint = parseHex(t.theme.background!)!
+    for (const pos of positions) {
+      const floor = Math.min(glassMinRatio(pos), contrastRatio(fg, tint))
+      const g = glassTint(t.theme, pos)!
+      for (const b of RANGE_BACKDROPS) {
+        const ratio = contrastRatio(fg, composite(tint, applyBackdropFilter(g.backdrop, b), g.alpha))
+        expect(ratio, `slider ${pos}, backdrop ${b}`).toBeGreaterThanOrEqual(floor - 0.01)
+      }
+    }
+  })
+
+  it('dark themes leave the backdrop alone from the Readable tick to Tinted', () => {
+    for (const t of TERMINAL_THEMES.filter((x) => x.dark)) {
+      for (const pos of [GLASS_READABLE_TICK, 0.85, 1]) expect(glassTint(t.theme, pos)!.backdrop).toBeNull()
+    }
+  })
+
+  it('light themes frost from the Readable tick: a black backdrop lifts to at least GLASS_LIGHT_FROST', () => {
+    for (const t of TERMINAL_THEMES.filter((x) => !x.dark)) {
+      for (const pos of [GLASS_READABLE_TICK, 0.85, 1]) {
+        const [v] = applyBackdropFilter(glassTint(t.theme, pos)!.backdrop, [0, 0, 0])
+        expect(v / 255).toBeGreaterThanOrEqual(GLASS_LIGHT_FROST)
+      }
+    }
+  })
+
+  it('a dark theme at Clear dims, never lifts, the backdrop', () => {
+    const t = TERMINAL_THEMES.find((x) => x.id === 'nodeterm-dark')!
+    const css = glassTint(t.theme, 0)!.backdrop
+    expect(css).toMatch(/^brightness\(0\.\d+\)$/)
+    expect(applyBackdropFilter(css, [0, 0, 0])).toEqual([0, 0, 0])
+  })
+
+  it('the chrome frost in styles.css is GLASS_LIGHT_FROST', () => {
+    const css = readFileSync(join(__dirname, '../styles.css'), 'utf8')
+    const m = /--glass-frost:\s*(contrast\([\d.]+\) brightness\([\d.]+\))/.exec(css)
+    expect(m?.[1]).toBe(glassBackdropFilter({ lo: GLASS_LIGHT_FROST, hi: 1 }))
   })
 })

@@ -10,7 +10,7 @@ import { Switch } from '../ui/Switch'
 import {
   CONTROL_CHANGE_FAILED_MESSAGE,
   CONTROL_CHANGE_UNSAVED_MESSAGE,
-  CONTROL_LOCKED_TEXT,
+  controlLockedText,
   KICK_FAILED_MESSAGE,
   KICK_NOT_DONE_MESSAGE,
   PASSWORD_CHANGE_FAILED_MESSAGE,
@@ -213,7 +213,7 @@ export function ControlSection({ linkId, control }: { linkId: string; control: W
       {control.locked && (
         <div className="live-pop__locked">
           <p className="live-pop__status" role="status">
-            {CONTROL_LOCKED_TEXT}
+            {controlLockedText(control.lockedUntil)}
           </p>
           <button
             type="button"

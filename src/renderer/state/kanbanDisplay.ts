@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { readLocal, writeLocal } from '../lib/localStore'
+import { isRecord } from '../../shared/is-record'
 
 // How ONE person looks at a project's board — PERSONAL, per machine: localStorage, never the
 // git-shared .nodeterm/project.json (same rule as the view mode and the card panel). What the board
@@ -21,9 +22,6 @@ export interface ProjectBoardDisplay {
 }
 
 export type KanbanDisplayMap = Record<string, ProjectBoardDisplay>
-
-const isRecord = (x: unknown): x is Record<string, unknown> =>
-  !!x && typeof x === 'object' && !Array.isArray(x)
 
 /** Parses the persisted map. Anything unreadable is "every default"; only literal booleans are
  *  kept, so a hand-edited value can never flip a default it did not spell exactly. */

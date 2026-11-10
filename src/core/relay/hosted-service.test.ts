@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createHostedService, PENDING_TTL_MS, PENDING_MAX, type HostedService, type HostedServiceDeps } from './hosted-service'
+import { BOARD_APPEND_REFUSED } from './append-budget'
 import { transportPair } from './transport-pair'
 import { connectRelayClient, type RelayClientSession } from './relay-client'
 import { killRelayHostsByPeerKey, type PeerAttach } from './relay-host'
@@ -677,6 +678,31 @@ describe('hosted service — roles', () => {
     g.c.close()
     await vi.waitFor(() => expect(w.svc.status().peers[1].connected).toBe(false))
     expect(w.svc.status().enabled).toBe(true)
+  })
+})
+
+describe('hosted service — a Commenter cannot flood the board log (security audit F3)', () => {
+  const comment = (id: string) => ({ id, ts: 1, kind: 'comment', author: { name: 'C', color: '#fff' }, text: 'hi', pad: 'A'.repeat(50_000) })
+  it('appends are rate-bounded per peer key (a reconnect does not reset it); an owner\'s are not', async () => {
+    let t = 1_000_000
+    const w = world({ monotonicNow: () => t })
+    const owner = await ownerOnline(w)
+    const keys = genKeyPair()
+    const c = await approvedGuest(w, owner, 'commenter', 5, keys)
+    c.req(1, IPC.boardLogAppend, ['P', comment('a')])
+    c.req(2, IPC.boardLogAppend, ['P', comment('b')])
+    await vi.waitFor(() => expect(c.res(2)).toBeDefined())
+    await vi.waitFor(() => expect(c.res(1)).toBeDefined())
+    expect(c.res(1)).toMatchObject({ ok: true })
+    expect(c.res(2)).toMatchObject({ ok: false, error: { code: 'E_ROLE', message: BOARD_APPEND_REFUSED } })
+    t += 5_000
+    c.req(3, IPC.boardLogAppend, ['P', comment('c')])
+    await vi.waitFor(() => expect(c.res(3)).toMatchObject({ ok: true }))
+    owner.req(10, IPC.boardLogAppend, ['P', comment('o1')])
+    owner.req(11, IPC.boardLogAppend, ['P', comment('o2')])
+    await vi.waitFor(() => expect(owner.res(11)).toMatchObject({ ok: true }))
+    expect(owner.res(10)).toMatchObject({ ok: true })
+    expect(w.dispatched.filter((m) => m === IPC.boardLogAppend)).toHaveLength(4)
   })
 })
 

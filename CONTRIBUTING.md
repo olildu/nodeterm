@@ -6,9 +6,15 @@ its invariants — lives in `CLAUDE.md` at the repo root, which is also loaded a
 work with an AI coding agent.
 
 nodeterm is licensed **BUSL-1.1** (converts to MIT after four years — see `LICENSE`). Contributions
-are accepted under that license.
+are accepted under that license. Its Additional Use Grant does not cover production use of a build
+whose license or usage-limit checks were removed or bypassed; changing that code in a PR here is
+ordinary work.
 
 ## Getting set up
+
+You need Node.js 20+ (22 for the Server Edition) on Linux or **macOS 12 Monterey or newer** —
+the macOS floor is Electron's and esbuild's, and the README's *Build from source* section says
+what fails on an older Mac.
 
 ```bash
 npm install        # also patches + rebuilds node-pty against Electron's ABI (postinstall)
@@ -39,6 +45,12 @@ Run `npm run rebuild`. node-pty 1.1.0 leaks a pty device per spawn on macOS
 conhost alive per killed session (its exit thread deletes the ConPTY baton without closing the
 HPCON); we patch both sources before `electron-rebuild` compiles them, and that test guards the
 patches surviving upgrades.
+The same goes for `src/core/speech/smart-whisper-patch.test.ts`: `scripts/patch-smart-whisper.mjs`
+adds an AVX2 build of whisper.cpp beside the baseline on Linux x64 (issue #1267, ~10× faster
+dictation), and `npm run rebuild` applies it.
+After the rebuild, `scripts/stage-conpty-dll.mjs` copies node-pty's bundled `conpty.dll` +
+`OpenConsole.exe` back beside `build/Release/conpty.node` on Windows (the rebuild deletes them);
+without them Windows terminals fall back to the inbox ConPTY, where a fullscreen TUI cannot scroll.
 
 ## Where code goes
 
@@ -72,6 +84,11 @@ Do not replace that read with a stored `agentId` or the restart heuristic's deep
 An interpreter such as `node` is named by its script's package `bin` entry, never as `node`, so
 npm-installed CLIs such as Codex are recognized. A session released by park expiry or offscreen
 release is still messageable: existence and routing ask the backend, not the attached client.
+Both Windows owner reads (session host and direct ConPTY) go through a PowerShell probe that takes
+seconds when cold, so they get their own `WINDOWS_PANE_PROBE_TIMEOUT_MS` through
+`PtyManager.paneProbeTimeoutMs`, derived from the probe's own deadlines
+(`session-host/windows-probe-budget.ts`) — change a probe deadline there, not a literal; ssh and
+tmux keep the 2 s bound. A shell that wires agent messaging must forward that optional dep.
 Never put the submitting Enter in the same write as a message paste: `core/settled-submit.ts`
 pastes, waits for the envelope to render, then submits separately, on every backend.
 The persistent session-host transport has its own versioned messaging extension: the host checks
@@ -79,6 +96,23 @@ its session generation, OS process identity and emulator before writing. An olde
 its terminals and refuses the extension; never restart it automatically or fall back to sendKeys.
 Message dispatch publishes pending canvas edits before main resolves scope, without overwriting
 an unresolved file conflict. See `docs/windows-session-host.md`.
+
+**Windows pane probes:** never start a `powershell.exe` per probe. Pane-command and console-owner
+reads go through the per-process probe worker (`session-host/windows-probe-worker.ts`), which falls
+back to the one-shot script (absolute `powershellExe()` path) only when it cannot answer. Coalesce
+concurrent table reads, but do not add a time-based cache: the restart exit poll needs two real
+consecutive observations before it trusts a changed pane.
+
+**Windows agent launches:** a new agent launch site that types a prompt-bearing line must go
+through the launch writer (`createLaunchWriter`) so a Windows-native pane can execute the node's
+`data.launchIntent` instead (`pty:execute-launch`). If you add a launch input the core planner does
+not model, exclude it in `heldLaunchIntentFor`, or the Windows pane launches without it.
+
+**Held launches are claimed by the core, not by a tab.** Every viewer of a project runs the
+canvas launch loop against its own copy of the nodes, so a per-tab check cannot stop two Server
+Edition tabs from typing the same launch (#1173). A launch path must claim through
+`commitLaunchAttempt` with its `claim` (`workspace.claimLaunch`) and treat the `elsewhere`
+outcome as "another viewer is typing it": no input, no state change, no failure.
 
 Claude usage identity is scoped to the same config directory as its credentials. Read organization
 metadata even when credentials already include an email, and degrade to the email-only row when
@@ -93,6 +127,15 @@ transcript discovery or debug-file writes finish; an older write must never rest
 Coalesce renderer updates before building the workspace map, without resetting the scheduled task.
 Intermediate publications retain resolved transcript paths only for unchanged identities; changing
 a session/account/location/hook path or removing the target invalidates that cache immediately.
+
+Windows updates (unsigned beta): `release-win` builds `dist:win:release` (`nodeTermUpdates=manual`)
+and uploads `latest.yml`, so the app shows a passive "new version — Download" card; it never
+downloads or installs, and main refuses restart-to-update for any non-self-installing build.
+Keep local `dist:win` on `disabled`, and never upload Windows `*.blockmap`s until signing lands.
+
+Updater UX: an update-check button must call `checkForUpdatesNow()` (`state/pendingUpdate.ts`) —
+the card treats every other check as automatic and silent. Never flip quitting flags before
+the install can start (macOS waits for Squirrel.Mac); see CLAUDE.md "Packaging & auto-update".
 
 Windows installer safety (#829): `build/installer.nsh` overrides NSIS's process-killing check.
 A running app or session host blocks install/uninstall, and a failed process query blocks too.
@@ -110,6 +153,9 @@ confirms what still stops (Cancel focused), then sends the host's `shutdown` com
 once the host process is confirmed gone. `shutdown` is a negotiated hello feature: never send it to
 a host that did not advertise it, and never add a taskkill/name-kill fallback — an older host gets
 the manual steps. The flow never deletes a node. Server Edition: degraded stub (`unsupported`).
+A host classified `staged` (runs from its `%LOCALAPPDATA%` copy) only needs a quit, so the dialog
+leads with "Quit nodeterm (sessions keep running)"; `unknown` must never be treated as staged.
+The NSIS preflight waits (bounded, exit 10 only) in silent/`--updated` runs and never kills.
 
 Staged host runtime (#829 step 3): a packaged Windows build launches the host from a private
 copy, `%LOCALAPPDATA%\nodeterm\session-host\<version>-<fingerprint>\nodeterm-sessionhost-v2.exe`
@@ -152,7 +198,9 @@ picker — goes in `renderer/lib/nodeActionItems.tsx`, never inline in `Canvas.t
 menu, the sessions-sidebar row menu and both kanban card menus (through
 `components/kanban/cardMenu.tsx`) build from it. Decide in the same change whether a card offers
 the new row: a card takes only `BOARD_NODE_ACTION_IDS`, and a row that acts on canvas position goes
-in `BOARD_SPATIAL_ROW_IDS` instead. Remember the board acts on nodes of projects that are NOT on the
+in `BOARD_SPATIAL_ROW_IDS` instead. The card modal's ⋯ menu takes `BOARD_MODAL_ACTION_IDS` through
+its `sessionActions` prop, closes the modal before the action runs, and is absent when the card has
+no session row. Remember the board acts on nodes of projects that are NOT on the
 canvas (the Omni board): write through Canvas's `nodeWritesFor(projectId)` (built on
 `createNodeWriteRouter`, `lib/nodeWriteRouter.ts`), never a live-canvas callback, and report a failure with a `nodeterm:toast`.
 `lib/nodeActionItems.guard.test.ts` fails on a second copy of the rows.
@@ -238,12 +286,45 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
 
 ## House rules
 
+- **Check `src/shared` before writing a two-line helper.** A JSON-object guard (`isRecord`), an
+  error's message (`errorText`), `sleep`, the root-space parent walk (`rootPositionWith`) and the
+  credential-store temp sweep (`sweepForeignTempFiles` in `core/fs-atomic.ts`) each existed in five
+  to twenty-one hand-typed copies until #1252's follow-up, and the parent walk's copies had already
+  drifted apart on corrupt canvases. A local helper that shares a name but behaves differently
+  (zellij's `errorText`, windows-conpty's array-accepting guard) is not a copy; leave it alone.
+
+- **Typing into a pane by node id goes through `PtyManager.sendPaneKeys`, and an SSH-project node
+  is never read or typed into on the local tmux socket.** An unmounted remote node resolves through
+  `remoteNodeOwner` or is refused (`not-connected`); `paneCommand` / `paneOwner` resolve unmounted
+  nodes only with the explicit `{ resolveUnmounted: true }` option. See Bulk pause in `CLAUDE.md`.
+
+- **A node id never reaches tmux as a bare `-t`.** Use `exactPaneTarget` (`=nt-<id>:`) or
+  `exactSessionTarget` (`=nt-<id>`) from `core/tmux-naming.ts`, and single-quote it on a remote
+  command line (zsh expands a leading `=`). tmux prefix-matches a bare target on a miss, so `nt-x-1`
+  reaches a live `nt-x-12`: a relay peer naming a prefix typed into, read and killed another
+  project's terminal (security audit F1/F2). `pty-exact-target.realtmux.test.ts` drives a real
+  `PtyManager` to prove it; see "Exact tmux targets" in `CLAUDE.md`.
+
+- **A relay peer's node ids, presence and shared folder are judged host-side.** A scoped guest's
+  newly introduced node unlocks only its own `newOnly` spawn, presence reaches a non-editor only for
+  peers on its shared projects, and a project rooted at `/`, `$HOME` or an ancestor of either is
+  never shared (`core/relay/share-root.ts`). A UI that hides an option is convenience; the policy in
+  `core/relay/` is the gate. See "Remote access" and "Hosted team relay" in `CLAUDE.md`.
+
 - **Branch labels describe a checkout on one core.** Share existing status reads through
   `renderer/state/gitBranches.ts`; do not cache a branch forever by project id or copy a project
   branch onto worktree nodes. Source, Sessions and worktree headers consume the same observations,
   keyed by API identity, exact cwd and (for SSH) project identity. Never probe an SSH cwd locally
   from a background header: only the active SSH project is git-routable. SSH headers observe
   Source refreshes instead.
+
+- **Pty input is filtered for exactly one thing: duplicate Device Attributes answers.** Every viewer
+  of a session (browser tabs, a kanban card modal, a relay peer) answers the tmux client's DA
+  handshake, and tmux types every answer after the first into the pane. `core/da-reply-gate.ts`, in
+  `PtyManager.write`, lets one DA1/DA2 reply through per query seen on the output and drops the rest.
+  Do not widen it to "anything that looks like a terminal report": `ESC[1;2R` is both a CPR and
+  Shift+F3, and a filter that eats a keystroke is worse than the bug (see CLAUDE.md → Terminal
+  session continuity).
 
 - **A port is a node's only if its listener is in that node's process tree.** Dev-server
   discovery (`core/dev-ports.ts`) attributes ports by socket ownership and never connects to
@@ -254,6 +335,13 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
   core re-scans and decides the host-side target. Treat `ss`/`lsof`/`ls` output as attacker-
   influenced text: a process name is chosen by the process, so parse each owner group on its own and
   never let a name reach a pid (see CLAUDE.md → Dev-server ports).
+
+- **App-originated text goes only into an empty prompt.** A note nodeterm types into an agent on
+  its own (the context-link discovery note, a sticky pushed over a note link) goes through
+  `linkNoteRefusal` + `pty.sendToEmptyPrompt`, never a bare `pty.sendText`: `sendText` pastes and
+  presses Enter, so it submits whatever the user had half-typed with it (#1144) and answers an open
+  permission dialog. Emptiness is read off the screen (`readClaudeComposer`), so an agent without a
+  measured composer reader gets no note — and a skipped note is named in a notice, never silent.
 
 - **A GitHub issue reaches a pane only as a validated reference.** Issue titles and bodies are
   written by strangers on public repositories, and a launch line is typed into a shell. Anything
@@ -278,6 +366,14 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
   hook prints a JSON answer only after a strict prefix/size/one-line check, so a new decision shape
   must pass `isBoundedAnswerContent` or it is silently ignored. Answer content never goes on an argv.
   See `docs/hook-reply-approvals.md`.
+
+- **`NODETERM_NODE_ID` is inherited, so a hook event's node id is not proof it is that node's
+  session.** A detached `claude -p` started from a node, or Claude's own daemon hosting a fork,
+  posts hooks under the node's id (and its token). Claude events pass `core/agents/claude-pane-origin.ts`
+  in the hook server before ANY listener: the managed script reports `$CLAUDE_PID`'s foreground
+  flag and tty, and only the pane's foreground claude speaks for the node. Do not add a listener
+  that runs before that gate, and do not "fix" a stuck node by loosening it: missing facts already
+  fail open. Both shells call `wireClaudePaneOrigin` (pinned by `hook-verified-parity.test.ts`).
 
 - **Never call the user's machine a Mac in user-visible copy.** Use `thisMachine()` /
   `thisMachineCap()` / `machineNoun()` from `src/renderer/lib/machineName.ts` — "this Mac" on
@@ -327,6 +423,13 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
   cannot read) and test Windows dispatch WITHOUT `windowsVerbatimArguments`; keep the `AutoRun`
   refusal. Deep version: `docs/antigravity-agent.md` and CLAUDE.md § Agent support.
 
+- **On Windows, only claude runs POSIX.** Claude Code runs hooks and tools through Git Bash; codex,
+  gemini, grok and copilot run them in PowerShell/cmd.exe. So a hook command or a "run this shim"
+  line for any other agent goes through the `.cmd` helpers in
+  `src/core/agents/hooks/windows-hook-wrapper.ts` / `shared/agents/shim-invocation.ts`, and every
+  builder takes the RUNNING machine's platform with a POSIX default — never `process.platform`
+  inside a builder an SSH installer also calls. Deep version: CLAUDE.md § Hook installers.
+
 - **Finding `agy` for hook installation is not enough to launch it.** The measured Windows
   installer wrote `%LOCALAPPDATA%\agy\bin` into a `REG_SZ` user PATH, so command lookup kept the
   percent expression literal and `agy` was not found even though its executable existed. Local
@@ -351,7 +454,11 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
   from the start with "ask me again" selected, "don't ask again for agents in <project>"
   (machine-local, keyed by project id, pruned like `settings.sidebarCollapsedItems`) or "don't ask
   again in any project until nodeterm quits" (in-memory — not `settings.json`, not `localStorage`,
-  so quitting restores the gate). Hiding a reach behind a checkbox made it read as missing. The machine-WIDE waiver stays Settings-only, because that is
+  so quitting restores the gate). Hiding a reach behind a checkbox made it read as missing. The
+  per-project answer can also be given up front from the project tab's "Agents may, without asking"
+  menu; it writes the same machine-local map through the same `withProjectWaiver`, never a second
+  copy of the merge, and each row shows what the gate will actually do (`projectWaiverState`), so
+  an app-run or global waiver is named rather than hidden behind an unchecked box. The machine-WIDE waiver stays Settings-only, because that is
   the one a stray click in a dialog that appeared under the user's hands must not be able to grant.
   Offering only the app-run one was its own failure: it is not what a user who ticks "don't ask
   again" means, so the real choices were "be asked forever" or "turn it off everywhere". Two rules
@@ -481,6 +588,12 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
   on POSIX a backslash is legal filename text — do not treat both separators as interchangeable
   unless the owning filesystem is known to be Windows.
 
+- **No unix sockets and no symlink privilege on Windows.** A `ws+unix://` dial (the Codex
+  app-server) cannot work there — read the same fact from disk instead (managed Codex identity is
+  the `auth.json` JWT email, `codexAppServerReachable` is the gate). An untyped `fs.symlink` throws
+  EPERM on a stock account: link a shared asset through `linkSharedEntry`
+  (`src/core/shared-entry-link.ts` — junction for directories, hardlink then warned copy for files).
+
 - **Anything tmux does for us on POSIX, the session host owes on Windows.** The two delivery paths
   are not symmetric and the missing half fails in the direction that LOOKS like success: `sendText`
   rides `tmux paste-buffer -p` on POSIX, which frames the payload from the pane's real
@@ -492,12 +605,30 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
   sees the pane app's own bytes — see CLAUDE.md's "We have our own VT emulator" for the one place
   that reasoning is inverted.
 
+- **An xterm-shaped buffer never takes the raw `tmuxScrollback`.** tmux's `history-limit` stores
+  only used cells; an xterm buffer (the renderer, the Windows session host's headless emulator,
+  `NativeWindowsPane`) allocates every line at full width. Size them with `xtermScrollback` from
+  `src/shared/scrollback.ts` (≤ 10k), so the host never keeps history the renderer cannot show.
+- **The app's own environment is not the panes' environment.** Whatever launched nodeterm (often an
+  agent CLI's shell) leaves markers in `process.env` that describe THAT session. `buildPtyEnv` strips
+  an explicit list (`TMUX`, `NESTED_AGENT_ENV_STRIP`); add a name there, with its measurement, rather
+  than a prefix sweep — `CLAUDE_CONFIG_DIR`/`CODEX_HOME` select managed accounts and must survive.
+
 - **A new session-host push frame must be negotiated at `hello`, never just sent.** An older
   `SessionHostClient` treats EVERY push frame whose `type` is not `data` as an exit, and a
   long-lived host routinely outlives the app that started it — so a frame the connection did not
   opt into retires a live session. Add the capability to `SESSION_HOST_FEATURES`, send it only to
   sockets that listed it (the `geometry` push of issue #914 is the worked example), and pin that
   against the real bundled host as `session-host/geometry-host.test.ts` does.
+  The same goes for a richer REPLY: `listSessions`' per-session rows ride the `sessionDetails`
+  feature, and a host that never negotiated it answers `{names}` — which a consumer must read as
+  "named, not described", never as "detached" or "no processes".
+
+- **Every xterm sizes characters through `activateTerminalWidths` (`src/shared/terminal-width.ts`).**
+  The renderer's terminals and the session host's emulator must agree with each other, with tmux and
+  with the agent CLIs about how many cells a character takes, or a repaint by cursor position leaves
+  stale text behind (an emoji + VS16 did exactly that). Change widths there, never in one emulator,
+  and test them on a real `@xterm/headless` terminal rather than on the provider's return values.
 
 - **Finding a Windows executable is not the same as being able to spawn it.** A PATH lookup may
   correctly resolve an npm CLI to `<name>.cmd`, but Node's `execFile`/`spawn` cannot execute that
@@ -507,6 +638,20 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
   prompts and other user-controlled arguments would become shell syntax. `.bat`/`.ps1`, CR/LF/NUL
   arguments and lines above cmd's limit fail explicitly. Keep stdin direct: PowerShell's text
   pipeline changes Unicode and line endings under Windows PowerShell 5.1.
+
+- **Need a POSIX `sh` on Windows? Resolve Git Bash, never spawn bare `sh`.** A stock Git install
+  puts only `Git\cmd` on PATH. `resolveWindowsSh` (`src/core/windows-sh.ts`) walks Git's real
+  layouts, then PATH minus WSL shims; the codex hook wrapper's batch candidate list is derived from
+  the same data, so add a layout there, once. With no shell, say "Install Git for Windows" — the
+  project setup-script runner is the worked example (it also sets `CHERE_INVOKING=1`, or Git Bash's
+  login profile leaves the project folder). And do not type a chained command line (`a && b '<x>'`)
+  into a terminal for the user: PowerShell 5.1 and cmd parse it differently. Type one bare command
+  and do the rest in-process (Source Control's publish fallback, `lib/publishFallback.ts`).
+- **Closing the window on Windows hides it to the tray (background mode), it does not quit.** The
+  relay host, hook server and notifications must outlive the window there as they do on macOS. Any
+  new app-initiated quit (updater-style) must set `quitting` before `app.quit()`, or the hidden
+  window's close handler turns the quit back into a hide. Every new raise (`show`/`focus`) needs a
+  user action and an entry in `window-raise.guard.test.ts`.
 
 - **The phone reaches a Windows desktop through the relay only.** Everything the iOS app sends over
   SSH is POSIX sh plus tmux, and Windows OpenSSH hands out `cmd.exe`, so Windows pairing installs no
@@ -521,6 +666,55 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
   a session for a phone-named node id directly (`attachDetached` / `createDetached`): that is how an
   SSH node became a local shell in this machine's `$HOME`. CLAUDE.md, "A remote node is NEVER
   spawned locally".
+
+- **Relay backpressure is undone by a drain sweep, never by the next chunk of output.** A paused
+  pty produces no next chunk, so a resume that waits for one never comes: that froze the phone's
+  terminal for good after a single >8 MB burst. `host-service.ts` arms a 250 ms sweep while a stream
+  is paused, then repaints with a snapshot before it resumes — the same drain-sweep pattern as
+  `core/ui-sink-registry.ts` (whose self-paced sinks never drop). A new paused path needs the same
+  trigger. CLAUDE.md, "Remote access".
+
+- **An SSH project's node runs on the project's host — ask the project, not the node.** Node
+  fields like `sshRemoteTmux` arrive through a shared `project.json` that the host's own desktop and
+  teammates also write, so a node without them must still never become a local shell (issue #1186).
+  `fileToProject` derives the routing from the project's SSH record, the file written back to the
+  host stays neutral, and core refuses a local spawn owned by an SSH project
+  (`PtyManager.setSshProjectCheck`). A new path that turns stored nodes into live ones or spawns a
+  terminal goes through those, not through the node's fields alone. CLAUDE.md, "A remote node is
+  NEVER spawned locally".
+
+- **A relay / team tab's node runs on the host, and the SESSION it mounts under decides that — the
+  node may carry nothing that says "remote".** A project shared from SSH with a team is adopted by
+  the host, which drops `sshRemoteTmux`/`ssh` from its nodes, so they reach the tab as plain
+  terminals. Four rules keep them off this core (bug F: a team tab's terminals became local tmux
+  sessions here):
+  - A node's session follows the project React Flow's STORE holds (`useFlowStoreOwner`); never key
+    a node subtree's `SessionProvider` on `activeProjectId`. xyflow copies nodes into its store one
+    commit late, so a key on the active id remounts the outgoing nodes under the incoming session.
+  - An unbound remote project resolves to the OFFLINE relay session (`sessionForProject`), never the
+    local one. Code asking "which live session is bound to this tab?" asks `boundSessionForProject`.
+  - A surface that mounts a terminal outside the canvas (the kanban card modal — both boards live
+    under App's LOCAL provider) runs under `sessionForProject(<its project>)` and provides
+    `OwningProjectContext`: wrap it in `ProjectSessionScope` (`session/owning-project.ts`). A new
+    terminal-creating path also asks `spawnBelongsElsewhere(isRemoteProjectId(<owning project>),
+    session.source)` before its first create; ask `isRemoteProjectId` (session.ts), never
+    `getProject(id)?.remote`, which misses a tab the store deleted. A component
+    under it that keys data by project (the board log, card metadata, pull requests) reads
+    `useOwningProjectId() ?? activeProjectId`, never `activeProjectId` alone: on the Omni board the
+    card's project is not the active one, and its `useSession()` api answers for the card's project.
+  - Core `join` refuses (`held-elsewhere`) a `requireRemote` create onto a held session that is
+    local or on another host, but a create that names no `sshRemote` still attaches to a held
+    REMOTE session, so core alone does not stop a caller that names only a node id. A new caller
+    that creates a remote node passes `requireRemote` plus the `sshRemote` it has, and treats
+    `held-elsewhere` as a refusal that is NOT a lost connection (no reconnect, no drop report).
+  Do not "fix" this by re-stamping `sshRemoteTmux` onto those nodes: the host would then refuse its
+  own sessions. CLAUDE.md, "Projects (tabs)".
+
+- **Read agent status through the node's session — `useSessionStores()` / `agentStatusForProject` —
+  never `useAgentStatus` directly, in any surface that can show a team tab's node.** A team tab
+  keeps its host's status in its own session store and shares node ids with the SSH project it was
+  handed off from, so the default store answers for the wrong project. CLAUDE.md, "A relay session
+  owns its agent status".
 
 - **Phone keys and store links are platform-neutral.** New paired keys are stamped
   `nodeterm-mobile-<id>`, but revoke must keep matching the legacy `nodeterm-ios-<id>` stamp every
@@ -590,6 +784,15 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
   management calls prove the same key through their own protocol (`src/core/push-webhook.ts`) — do
   not fold one into the other. Change the relay protocol and `relay-pop-vector.json` must change in
   both repos. Deep version: CLAUDE.md § Hosted team relay.
+
+- **A peer's X25519 key goes through `src/core/relay/e2ee.ts`, never straight into
+  `nacl.box.before`.** `deriveSharedKey` refuses a low-order key (raw X25519 output all zero: the
+  shared secret would be a public constant, the SAS a fixed value) and `publicKeyFromB64` refuses
+  non-canonical base64; a new intake of a key someone will PIN (an offer, a code, a QR field, a pin
+  store) validates with `peerPublicKeyFromB64` / `isUsablePeerKeyB64` and gets a
+  `low-order-keys.test-support.ts` test. A new surface that SHOWS the SAS shows `SAS_COMPARE_HINT`
+  (`src/shared/remote/sas.ts`) under it, and nothing compares SAS strings across builds (a v1 peer
+  shows the first six of the ten digits). Deep version: CLAUDE.md § Remote access.
 
 - **Normalize BOTH sides of a path comparison, through one function.** A marker normalized where
   it is built and matched raw where it is used is a no-op on the machine you wrote it on and a
@@ -695,6 +898,12 @@ bug.
 name the project boundary and explain that cross-project linking is unsupported; do not scan other
 projects just to improve a missing-endpoint diagnostic.
 
+**A memory lever that drops a terminal's PTY client asks the live-work gate first**
+(`terminal/live-work.ts`): without tmux the pty IS the shell, and the "free" release kills the
+agent in it. A hidden/minimized window feeds the existing levers by making every node read
+offscreen (`terminal/window-backgrounded.ts`) — reuse that input rather than adding a parallel
+release path that would have to re-implement every gate.
+
 **A failed read is never evidence of absence.** "Could not measure" and "there is nothing" are
 different facts and must stay distinguishable at every layer. Collapsing them is how a panel ends up
 reporting "no sessions" on a host running thirty. When something ACTS on the negative, give it three
@@ -724,6 +933,13 @@ ANSWER) into "the ControlMaster is down" (a NON-answer, session still running). 
 the debt down and settle it later (`core/pending-remote-kills.ts`). Silently dropping it is the one
 option that is never available.
 
+**Server Edition sign-in rules are load-bearing** (security audit 2026-10; see CLAUDE.md →
+Server Edition sign-in). A login attempt reserves its rate-limit slot before its body is read and
+verifies with the async scrypt behind a 2-slot gate — never `scryptSync`, which stalls every
+terminal. A new auth POST lives under `/auth/` so the shared same-origin check (`src/server/origin.ts`)
+covers it. Header trust from a loopback peer needs `NODETERM_TRUST_PROXY_SECRET`, which is read from
+the environment only and never logged.
+
 **A Server Edition agent owns only nodes it freshly opened in this server run.** The
 creator ledger is process-local and must never be rebuilt from `.nodeterm/project.json`, titles,
 hook history, or a surviving tmux name: all are writable or stale. A restart therefore clears
@@ -732,6 +948,17 @@ mutations and message delivery validate every target before writing anything; mi
 named refusal. Validate Server upgrades against a disposable data directory and port. Restarting a
 shared live service is
 an explicit operator action, never a test or an automatic repair step.
+
+**A canvas-control verb you add in `Canvas.tsx` does not exist on the Server Edition.** The verbs
+run in the DESKTOP renderer's dispatch; the browser bridge never subscribes to `onAgentControl`, and
+the Server Edition answers `/control/*` itself (`src/server/control-unsupported.ts`), serving only
+`SERVER_V1_VERBS` through the headless node factory. Everything else — `list`, `arrange`, `move`,
+`resize`, `place` included — gets the named permanent `control-unsupported-on-this-edition` refusal.
+So "it is in the renderer, so both shells have it" is false here; either add a headless action or
+leave the refusal, and pin which in `control-unsupported.test.ts`. A new verb's flag gate goes in
+`src/shared` and is called from desktop main's control handler too (it never runs
+`parseControlRequest`), and a new verb should refuse a flag it does not read by name (#539) rather
+than ignore it.
 
 **A plain terminal is not a Claude node.** It may carry the generic node/endpoint wiring needed for
 a hand-launched agent to report hooks, but it gets no `NODETERM_AGENT_ID` and no
@@ -798,6 +1025,12 @@ installation-qualified endpoint only after bearer verification. A wrong bearer a
 any handler runs; only that explicit wrong-owner response (or transport failure) permits endpoint
 failover. A node-identity 403 stays final. Test with disposable sockets, never a running user's tunnel.
 
+**A hook-server client sends no `Origin` and a loopback `Host`.** The server refuses both before
+the bearer (a browser page, DNS rebinding included, is the caller this keeps out). curl, Node's
+`http` and fetch, and Bun's fetch all comply as they are used today; a new client that sets an
+`Origin`, or names the server by anything but `127.0.0.1` / `localhost` / `[::1]`, gets a 403.
+`hook-server.browser-guard.test.ts` drives the real transports — add yours there.
+
 **Both raw listeners change together** — `src/main/index.ts` and `src/server/agent-status.ts`. A new
 field on a hook event that reaches only the desktop leaves the Server Edition quietly without the
 feature, and the boundary tests can only tell you an import is wrong, never that a field is missing.
@@ -841,6 +1074,19 @@ shipped: managed-account `CLAUDE_CONFIG_DIR` leaked into system-account sessions
 env either joins `ACCOUNT_SCOPE_UPDATE_ENV` / the gateway list, or rides `-e` — and gets a
 real-tmux test (`account-env.realtmux.test.ts` is the pattern).
 
+**A synchronous tmux call on main always has a timeout.** Use `PtyManager.runTmuxSync` (2 s,
+`TMUX_BOOT_CMD_TIMEOUT_MS`), never a bare `execFileSync` on the tmux socket: one runs before the
+first window exists, and a wedged server held an unbounded call for as long as it stayed wedged
+(4.05 s in a repro). Warn on a timeout and fail open; keep "no server yet" silent.
+A call that runs on every spawn also needs a cooldown after a timeout
+(`TMUX_UPDATE_ENV_COOLDOWN_MS`), or each spawn waits out the same wedge again.
+
+**The same goes for the CWD: a tmux client never runs in the node's directory.** The server keeps
+the cwd of the client that started it, and from tmux 3.7 a new pane's `-c` is silently dropped once
+that directory is deleted — every new terminal then opens in the deleted dir (issue #1131, measured
+on tmux 3.7c). The local tmux client is spawned from `localTmuxClientCwd()` (home, else `/`) and the
+pane's directory rides `-c` only. The plain-shell fallback IS the pane and keeps the project cwd.
+
 **A new keyboard chord has to survive the shells, not just the renderer.** The application menu is
 ours (`buildAppMenu` in `main/index.ts`), but its command-style accelerators — ⌘Q, ⌘M, ⌘W, ⌘0, ⌘⇧B,
 ⌘, — are still handled above the page, so your `keydown` branch simply never runs: steal the chord
@@ -858,6 +1104,10 @@ make it show up; a command with no effective binding is omitted rather than list
 `ShortcutsPanel.test.tsx` is the watchdog and reds if a command fails to surface. The panel it
 replaced hand-listed 24 ids against a 45-command registry and had drifted four live chords behind
 — if you find yourself typing a command id into that file, that is the bug reappearing.
+
+**`keybindings-handler-parity.test.ts` checks only the ids in its `checkedIds`.** Add a new
+ships-unbound command there, or nothing catches a missing `'<id>':` handler entry in Canvas.tsx
+(the handlers map is `Partial`).
 
 **Comments explain WHY, and name the failure they prevent.** The codebase is deliberately dense with
 reasoning. A comment that restates the code is noise; one that says "do not simplify this back,
@@ -881,6 +1131,13 @@ record path into a remote host is both wrong and a local-layout leak. A guard te
 (`remote-shim-neutrality.guard.test.ts`), because the leak is silent — the remote shim keeps
 working, and nothing goes red.
 
+**A Codex hook is identified by its payload, not its env.** Hooks the shared app-server runs are
+the daemon's children: they carry the daemon's env (often a stale pane's `NODETERM_NODE_ID`) and no
+`CODEX_THREAD_ID`. The codex hook script reads the payload's leading `session_id` before the prelude
+and lets that thread's record outrank an inherited id; only a pane marked `NODETERM_CODEX_PLAIN=1`
+(the launcher's in-process exits) keeps its own. Do not move the codex payload read back below the
+prelude (`codex-shared-daemon-hook.test.ts` runs the real script against the real hook server).
+
 **That prelude may not decide anything a pane already decided.** It exports the agent id and the
 canvas-control grant the ownership RECORD carries, never constants. They used to be hardcoded
 (`codex`, granted) and both are `buildPtyEnv`'s answers: a custom agent inheriting the codex harness
@@ -902,6 +1159,13 @@ to kill the process. The stack it carries was captured at the write, so the cras
 happened synchronously at your `console.log`, and wrapping that call in `try/catch` changes nothing
 (measured on node 22). If you write to a stream that can go away, attach an `'error'` listener and
 latch the writer off — `installLogSink` (`src/core/log-sink.ts`) is the worked example. Issue #382.
+
+**A dead or hung process is logged, never acted on.** `child-process-gone`, window
+`unresponsive`/`responsive` and external WebGL context losses each write one tagged line to the
+debug log ring (`main/process-health-log.ts`, `[webgl]` in `terminal/webgl-budget.ts`) and nothing
+else. Chromium respawns its own GPU process; a reload or relaunch on top of that turns a GPU reset
+into a lost session. If you add a loss path, report it through `handle.contextLost(kind)` so the
+external counts stay apart from our own `loseWebglContexts` releases.
 
 **A retry budget must measure the thing it is waiting for, and running out must be VISIBLE.** The
 armed-launch loop (canvas-control `--after`, and the cold open a `--project` node gets) delivered its
@@ -979,7 +1243,16 @@ account, breadcrumbs, closed-session history, per-node `shell` and held `pending
 And **`workspace.json` is one file with last-writer-wins semantics, so it may not be the only home
 of any content**: that is precisely what let a second app instance erase a cwd-less canvas. Between
 two instances the arbiter is the file's `rev` — a lower rev never overwrites a higher one — and
-there is no merge; if you add a fourth kind, give it a file and say which rev wins.
+there is no merge; if you add a fourth kind, give it a file and say which rev wins. The fourth is the
+folder-data-ref (issue #1145: a folder project whose canvas lives in app data): its file is the
+inline one, `writeDataFile`'s rule decides between instances, and the rev continues across a move
+between the folder and app data. Anything that reads or writes `<cwd>/.nodeterm/` must ask
+`folderFileCwd(e)` (or the side-file accessors), never `e.cwd` alone — a project can have a cwd and
+nothing in its folder. Such a project's side files keyed by node id (whiteboards) go under its own
+app-data root, never into a folder every project shares: two folders holding one committed canvas
+share node ids. And `lastWritten` is a record, not evidence that a file is on disk: a file
+can leave a folder behind the store's back (`git rm`, a checkout), so nothing may be deleted
+because the store remembers writing its replacement. The data-file sweep asks what THIS save wrote.
 
 **A project with no folder is a real project — degrade explicitly, never silently.** "New project"
 creates a cwd-less canvas, so every folder-shaped feature meets one. Keep the affordance and
@@ -987,6 +1260,8 @@ disable it with its reason (`NEW_FILE_NO_CWD_HINT`,
 `WORKTREE_NO_CWD_HINT`, the Explorer/Source Control notes); a row that simply vanishes teaches
 nothing, and a message that names the wrong cause ("not a git repository" for a project that has no
 folder to be one) sends the user hunting a problem that does not exist.
+
+**Opening a project goes through `gateProjectOpen` (`src/renderer/lib/projectLimitGate.ts`); a new way to open one must call it — see `docs/project-limit.md`.**
 
 **Agent features attach to base harness capabilities, not frontend allowlists.** A custom agent can
 inherit a builtin harness, so add the capability and its one shared leaf (`src/shared/agents`) and
@@ -1060,6 +1335,22 @@ the kind union, so a new kind is a **compile error** until you route it. The kan
 `addMenuSpec.surfaces.test.ts` pins that split so "make them all consistent" stays a decision
 rather than a reflex.
 
+**A surface that takes the whole keyboard marks itself `data-nt-keyboard-owner`.** The canvas
+decides "is the user typing" from the focused element (`isTypingTarget` and friends), and a canvas-
+or div-based editor — the whiteboard's Excalidraw — is not a text field to that check, so Space,
+Delete and ⌘Z reached canvas commands over it. The attribute is honoured by every typing-aware key
+site through `isKeyboardOwnerTarget` (`lib/keyContext.ts`); add new sites to it, not a class list.
+
+**Files a node owns are addressed by id, never by a path from node data.** `project.json` is
+git-shared and hand-editable, so a path in it is attacker-controlled: a whiteboard's side file is
+derived by the core from (project, node id) (`core/whiteboards.ts`), and the id must be a string
+passing `isSafeNodeId`. A copy refers to its original by id (`whiteboardSource`), not by path.
+
+**A new node kind also gets a default size the user can change.** Add it to `SizableNodeKind` /
+`SIZABLE_NODE_KINDS` (`shared/default-node-size.ts`) and `BUILTIN_NODE_SIZES`, and place it with
+`placeSized(kind, …)` in its factory. A literal `*_SIZE` passed to `placeNode` compiles fine and
+quietly ignores Settings → Behavior → Default node size for that kind.
+
 **A setting read at mount reads the DEFAULT, not the user's.** `useSettings` starts on
 `DEFAULT_SETTINGS` and hydrates from disk asynchronously, while `<Canvas />` is mounted before that
 lands. A `useState(() => settings.foo ? ...)` initializer therefore reads the shipped default and
@@ -1119,6 +1410,20 @@ Grok billing diagnostics must keep HTTP codes and safe failure categories per bi
   was typed. Nothing may treat it as "safe to resend": the phone keeps the draft, re-reads, and lets
   the user decide. Only `'refused'` means nothing was typed.
 
+**`nodeterm://` links.** A link proves nothing about who sent it (any web page can build one), so
+the confirm sheet is its whole authority. It is off unless the user turns on
+`settings.allowOpenLinks`, and main checks that flag itself. Four rules get a PR sent back:
+- **No power flags.** A link opens one node in the project's default permission mode. Never add a
+  param for a permission mode, `--after`, a model, a count or "open without asking" (the signed-link
+  design in `docs/superpowers/specs/2026-10-13-open-link-design.md` is the only planned way to skip
+  the sheet).
+- **The renderer only chooses.** Its answer is a candidate id main offered, "new project", and a
+  title. The cwd and prompt in the final open come from main (`src/main/open-link.ts`), never the
+  reply.
+- **Enter never opens it.** Only a pointer click on Open, after the 1 s arm.
+- **What the human sees is what runs.** No hidden Unicode in a prompt or path (`hasHiddenText`), no
+  path that can reach another machine, and the permission mode shown is re-checked at landing.
+
 ## User-owned agent settings
 
 **Nothing writes into an agent's global config except `src/core/agent-integrations.ts`** (issue
@@ -1128,8 +1433,18 @@ for an agent the user ENABLED in `settings.agentIntegrations`, removed when they
 alone while they have not answered. Do not add a direct call to an installer; add the artifact to
 the lifecycle (local) or to the `RemoteHooks` artifact plan (SSH), and give it a removal that
 deletes only what nodeterm wrote. `src/core/agent-integrations-wiring.test.ts` fails on a new call
-site. Do not merge text into `AGENTS.md` / `GEMINI.md` — agents get skills (progressive disclosure)
+site. **A file nodeterm writes at every boot is never evidence of a pre-consent install** — the
+grandfathering check (`detectExistingIntegrations`) counted the always-written userData shims and
+silently enabled every agent on a fresh install's second boot (#1149). Only a non-empty
+`~/.nodeterm/agent-hooks/` counts, and only on an install's first boot (the fresh-install marker). Do not merge text into `AGENTS.md` / `GEMINI.md` — agents get skills (progressive disclosure)
 instead; the old blocks crowded codex's 32 KiB instruction budget.
+
+**opencode has two managed plugins and they must stay two** (issue #1136): the 1.x file
+`plugins/nodeterm-status.js` exports ONLY the named function — opencode <= 1.2.10 calls every export
+as a function and dies on a default object, for every command on the machine — and 2.x gets the
+directory `plugins/nodeterm-status-v2/`, which no 1.x loads. The 2.x plugin stays silent inside the
+shared `serve --service` server (its env belongs to another pane); see CLAUDE.md for the
+measurements.
 
 Claude/Gemini settings must go through the guarded transactions in
 `src/core/agents/hooks/{settings-file,remote-settings-file}.ts`. Confirmed absence or a successfully read empty/whitespace file may start from `{}`;
@@ -1186,11 +1501,36 @@ bite most often:
 - `handleNodesChange` must not call `onNodesChange` with an empty batch (it re-renders the canvas
   every frame through React Flow's ResizeObserver).
 - Work done per terminal on a project switch must be coalesced and on-screen-first.
+- Don't put a `backdrop-filter` on a surface whose content changes often. Chromium re-runs it
+  every time the surface is drawn, and the damage spreads to the glass next to it. Liquid Glass
+  terminals frost a static wallpaper copy instead (`.term-node__frost`, `lib/glassFrost.ts`): six
+  streaming terminals went from 92% to 42% GPU. The SVG refraction filter (`url(#nt-refract)`)
+  runs only left of the Readable tick, for the same reason.
+- macOS memory pressure comes from the kernel's level (`onKernelPressure` in
+  `core/memory-pressure.ts`), fired on escalations only, and at the same severity at most once per
+  `KERNEL_LEVER_GAP_MS` (a level flapping normal/warn re-arms it every fall). Never re-fire it on a
+  held level, and never route it through `hostMemReader`/`MemInfo`: the session reaper shares that reader.
+- A terminal under the kanban board must not draw. CSS can't stop xterm; its render pause is
+  `terminal/board-render-pause.ts`. Every "is the board up" check includes the Omni board
+  (`isGlobalKanbanOpen()`), and the board never feeds the visibility verdict that drives
+  hibernation and the WebGL budget.
+- Search big in-memory text with one escaped `RegExp(q, 'iu')` per query, never `toLowerCase()`
+  per entry (transcript index: 20-52 ms + 7-15 MB garbage → 2-13 ms + 0 MB per search).
+- Dispose every Monaco model your node creates when it unmounts. The TS/JS worker (a whole
+  compiler isolate) is only stopped once no TS/JS model is left (`renderer/editor/tsWorkerReaper.ts`).
+
+**`ssh2` and `electron-updater` load on first use, never at main's module scope**, which runs
+before Chromium's `ready` (together ~50–70 ms warm on every launch). Use `import
+type` for their types; values come from `ssh2()` in `native-mux.ts` and `initUpdater`'s
+`loadUpdater`. `src/main/lazy-deps.source.test.ts` goes red on a value import. A `require()` is
+not reached by `vi.mock`, so a test injects its double (see the updater tests).
 
 **SSH projects on Windows** run over an in-process transport (`src/core/remote-ssh/native/`),
 not the ssh binary. If you add an ssh call site, route it through `useNativeSsh()` like the
 others, and if you add an ssh option to `control-master.ts`, teach `ssh-argv.ts` about it (the
-parser refuses unknown options on purpose). Test from macOS/Linux with `NODETERM_NATIVE_SSH=1`.
+parser refuses unknown options on purpose). Test from macOS/Linux with `NODETERM_NATIVE_SSH=1`. Resolve the ssh
+program with `resolveSshProgram()` (never a private `findExecutableSync('ssh', …)`): on Windows it
+may be the bare `ssh` sentinel, which only the native runners can serve.
 
 **A dependency with a native addon that the Server Edition reaches is `--external:` in
 `server:build`.** Hosts build the bundle after `npm ci --ignore-scripts`, so no addon is compiled
@@ -1198,6 +1538,10 @@ there, and esbuild fails on a `.node` require it cannot resolve (or, where the a
 on a file it has no loader for). No CI job builds the server bundle, but
 `src/server/server-build.test.ts` builds it in both views and goes red. The server runs from a
 `node_modules` tree, so an external is resolved at runtime.
+
+**Never fill `swapTotalMb`/`swapFreeMb` on darwin.** The reaper's swap term reads them, and a Mac
+can keep most of its swap in use for hours, so it would fire all day; the RAM pill's swap figure
+lives in `MemInfo.display`, which nothing else reads. CLAUDE.md, Session memory.
 
 ## Testing
 
@@ -1271,6 +1615,15 @@ tmux without carrying `TMUX_TMPDIR` into it, which is the one way left to escape
 `src/core/tmux-socket-isolation.guard.test.ts` holds the short allowlist of suites that name a
 production socket on purpose; adding a third is a review conversation, not a checkbox.
 
+**A test never touches the real home.** The hook installers write `~/.codex/config.toml` (Codex's
+trust in nodeterm's hooks), `~/.claude/settings.json` and friends, and they use
+`import { homedir } from 'os'`, which `vi.spyOn(os, 'homedir')` does not reach — one test doing that
+rewrote a developer's real Codex config and Codex stopped running nodeterm's hooks. Every run points
+HOME/USERPROFILE at a private sandbox (`test/setup/home-sandbox.ts`) and clears `CODEX_HOME`,
+`CLAUDE_CONFIG_DIR` and the other relocation variables (one list, `HOME_OVERRIDE_ENV` in
+`src/core/test-home.ts`, which `test/setup/agent-env.ts` reuses). If a test needs its own home, mock the
+module (`vi.mock('os', …)`, see `install-helper.fs.test.ts`), never spy on it.
+
 **Session code has two local backends on POSIX: tmux and Zellij.** `settings.sessionBackend` picks
 where a NEW local terminal's session is created (default tmux); an existing session is always
 reattached in the backend that holds it. If you add a `PtyManager` method that talks to tmux about a
@@ -1307,8 +1660,10 @@ the step is at the FIRST animation, not the twentieth. Two consequences when you
 `animation-play-state: var(--nt-anim-state);` right after the shorthand so it joins the idle-window
 gate (`src/renderer/styles.animation-gate.test.ts` fails if you forget, because one ungated
 animation takes the whole win back), and prefer a static state to a pulse wherever the pulse is not
-carrying information the user needs at a glance. The full measurement table and the reasoning are
-in CLAUDE.md § Idle energy.
+carrying information the user needs at a glance. A dependency's stylesheet counts too: React Flow's
+`dashdraw` on animated edges is gated by a rule in `styles.css` that repeats xyflow's selectors, and
+the same test scans `@xyflow/react/dist/style.css` so an upgrade that adds an infinite animation
+fails there. The full measurement table and the reasoning are in CLAUDE.md § Idle energy.
 
 ## Pull requests
 
@@ -1426,3 +1781,10 @@ the real POST: a confirm-gated verb waits for a human. Keep real owning-endpoint
 legacy hook delivery unchanged. When no owner answers, say so once, as a temporary state
 (`FOREIGN_ENDPOINT_HINT`); never let another instance's "permanent, do not retry" stand in for a
 dropped tunnel.
+
+**Browser control must measure settled geometry.** A CDP wheel acknowledgement precedes
+Chromium's scroll frames. Use the bounded settlement helper before reporting movement or
+resolving pointer targets. Keep actions on one guest exclusive. A CDP viewport override
+(`--screenshot --full true`) survives debugger detach and a reload: it goes through the lease,
+which clears it before every detach and on the next attach — never send emulation around it, and
+never reattach a released lease to clean up.

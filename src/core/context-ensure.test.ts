@@ -37,6 +37,7 @@ let f: ReturnType<typeof fakePlatform>
 let claude: ReturnType<typeof fakeTail>
 let codex: ReturnType<typeof fakeTail>
 let gemini: ReturnType<typeof fakeTail>
+let antigravity: ReturnType<typeof fakeTail>
 
 // The registered listener is async; `CorePlatform.on` types its return as void (a cast is
 // fire-and-forget on the wire), so awaiting it here — which is what lets these tests assert on the
@@ -59,6 +60,8 @@ const tailFor = (agentId: string | undefined): ContextTail | undefined => {
       return codex
     case 'gemini':
       return gemini
+    case 'antigravity':
+      return antigravity
     default:
       return undefined
   }
@@ -81,6 +84,7 @@ beforeEach(() => {
   claude = fakeTail()
   codex = fakeTail()
   gemini = fakeTail()
+  antigravity = fakeTail()
 })
 afterEach(() => {
   vi.restoreAllMocks()
@@ -132,6 +136,17 @@ describe('local rehydration, per agent', () => {
     registerContextEnsureIpc({ tailFor })
     await ensure({ agentId: 'gemini' })
     expect(gemini.tracked).toEqual([[SID, chat]])
+    expect(claude.tracked).toEqual([])
+  })
+
+  it('rehydrates an antigravity node from its own brain transcript, never claude’s', async () => {
+    const logs = path.join(home, '.gemini', 'antigravity-cli', 'brain', SID, '.system_generated', 'logs')
+    fs.mkdirSync(logs, { recursive: true })
+    const tf = path.join(logs, 'transcript_full.jsonl')
+    fs.writeFileSync(tf, '{}\n')
+    registerContextEnsureIpc({ tailFor })
+    await ensure({ agentId: 'antigravity' })
+    expect(antigravity.tracked).toEqual([[SID, tf]])
     expect(claude.tracked).toEqual([])
   })
 
@@ -248,5 +263,46 @@ describe('remote (SSH-project) rehydration', () => {
     release()
     await Promise.all([a, b])
     expect(calls).toBe(1)
+  })
+})
+
+describe('cursor rehydration: by id, on its own tail, never by cwd or from a remote node', () => {
+  let cfg: string, prevCfg: string | undefined
+  let cursor: ReturnType<typeof fakeTail>
+  const tailForCursor = (agentId: string | undefined): ContextTail | undefined => (agentId === 'cursor' ? cursor : tailFor(agentId))
+  beforeEach(() => {
+    cfg = fs.mkdtempSync(path.join(os.tmpdir(), 'nt-cursor-ensure-'))
+    prevCfg = process.env.CURSOR_CONFIG_DIR
+    process.env.CURSOR_CONFIG_DIR = cfg
+    cursor = fakeTail()
+  })
+  afterEach(() => {
+    if (prevCfg === undefined) delete process.env.CURSOR_CONFIG_DIR
+    else process.env.CURSOR_CONFIG_DIR = prevCfg
+    fs.rmSync(cfg, { recursive: true, force: true })
+  })
+  const writeStore = (id: string): string => {
+    const dir = path.join(cfg, 'chats', 'bucket', id)
+    fs.mkdirSync(dir, { recursive: true })
+    const p = path.join(dir, 'store.db')
+    fs.writeFileSync(p, '')
+    return p
+  }
+
+  it('tracks the store for its session id on cursor’s tail only', async () => {
+    const store = writeStore(SID)
+    registerContextEnsureIpc({ tailFor: tailForCursor })
+    await ensure({ agentId: 'cursor' })
+    expect(cursor.tracked).toEqual([[SID, store]])
+    expect(claude.tracked).toEqual([])
+  })
+
+  it('never adopts another chat or a claude transcript for the same cwd', async () => {
+    writeStore('99999999-2222-3333-4444-555555555555') // a stranger's chat
+    writeClaudeTranscript('11111111-2222-3333-4444-555555555555')
+    registerContextEnsureIpc({ tailFor: tailForCursor })
+    await ensure({ agentId: 'cursor' })
+    expect(cursor.tracked).toEqual([])
+    expect(claude.tracked).toEqual([])
   })
 })

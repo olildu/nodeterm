@@ -38,6 +38,14 @@ export const IconNote = () => (
   </svg>
 )
 
+export const IconWhiteboard = () => (
+  <svg {...S}>
+    <rect x="3" y="4" width="18" height="13" rx="1.5" />
+    <path d="M7 13c1.5-3 3-3 4-1s2.5 2 4-2" />
+    <path d="M9 21l3-4 3 4" />
+  </svg>
+)
+
 export const IconDino = () => (
   <svg width={16} height={16} viewBox="0 0 24 24" fill="currentColor" stroke="none">
     {/* Blocky right-facing T-Rex silhouette (tail, body, head+snout, arm, legs). */}

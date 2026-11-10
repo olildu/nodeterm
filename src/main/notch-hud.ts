@@ -23,6 +23,7 @@ import {
 import type { NormalizedAgentEvent } from '../shared/agents/normalize'
 import { createHudModel, type HudModel, type HudContextUpdate } from './notch-hud-model'
 import { hudGeometry, hudPlacement, type HudGeometry } from './notch-hud-geometry'
+import { ensureRegularDockPresence } from './dock-presence'
 import {
   sanitizeNotchAlign,
   sanitizeNotchOffsetY,
@@ -46,23 +47,12 @@ const SWEEP_MS = 60 * 1000
  * that is orderFront-ed on screen (e.g. it shows before the main window has finished loading, or
  * while the main window is hidden by hide-on-close), macOS re-evaluates the app as having no
  * regular window and drops its Dock tile — the "Dock icon disappears once the HUD opens" bug.
- * Asserting `regular` + `dock.show()` is idempotent and cheap, and guarantees the HUD never
- * demotes the app's Dock presence. No-op off macOS.
+ * It restores the Dock presence only when it is actually gone: `dock.show()` is NOT idempotent,
+ * and calling it on an app already in the Dock can show the app twice (issue #1305; see
+ * ./dock-presence.ts). No-op off macOS.
  */
 export function assertRegularDockPresence(): void {
-  if (process.platform !== 'darwin') return
-  try {
-    // Idempotent: re-asserting 'regular' when already regular is a no-op.
-    app.setActivationPolicy('regular')
-  } catch {
-    /* older Electron / transient — ignore */
-  }
-  // `dock.show()` returns a Promise in recent Electron; swallow it either way.
-  try {
-    void Promise.resolve(app.dock?.show()).catch(() => {})
-  } catch {
-    /* ignore */
-  }
+  ensureRegularDockPresence(app, process.platform)
 }
 
 // ---- Singleton (mirror main-window.ts) -----------------------------------------------------

@@ -1,5 +1,6 @@
 // TerminalNode's handling of a `'join-only'` create refusal (a hosted-relay viewer asked for a
-// terminal it could not find running).
+// terminal it could not find running), and of `'held-elsewhere'` (a remote node's id is held by a
+// session that is not on its host), which takes the same branch: nothing is offline in either.
 //
 // The DECISION about the words is pure and tested in `shared/pty-refusal.test.ts`. What only the
 // source can show is what the node does with it: this branch returns BEFORE the success path that
@@ -14,9 +15,9 @@ import path from 'path'
 
 const src = fs.readFileSync(path.resolve(__dirname, 'TerminalNode.tsx'), 'utf8').replace(/\r\n/g, '\n')
 
-/** The body of `if (unavailable === 'join-only') { … }`, up to its `return`. */
+/** The body of the `'join-only'` / `'held-elsewhere'` branch, up to its `return`. */
 function joinOnlyBranch(): string {
-  const start = src.indexOf("if (unavailable === 'join-only') {")
+  const start = src.indexOf("if (unavailable === 'join-only' || unavailable === 'held-elsewhere' || unavailable === 'new-only') {")
   expect(start, 'the join-only branch must still exist').toBeGreaterThan(-1)
   const end = src.indexOf('return', start)
   expect(end).toBeGreaterThan(start)
@@ -32,7 +33,7 @@ function coStateFields(): string[] {
   return [...src.slice(start, end).matchAll(/^ {2}(\w+):/gm)].map((m) => m[1])
 }
 
-describe("TerminalNode: a 'join-only' refusal", () => {
+describe("TerminalNode: a 'join-only' or 'held-elsewhere' refusal", () => {
   it('resets every CoState field that describes a session, and only those', () => {
     const branch = joinOnlyBranch()
     const fields = coStateFields()

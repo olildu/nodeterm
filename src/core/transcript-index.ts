@@ -9,6 +9,7 @@ import { platform } from './platform'
 import type { ClaudeAccount } from '../shared/types'
 import { accountConfigDir, normalizeLinkedConfigDir } from './claude-accounts-core'
 import { SESSION_ID_RE } from './transcript-reader'
+import { sweepStaleTempFiles, writeFileAtomic } from './fs-atomic'
 import {
   extractEntryFields,
   planRefresh,
@@ -22,6 +23,10 @@ export const TRANSCRIPT_INDEX_REFRESH_MS = 5 * 60 * 1000
 const READ_CAP_BYTES = 5 * 1024 * 1024 // mirror transcript-reader: never read more than the tail
 
 let entries: TranscriptIndexEntry[] = []
+// True while the in-memory index holds changes the file does not. Cleared only by a write that
+// landed, so a failed persist is retried on the next refresh instead of waiting for an unrelated
+// transcript change — and a refresh that changed nothing still costs no 16 MB rewrite.
+let dirty = false
 let timer: NodeJS.Timeout | undefined
 let accountsGetter: (() => ClaudeAccount[]) | undefined
 
@@ -114,9 +119,10 @@ async function readTail(filePath: string): Promise<string> {
   }
 }
 
-function loadPersisted(): TranscriptIndexEntry[] {
+/** Read a persisted index. Anything unreadable is an empty index: the next refresh rebuilds it. */
+export function loadPersistedIndex(file: string): TranscriptIndexEntry[] {
   try {
-    const raw = fs.readFileSync(indexFilePath(), 'utf8')
+    const raw = fs.readFileSync(file, 'utf8')
     const data = JSON.parse(raw)
     return Array.isArray(data) ? (data as TranscriptIndexEntry[]) : []
   } catch {
@@ -124,15 +130,40 @@ function loadPersisted(): TranscriptIndexEntry[] {
   }
 }
 
-async function persist(): Promise<void> {
+/**
+ * Persist the index; resolves false (never throws) when the write did not land.
+ *
+ * It was a bare `writeFile` of ~16 MB every 5 minutes while agents are active. A crash or power
+ * loss mid-write left truncated JSON, which loads as an empty index and forces a cold rescan —
+ * measured at ~779 MB read and ~3.2 s. Temp + rename
+ * means a reader sees the old index or the new one, never half of either. Mode 0600 because the
+ * file holds transcript text (it was 0644).
+ */
+export async function persistIndex(
+  file: string,
+  index: TranscriptIndexEntry[]
+): Promise<boolean> {
   try {
-    await fs.promises.writeFile(indexFilePath(), JSON.stringify(entries), 'utf8')
+    await writeFileAtomic(file, JSON.stringify(index), { mode: 0o600 })
+    return true
   } catch {
-    /* best-effort */
+    return false // best-effort: the caller keeps the index dirty and tries again next refresh
   }
 }
 
-async function refresh(): Promise<void> {
+// One refresh at a time. A cold scan of a large tree can outlast the interval, and two overlapping
+// runs would race their persists (and the `dirty` flag) as well as reading every file twice.
+let refreshing: Promise<void> | undefined
+/** Rescan and persist if owed — what launch and the 5-minute timer run. A call while a refresh is
+ *  in flight joins it rather than starting a second scan. */
+export function refreshTranscriptIndex(): Promise<void> {
+  refreshing ??= refreshOnce().finally(() => {
+    refreshing = undefined
+  })
+  return refreshing
+}
+
+async function refreshOnce(): Promise<void> {
   const scan = await scanTranscripts()
   const { toRead, keep } = planRefresh(entries, scan)
   // Only persist when the index actually changed (new/updated entries or dropped ones).
@@ -151,7 +182,8 @@ async function refresh(): Promise<void> {
     })
   }
   entries = fresh
-  if (changed) await persist()
+  if (changed) dirty = true
+  if (dirty) dirty = !(await persistIndex(indexFilePath(), entries))
 }
 
 export function searchTranscripts(query: string): TranscriptHit[] {
@@ -163,8 +195,12 @@ export function searchTranscripts(query: string): TranscriptHit[] {
 
 export function initTranscriptIndex(getAccounts?: () => ClaudeAccount[]): void {
   accountsGetter = getAccounts
-  entries = loadPersisted()
-  void refresh()
-  timer = setInterval(() => void refresh(), TRANSCRIPT_INDEX_REFRESH_MS)
+  entries = loadPersistedIndex(indexFilePath())
+  // Collect the legacy ownerless `<file>.tmp` shape once it is a day old. A pid-bearing temp left by
+  // a crash inside writeFileAtomic is deliberately NOT collected (fs-atomic cannot prove its writer
+  // dead across PID namespaces), so such an orphan stays until removed by hand.
+  void sweepStaleTempFiles(indexFilePath())
+  void refreshTranscriptIndex()
+  timer = setInterval(() => void refreshTranscriptIndex(), TRANSCRIPT_INDEX_REFRESH_MS)
   if (timer.unref) timer.unref()
 }

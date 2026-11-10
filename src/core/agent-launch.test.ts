@@ -155,6 +155,53 @@ describe("prepareAgentLaunch logical argv", () => {
     });
   });
 
+  it("puts Cursor's flags before its `agent` subcommand, not after the prompt", async () => {
+    await expect(
+      prepareAgentLaunch(
+        start("cursor", { prompt: "hi", permissionMode: "bypassPermissions" }),
+        "posix",
+        builtinContext("cursor"),
+      ),
+    ).resolves.toEqual({ command: "'cursor-agent' '--force' 'agent' 'hi'" });
+    await expect(
+      prepareAgentLaunch(
+        start("cursor", { prompt: "hi", permissionMode: "plan" }),
+        "posix",
+        builtinContext("cursor"),
+      ),
+    ).resolves.toEqual({ command: "'cursor-agent' '--mode' 'plan' 'agent' 'hi'" });
+    // The default mode emits nothing, so an untouched node's line is byte-identical to before.
+    await expect(
+      prepareAgentLaunch(
+        start("cursor", { prompt: "hi", permissionMode: "auto" }),
+        "posix",
+        builtinContext("cursor"),
+      ),
+    ).resolves.toEqual({ command: "'cursor-agent' '--auto-review' 'agent' 'hi'" });
+  });
+
+  it("resumes and mints Cursor with `--resume <id>` before the `agent` subcommand", async () => {
+    const id = "550e8400-e29b-41d4-a716-446655440000";
+    await expect(
+      prepareAgentLaunch(
+        resume("cursor", id, { permissionMode: "plan" }),
+        "posix",
+        builtinContext("cursor"),
+      ),
+    ).resolves.toEqual({
+      command: `'cursor-agent' '--resume' '${id}' '--mode' 'plan'`,
+    });
+    await expect(
+      prepareAgentLaunch(
+        start("cursor", { prompt: "hi", newSessionId: id }),
+        "posix",
+        builtinContext("cursor"),
+      ),
+    ).resolves.toEqual({
+      command: `'cursor-agent' '--resume' '${id}' 'agent' 'hi'`,
+    });
+  });
+
   it("uses flag-prompt for OpenCode and preserves a trailing slash", async () => {
     await expect(
       prepareAgentLaunch(
@@ -163,6 +210,28 @@ describe("prepareAgentLaunch logical argv", () => {
         builtinContext("opencode"),
       ),
     ).resolves.toEqual({ command: "'opencode' '--prompt' 'repo/'" });
+  });
+
+  it("passes a flag-interactive builtin's prompt through its own flag, never as a positional", async () => {
+    // Same flags the typed line uses (`assembleLaunchCommand`): a positional is a subcommand slot
+    // for both CLIs, so the earlier argv fallthrough would have launched the wrong thing.
+    await expect(
+      prepareAgentLaunch(
+        start("copilot", { prompt: "fix it" }),
+        "posix",
+        builtinContext("copilot"),
+      ),
+    ).resolves.toEqual({ command: "'copilot' '--interactive' 'fix it'" });
+    await expect(
+      prepareAgentLaunch(
+        start("antigravity", { prompt: "fix it" }),
+        "posix",
+        builtinContext("antigravity"),
+      ),
+    ).resolves.toEqual({ command: "'agy' '--prompt-interactive' 'fix it'" });
+    await expect(
+      prepareAgentLaunch(start("copilot"), "posix", builtinContext("copilot")),
+    ).resolves.toEqual({ command: "'copilot'" });
   });
 
   it("preserves Gemini's historical positional prompt, including an empty prompt", async () => {

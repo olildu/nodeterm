@@ -36,6 +36,7 @@ function input(nodes: CanvasNodeState[], over: Partial<OffCanvasCtxInput> = {}):
     gatewayStatus: 'idle',
     gatewayError: '',
     grokModels: () => [],
+    cursorModels: () => [],
     writes: { setColor: vi.fn(), pickIcon: vi.fn() },
     liveLinkMenuItems: () => [],
     connectedProjectIdForHost: () => undefined,
@@ -108,6 +109,22 @@ describe('offCanvasNodeActionCtx — a card of a background project', () => {
     ctx.duplicateNodes(['a1'])
     ctx.deleteNodes(['a1'])
     expect(i.refuse).toHaveBeenCalledTimes(2)
+  })
+
+  it('an Omni card of a background project shows session rows disabled as not attached', () => {
+    // Idle, with a session id, so the ONLY reason for disabling is the missing attachment.
+    useAgentStatus.setState({ byId: { a1: { state: 'done', sessionId: 's1' } } } as never)
+    const items = buildNodeActionItems(
+      ['a1'],
+      undefined,
+      offCanvasNodeActionCtx(input([stored('a1', { agentId: 'claude', agentSessionId: 's1' } as never)])),
+      { allow: BOARD_NODE_ACTION_IDS }
+    )
+    for (const label of ['Restart agent', 'Restart agent and shell', 'Pause', 'Pause & end session', 'Refresh terminal']) {
+      const r = row(items, label)
+      expect(r && 'disabled' in r && r.disabled, label).toBe(true)
+      expect(r && 'hint' in r && r.hint, label).toBe('This terminal is not attached right now.')
+    }
   })
 
   it('a node of the stored copy that names its agent only by the legacy claude tag is still an agent', () => {

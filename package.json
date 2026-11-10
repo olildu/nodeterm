@@ -1,6 +1,6 @@
 {
   "name": "node-terminal",
-  "version": "0.4.3",
+  "version": "0.5.1",
   "engines": {
     "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
   },
@@ -22,7 +22,7 @@
     "test": "vitest run",
     "test:unit": "vitest run test/remote",
     "diagnose:agents": "node scripts/agent-session-scan.mjs",
-    "rebuild": "node scripts/patch-node-pty.mjs && electron-rebuild -f -w node-pty,smart-whisper",
+    "rebuild": "node scripts/patch-node-pty.mjs && node scripts/patch-smart-whisper.mjs && electron-rebuild -f -w node-pty,smart-whisper && node scripts/stage-conpty-dll.mjs",
     "server:build": "esbuild src/server/main.ts --bundle --platform=node --format=cjs --outfile=out/server/main.cjs --external:node-pty --external:ws --external:smart-whisper --external:ssh2 --tsconfig=tsconfig.node.json",
     "host:build": "esbuild src/session-host/host.ts --bundle --platform=node --format=cjs --outfile=out/session-host/host.cjs --external:node-pty --tsconfig=tsconfig.node.json",
     "server:start": "node out/server/main.cjs",
@@ -34,12 +34,21 @@
     "dist": "npm run make-icon && npm run build:sim-helper && npm run build:android-helper && npm run build && electron-builder --mac --arm64 --publish never -c.mac.identity=null -c.mac.notarize=false -c.extraMetadata.nodeTermUpdates=disabled",
     "dist:linux": "npm run make-icon && npm run build && electron-builder --linux --publish never -c.extraMetadata.nodeTermUpdates=disabled",
     "dist:win": "npm run make-icon && npm run build && electron-builder --win --x64 --publish never -c.extraMetadata.nodeTermUpdates=disabled",
+    "dist:win:release": "npm run make-icon && npm run build && electron-builder --win --x64 --publish never -c.extraMetadata.nodeTermUpdates=manual",
     "release": "npm run make-icon && npm run build && sh -c 'electron-builder --mac --arm64 --x64 --publish never; s=$?; npm run rebuild; exit $s'",
-    "postinstall": "node scripts/patch-node-pty.mjs && electron-rebuild -f -w node-pty,smart-whisper"
+    "postinstall": "node scripts/patch-node-pty.mjs && node scripts/patch-smart-whisper.mjs && electron-rebuild -f -w node-pty,smart-whisper && node scripts/stage-conpty-dll.mjs"
   },
   "build": {
     "appId": "com.nodeterm.app",
     "productName": "nodeterm",
+    "protocols": [
+      {
+        "name": "nodeterm",
+        "schemes": [
+          "nodeterm"
+        ]
+      }
+    ],
     "directories": {
       "output": "dist",
       "buildResources": "build"
@@ -151,7 +160,9 @@
             "!lib/**/*.test.js",
             "build/Release/*.node",
             "build/Release/*.exe",
-            "build/Release/*.dll"
+            "build/Release/*.dll",
+            "build/Release/conpty/conpty.dll",
+            "build/Release/conpty/OpenConsole.exe"
           ]
         }
       ],
@@ -186,31 +197,32 @@
     "@xterm/addon-unicode11": "^0.9.0",
     "@xterm/addon-web-links": "^0.11.0",
     "@xterm/headless": "^6.0.0",
-    "dompurify": "^3.4.16",
-    "electron-updater": "^6.8.9",
+    "dompurify": "^3.4.17",
+    "electron-updater": "^6.8.11",
     "emoji-picker-react": "^4.22.2",
-    "lucide-react": "^1.48.0",
+    "lucide-react": "^1.62.0",
     "marked": "^12.0.2",
     "monaco-editor": "^0.57.0",
     "node-pty": "^1.0.0",
     "qrcode": "^1.5.4",
-    "sharp": "^0.35.4",
+    "sharp": "^0.35.5",
     "smart-whisper": "^0.8.1",
     "ssh2": "^1.17.0",
     "tweetnacl": "^1.0.3",
-    "ws": "^8.21.3",
-    "zustand": "^5.0.15"
+    "ws": "^8.22.0",
+    "zustand": "^5.0.16"
   },
   "devDependencies": {
-    "@electron/rebuild": "^4.2.0",
+    "@electron/rebuild": "^4.2.1",
+    "@excalidraw/excalidraw": "^0.18.1",
     "@tailwindcss/vite": "^4.3.3",
     "@types/css-tree": "^3.2.0",
-    "@types/node": "^26.6.3",
+    "@types/node": "^26.6.5",
     "@types/qrcode": "^1.5.6",
     "@types/react": "^18.3.31",
     "@types/react-dom": "^18.3.7",
     "@types/ssh2": "^1.15.6",
-    "@types/ws": "^8.18.1",
+    "@types/ws": "^8.18.2",
     "@vitejs/plugin-react": "^4.3.1",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-search": "^0.16.0",
@@ -218,21 +230,32 @@
     "@xterm/xterm": "^5.5.0",
     "@xyflow/react": "^12.12.0",
     "css-tree": "^3.2.1",
-    "electron": "^42.11.9",
-    "electron-builder": "^26.17.0",
+    "electron": "^42.11.18",
+    "electron-builder": "^26.18.0",
     "electron-vite": "^5.0.0",
     "esbuild": "^0.28.2",
-    "jsdom": "^30.1.1",
+    "jsdom": "^30.1.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "tailwindcss": "^4.3.1",
     "typescript": "^7.0.2",
     "vite": "^7.3.6",
-    "vitest": "^5.0.2"
+    "vitest": "^5.0.5"
   },
   "overrides": {
     "monaco-editor": {
       "dompurify": "^3.4.14"
+    },
+    "@excalidraw/excalidraw": {
+      "nanoid": "3.3.20",
+      "sass": "1.105.2",
+      "lodash-es": "4.18.1",
+      "katex": "0.19.0",
+      "mermaid": "12.2.0",
+      "@mermaid-js/parser": "2.0.1",
+      "@excalidraw/mermaid-to-excalidraw": {
+        "nanoid": "5.1.16"
+      }
     }
   }
 }

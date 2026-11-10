@@ -192,7 +192,7 @@ tab).
 ### Trust (4d — scoped to the crypto/pairing layer)
 
 - The peer's device key becomes **persistent** (today the client key is ephemeral)
-  and is **pinned on both ends**; SAS (6-digit) is verified **mutually**.
+  and is **pinned on both ends**; SAS (10-digit v2; a v1 peer shows the first six) is verified **mutually**.
 - Revocation is a first-class action (facepile avatar → "Remove"): it unpins the key
   **and kills the live session** — closes the relay connection, drops the peer's pty
   subscriptions, leaves presence. Unpinning alone would leave the peer connected.
@@ -237,7 +237,7 @@ function confirmLocal(s: MutualApproval): MutualApproval
 function confirmRemote(s: MutualApproval): MutualApproval
 function isMutuallyApproved(s: MutualApproval): boolean
 function recordApproval(store: ApprovedDevices, s: MutualApproval): ApprovedDevices   // pins s.peerKeyB64 only when both confirmed
-function mutualSas(shared: Uint8Array): string                                        // "NNN NNN"; alias of sasFromSharedKey
+function mutualSas(shared: Uint8Array): string                                        // "NNN NNN NNNN"; alias of sasFromSharedKey
 ```
 
 Flow: `emptyMutualApproval(peerKeyB64, sessionId)` → `confirmLocal` on this human's SAS
@@ -586,7 +586,7 @@ session):
   `/tmp/nt-B`). Then:
   1. On A, start a remote host (New Remote Connection → host), **pick which project to share**
      (default = active), and copy the pairing offer.
-  2. On B, paste the offer → both show the **same 6-digit SAS** → B sees the **ConsentNotice**
+  2. On B, paste the offer → both show the **same 10-digit SAS** → B sees the **ConsentNotice**
      on A's approval → confirm on both → the **shared project opens as a tab on B, already
      populated with A's nodes** (NOT a blank canvas — this is the project-scope check). B sees ONLY
      the shared project, not A's other projects.

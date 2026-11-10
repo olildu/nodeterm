@@ -17,6 +17,7 @@
 import {
   UNKNOWN_CLAUDE_CLI_CAPS,
   UNKNOWN_GROK_CLI_CAPS,
+  UNKNOWN_CURSOR_CLI_CAPS,
   UNKNOWN_CODEX_IDENTITY_CAPS,
   UNKNOWN_CODEX_CLI_CAPS,
   type ClaudeUsage,
@@ -26,6 +27,7 @@ import {
   type UpdatePolicy
 } from '../../shared/types'
 import { E_UNSUPPORTED } from '../../shared/rpc'
+import { INACTIVE_PROJECT_LIMIT, type ClaimResult, type ProjectLimitState } from '../../shared/project-limit'
 import { isMacPlatform } from '../../shared/platform-utils'
 import { effectiveBindings, terminalShortcutPolicy } from '../lib/keybindingOverrides'
 import type { ContextElement } from '../lib/keyContext'
@@ -130,6 +132,7 @@ export function buildStubApi(): Omit<
   | 'canvas'
   | 'dialog'
   | 'onAgentStatus'
+  | 'agentStatusSnapshot'
   | 'onSubagentActivity'
   | 'onUnreadClear'
   | 'answerPermission'
@@ -246,6 +249,10 @@ export function buildStubApi(): Omit<
       // Server Edition has no updater at all (initUpdater runs only in src/main) and a browser
       // tab cannot self-install, so there is no channel state to report either way.
       onNoChannel: noopUnsub,
+      // No self-install in a browser, so there is never an install in progress to report.
+      onInstalling: noopUnsub,
+      // Nothing is ever staged in a browser.
+      getStaged: () => Promise.resolve(null),
       check: noop,
       getVersion: U('updates.getVersion'),
       // Boot path awaits this and reads `p.mandatory` UNGUARDED (UpdateCard.tsx), so the old
@@ -264,7 +271,10 @@ export function buildStubApi(): Omit<
       prepareQuit: noop
     },
     announcements: {
-      fetch: () => Promise.resolve([])
+      fetch: () => Promise.resolve([]),
+      // The Server Edition does not read the check feed, so there is never a popup to show.
+      popups: () => Promise.resolve([]),
+      popupImage: () => Promise.resolve(null)
     },
     license: {
       upgrade: U('license.upgrade'),
@@ -276,6 +286,18 @@ export function buildStubApi(): Omit<
       // reject rather than answer a fabricated "0 devices" — the same degrade as getStatus above.
       detail: U('license.detail'),
       releaseOthers: U('license.releaseOthers'),
+      onChange: noopUnsub
+    },
+    projectLimit: {
+      // The Server Edition has no open-project gate (docs/project-limit.md), so it answers the
+      // dormant state and every open stays synchronous. Resolved, not rejected: unlike
+      // `license.getStatus`, this is read on the open path, and "inactive" is the true answer here
+      // rather than "unknown". `claim` answers `disabled` (this shell never talks to the license
+      // server) for the same reason: a refusal `ClaimResult` names, where an E_UNSUPPORTED throw is
+      // outside the contract.
+      state: (): Promise<ProjectLimitState> => Promise.resolve(INACTIVE_PROJECT_LIMIT),
+      claim: (): Promise<ClaimResult> =>
+        Promise.resolve({ ok: false, error: 'disabled', state: INACTIVE_PROJECT_LIMIT }),
       onChange: noopUnsub
     },
     contextLink: {
@@ -368,7 +390,28 @@ export function buildStubApi(): Omit<
       // are pure CSS and need no bridge), and import refuses.
       listStills: () => Promise.resolve([]),
       load: () => Promise.resolve(null),
-      importImage: U('wallpaper.importImage')
+      importImage: U('wallpaper.importImage'),
+      listAerials: () => Promise.resolve([]),
+      aerialClips: () => Promise.resolve([])
+    },
+    simulator: {
+      devices: () => Promise.resolve({ devices: [] }),
+      boot: () => Promise.resolve({ ok: false as const, error: 'Simulator views are only available in the desktop app.' }),
+      // DESKTOP only, deliberately not bridged: the helper talks to the simulator frameworks
+      // of the machine it runs on, and a Server Edition / relay tab's canvas is on another one. The
+      // node is not offered there; these say why if reached anyway.
+      start: () => Promise.resolve({ ok: false as const, error: 'Simulator views are only available in the desktop app.' }),
+      stop: () => Promise.resolve(),
+      input: () => Promise.resolve(false),
+      shutdown: () => Promise.resolve(false),
+      action: () => Promise.resolve({ ok: false as const, error: 'Simulator views are only available in the desktop app.' }),
+      state: () => Promise.resolve({}),
+      screenshot: () => Promise.resolve({ ok: false as const, error: 'Simulator views are only available in the desktop app.' }),
+      startRecording: () => Promise.resolve({ ok: false as const, error: 'Simulator views are only available in the desktop app.' }),
+      stopRecording: () => Promise.resolve({ ok: false as const, error: 'Not recording.' }),
+      isRecording: () => Promise.resolve(false),
+      onFrame: () => () => {},
+      onStatus: () => () => {}
     },
     runConfig: {
       // Superseded by the real WS-backed namespace in ws-bridge (registerRunConfigIpc runs in the
@@ -423,6 +466,10 @@ export function buildStubApi(): Omit<
       // Nothing taken is the honest answer where no shell can look, and it degrades to today's
       // behaviour: mint freely. Overridden by the real WS-backed namespace in ws-bridge.
       takenSessionIds: () => Promise.resolve([])
+    },
+    cursor: {
+      // Overridden by the real WS-backed namespace in ws-bridge. Never rejects: empty = no picker.
+      cliCaps: () => Promise.resolve(UNKNOWN_CURSOR_CLI_CAPS)
     },
     agent: {
       // No env snapshot outside the desktop window: the stub (and ws-bridge, identically) answers
@@ -526,6 +573,8 @@ export function buildStubApi(): Omit<
       start: U('relayHost.start'),
       invite: U('relayHost.invite'),
       stop: U('relayHost.stop'),
+      // Nothing can be hosted here (start/invite are unsupported), so nothing is refused either.
+      scopeProblems: async () => ({}),
       revoke: noop,
       onPeerPending: noopUnsub,
       confirm: noop,
@@ -578,6 +627,16 @@ export function buildStubApi(): Omit<
       // stand down. The policy itself still works in the browser — it is enforced by the
       // renderer's own dispatcher (`keyDispatchContextFor`), which reads focus directly.
       setTerminalFocused: noop
+    },
+    // Deliberate degrade: `nodeterm://` links are an OS URL-scheme registration, which only the
+    // desktop app has. Nothing ever fires here; accept refuses.
+    openLink: {
+      ready: noop,
+      onRequest: noopUnsub,
+      onPair: noopUnsub,
+      onNotice: noopUnsub,
+      accept: U('openLink.accept'),
+      cancel: noop
     },
     // REAL, not a stub: a browser tab has no main process to intercept ⌘/Ctrl+M, so the chord is
     // matched by a window keydown listener here (bindings, terminal-first stand-down and focus all
@@ -638,6 +697,12 @@ export function buildStubApi(): Omit<
     // on its own terms; pushing our levers over the wire would fight it, not help it. Deliberate
     // no-op, not an oversight.
     onMemoryPressure: noopUnsub,
+    // Deliberate no-op, not an oversight. The desktop signal means "the user put the app away"
+    // (tray / hide / minimize). The browser's nearest analogue, `visibilitychange`, fires on every
+    // tab switch AND on occlusion — wiring it here would release every terminal of a user who
+    // glanced at another tab for two minutes. The browser throttles and discards a hidden tab on
+    // its own terms; the viewport-driven levers keep working unchanged.
+    onWindowVisibility: noopUnsub,
     // Same asymmetry, one step further: the desktop's pty-pressure banner exists to offer "Fix
     // automatically…", which ends in macOS's admin-password dialog on the HOST's physical display.
     // A browser tab cannot answer that prompt, so the host keeps the reaper leg and says nothing
@@ -743,6 +808,7 @@ export function buildStubApi(): Omit<
     | 'canvas'
     | 'dialog'
     | 'onAgentStatus'
+    | 'agentStatusSnapshot'
     | 'onSubagentActivity'
     | 'onUnreadClear'
     | 'answerPermission'

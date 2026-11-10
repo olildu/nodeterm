@@ -176,9 +176,10 @@ describe('joinHostedTeam', () => {
     expect((await s.store.list())[0].approvedAt).toBe('2026-09-01T00:00:00Z')
   })
 
-  it('a known hostId whose code now carries a different key string never auto-approves, and its token is not reused', async () => {
-    // A non-canonical base64 spelling of the same 32 bytes: same hostId, different key string. The
-    // rule compares the key the code carries with the key the bookmark was approved for, exactly.
+  it('a known hostId whose code carries a second spelling of the key is refused outright: nothing minted, nothing touched', async () => {
+    // A non-canonical base64 spelling of the same 32 bytes: same hostId, different key string. It
+    // used to reach the join (no auto-approve, a fresh token); the decoder now accepts one spelling
+    // per key, so the code is invalid before any token is minted or any bookmark is touched.
     // 32 bytes encode as 43 characters + '=', and the last of those carries 2 unused low bits.
     const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
     const k = code.hostPublicKeyB64
@@ -186,10 +187,12 @@ describe('joinHostedTeam', () => {
     expect(hostIdFromPublicKeyB64(alt)).toBe(code.hostId)
     expect(alt).not.toBe(k)
     const s = setup({ bookmarks: [bookmark({ approvedAt: '2026-09-01T00:00:00Z' })] })
-    await joinHostedTeam(encodeJoinCode({ ...code, hostPublicKeyB64: alt }), s.deps, events().ev)
-    expect(s.c.last().autoApprove).toBe(false)
-    expect(s.api.count('device')).toBe(1)
-    expect((await s.store.list())[0]).toMatchObject({ deviceToken: 'DT', approvedAt: null })
+    await expect(joinHostedTeam(encodeJoinCode({ ...code, hostPublicKeyB64: alt }), s.deps, events().ev)).rejects.toThrow(
+      /E_JOIN_BAD_CODE/
+    )
+    expect(s.c.sessions).toHaveLength(0)
+    expect(s.api.calls).toEqual([])
+    expect((await s.store.list())[0]).toMatchObject({ approvedAt: '2026-09-01T00:00:00Z' })
   })
 
   it('a bookmark whose stored code no longer decodes is not trusted either', async () => {

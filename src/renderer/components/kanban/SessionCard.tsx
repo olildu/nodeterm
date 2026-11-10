@@ -1,6 +1,6 @@
 import { memo, useState } from 'react'
 import type { KanbanCardMeta, KanbanColumnCategory, KanbanLabel, KanbanPriority } from '@shared/types'
-import { useAgentStatus } from '../../state/agentStatus'
+import { useAgentStatus, type AgentStatusSession } from '../../state/agentStatus'
 import { AccountChip, useAccountChip } from '../AccountChip'
 import { LiveLinkChip, showsLiveLinks } from '../LiveLinkChip'
 import type { SessionSource } from '../../session/session'
@@ -22,6 +22,7 @@ import { TeamProgressChip } from '../TeamProgressChip'
 import type { TeamStation } from '../../lib/teamProgress'
 import { cardShowsOverdue, sessionNameRepeatsTitle } from '../../lib/cardRedundancy'
 import { PortsChip } from '../PortsChip'
+import { QueuedLaunchChip } from './QueuedLaunchChip'
 
 const PRIO_COLOR = Object.fromEntries(PRIORITIES.map((p) => [p.id, p.color])) as Record<KanbanPriority, string>
 
@@ -61,11 +62,21 @@ interface SessionCardProps {
   ports?: { projectId: string; remote: boolean }
   /** A port row was picked: open it in a browser node beside the card's node (on the canvas). */
   onOpenPort?: (nodeId: string, url: string) => void
+  /** ▶ on the card's QUEUED chip: start the node's held launch now (Canvas's `run` path; on a relay
+   *  tab Canvas answers with a "runs on the host" notice instead). Absent = the chip shows without ▶. */
+  onRunQueued?: (nodeId: string) => void
+  /** The agent-status store of the session the card's PROJECT belongs to
+   *  (`agentStatusForProject(projectId).store`, re-resolved by the board on a registry change).
+   *  A team tab's card reads its relay session's store; its node id is the handed-off SSH
+   *  project's too, so the default store would show that project's state on this card. Absent =
+   *  the default store. A stable reference per board (SessionCard is memoized). */
+  statusStore?: AgentStatusSession['store']
 }
 
 export const SessionCard = memo(function SessionCard({
   session, meta, labels = [], onOpen, onDragStart, onDragEnd, onDropAt, onContext, pulls,
-  pullFreshness = 'fresh', onOpenIssue, team, onTravel, columnCategory, liveLinkSource, ports, onOpenPort
+  pullFreshness = 'fresh', onOpenIssue, team, onTravel, columnCategory, liveLinkSource, ports, onOpenPort, onRunQueued,
+  statusStore
 }: SessionCardProps) {
   // THIS card's agent status, subscribed per card rather than threaded down from the board.
   // KanbanView used to hold `useAgentStatus((s) => s.byId)` and pass the map through the column:
@@ -73,13 +84,13 @@ export const SessionCard = memo(function SessionCard({
   // flip re-rendered the whole board — every column, every card. The same rule Canvas follows
   // (see its loopSig comment) and StatusAwareMiniMap demonstrates: subscribe where the value is
   // read, so the re-render is confined to the one thing that changed.
-  const status = useAgentStatus((s) => s.byId[session.id])
+  const status = (statusStore ?? useAgentStatus)((s) => s.byId[session.id])
   // The card's meter follows the same session rule as the node and the card modal.
   const cardTranscript = transcriptSessionFor({ live: status?.sessionId, persisted: session.spawn.agentSessionId, cwd: session.spawn.cwd })
   // The board is the canvas's other view of the same node (CONTRIBUTING), so the card carries the
   // node header's account chip from the same helper — created-with account, else what the session
   // was observed running as.
-  const accountChip = useAccountChip(session.spawn.accountId, status?.account)
+  const accountChip = useAccountChip(session.spawn.accountId, status?.account, statusStore)
   // Local drag state only styles THIS card (ghost look) — the drag payload lives in KanbanView.
   const [dragging, setDragging] = useState(false)
   // Which edge a drag is hovering over → shows the drop line (top = before, bottom = after).
@@ -162,7 +173,15 @@ export const SessionCard = memo(function SessionCard({
           <IssueRefChip issueRef={session.issueRef} onOpen={onOpenIssue} />
         )}
         {session.kind === 'terminal' && team && team.length > 0 && onTravel && (
-          <TeamProgressChip stations={team} onTravel={onTravel} />
+          <TeamProgressChip stations={team} onTravel={onTravel} statusStore={statusStore} />
+        )}
+        {session.kind === 'terminal' && session.pendingLaunch && (
+          <QueuedLaunchChip
+            nodeId={session.id}
+            pending={session.pendingLaunch}
+            firstOpen={session.launchFirstOpen}
+            onRun={onRunQueued ? () => onRunQueued(session.id) : undefined}
+          />
         )}
         {/* The canvas node header's Ports chip — one component, so the two views of a session
             cannot disagree. It stops its own clicks, so opening it never opens the card. */}

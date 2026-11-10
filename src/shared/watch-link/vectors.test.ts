@@ -6,6 +6,7 @@ import { bytesToHex, concatBytes, utf8 } from './bytes'
 import { hkdfSha256 } from './hkdf'
 import { formatWatchLink } from './link'
 import { encodePtyFrame, RELAY_SESSION_INFO } from './wire'
+import { openUnlock } from './unlock-seal'
 
 // vectors.json is what nodeterm-web's copy is tested against. It is the fixture; this test proves
 // the code still produces it. Regenerate ONLY for a deliberate protocol change (bump the version).
@@ -24,6 +25,11 @@ describe('watch-link vectors', () => {
       expect(formatWatchLink(v.linkId, secret)).toBe(v.url)
     }
     for (const f of vectors.ptyFrames) expect(bytesToHex(encodePtyFrame(f.sessionId, f.data))).toBe(f.hex)
+    // A Control link's sealed unlock: what a page sealed (nodeterm-web opens the same vector).
+    expect(vectors.unlockSeals.length).toBeGreaterThan(0)
+    for (const v of vectors.unlockSeals) {
+      expect(openUnlock({ sealed: v.sealed }, hex(v.hostSecretHex))).toEqual({ name: v.name, password: v.password })
+    }
   })
 
   it('derives every session key: HKDF-SHA256(base, hostNonce ‖ clientNonce, info)', async () => {

@@ -10,6 +10,9 @@ import {
   contentAddItemsToDockRows,
   FILES_NO_CWD_HINT,
   RUN_SSH_HINT,
+  SIMULATOR_RELAY_HINT,
+  SIMULATOR_SSH_HINT,
+  RUN_WINDOWS_HINT,
   NEW_FILE_NO_CWD_HINT,
   WORKTREE_NO_CWD_HINT,
   WORKTREE_SSH_HINT,
@@ -30,8 +33,10 @@ const handlers = (overrides: Partial<AddHandlers> = {}): AddHandlers => ({
   sticky: noop,
   files: noop,
   run: noop,
+  simulator: noop,
   dino: noop,
   agentsim: noop,
+  whiteboard: noop,
   trigger: noop,
   openFile: noop,
   newFile: noop,
@@ -44,6 +49,8 @@ const allKinds: AddItem['kind'][] = [
   'terminal',
   'remote',
   'run',
+  'simulator',
+  'whiteboard',
   'browser',
   'web',
   'sticky',
@@ -61,13 +68,13 @@ describe('Simulator row', () => {
   const reason = 'Simulators run in the desktop app on macOS'
   it('is offered, enabled, by default — the node explains a missing helper itself', () => {
     const [row] = contentAddItemsToMenuItems([{ kind: 'agentsim' }], handlers(), { hasCwd: false, isSshProject: false })
-    expect(row).toMatchObject({ label: 'New simulator / emulator' })
+    expect(row).toMatchObject({ label: 'New simulator (agent-drivable)' })
     expect((row as { disabled?: boolean }).disabled).toBeFalsy()
   })
   it('is disabled with its reason on the menu and the Dock alike (browser tab, team tab, not macOS)', () => {
     const ctx = { hasCwd: true, isSshProject: false, simulatorUnavailable: reason }
     const [row] = contentAddItemsToMenuItems([{ kind: 'agentsim' }], handlers(), ctx)
-    expect(row).toMatchObject({ label: 'New simulator / emulator', disabled: true, hint: reason })
+    expect(row).toMatchObject({ label: 'New simulator (agent-drivable)', disabled: true, hint: reason })
     const [dock] = contentAddItemsToDockRows([{ kind: 'agentsim' }], handlers(), ctx)
     expect(dock).toMatchObject({ kind: 'agentsim', disabled: true, hint: reason })
   })
@@ -85,9 +92,39 @@ describe('Run configuration row', () => {
     const [dock] = contentAddItemsToDockRows([{ kind: 'run' }], handlers(), ctx)
     expect(dock).toMatchObject({ kind: 'run', disabled: true, hint: RUN_SSH_HINT })
   })
+  it('is disabled with its reason on a Windows core, menu and Dock alike — SSH keeps its own reason', () => {
+    const ctx = { hasCwd: true, isSshProject: false, isWindowsCore: true }
+    const [row] = contentAddItemsToMenuItems([{ kind: 'run' }], handlers(), ctx)
+    expect(row).toMatchObject({ label: 'New run configuration', disabled: true, hint: RUN_WINDOWS_HINT })
+    const [dock] = contentAddItemsToDockRows([{ kind: 'run' }], handlers(), ctx)
+    expect(dock).toMatchObject({ kind: 'run', disabled: true, hint: RUN_WINDOWS_HINT })
+    const [ssh] = contentAddItemsToMenuItems([{ kind: 'run' }], handlers(), { ...ctx, isSshProject: true })
+    expect(ssh).toMatchObject({ disabled: true, hint: RUN_SSH_HINT })
+  })
   it('is enabled in a local project, even with no folder yet (it asks for one)', () => {
     const [row] = contentAddItemsToMenuItems([{ kind: 'run' }], handlers(), { hasCwd: false, isSshProject: false })
     expect(row).toMatchObject({ label: 'New run configuration' })
+    expect((row as { disabled?: boolean }).disabled).toBeFalsy()
+  })
+})
+
+describe('Simulator row', () => {
+  it('is disabled with its reason in a relay tab — the node would show this machine’s devices', () => {
+    const ctx = { hasCwd: true, isSshProject: false, isRelayTab: true }
+    const [row] = contentAddItemsToMenuItems([{ kind: 'simulator' }], handlers(), ctx)
+    expect(row).toMatchObject({ label: 'New simulator', disabled: true, hint: SIMULATOR_RELAY_HINT })
+    const [dock] = contentAddItemsToDockRows([{ kind: 'simulator' }], handlers(), ctx)
+    expect(dock).toMatchObject({ kind: 'simulator', disabled: true, hint: SIMULATOR_RELAY_HINT })
+  })
+  it('is disabled with its reason in an SSH project, as the run row is', () => {
+    const ctx = { hasCwd: true, isSshProject: true }
+    const [row] = contentAddItemsToMenuItems([{ kind: 'simulator' }], handlers(), ctx)
+    expect(row).toMatchObject({ label: 'New simulator', disabled: true, hint: SIMULATOR_SSH_HINT })
+    const [dock] = contentAddItemsToDockRows([{ kind: 'simulator' }], handlers(), ctx)
+    expect(dock).toMatchObject({ kind: 'simulator', disabled: true, hint: SIMULATOR_SSH_HINT })
+  })
+  it('is enabled in a local desktop project', () => {
+    const [row] = contentAddItemsToMenuItems([{ kind: 'simulator' }], handlers(), { hasCwd: true, isSshProject: false })
     expect((row as { disabled?: boolean }).disabled).toBeFalsy()
   })
 })
@@ -110,12 +147,14 @@ describe('contentAddItemsToMenuItems', () => {
       'New terminal',
       'New remote…',
       'New run configuration',
+      'New simulator',
+      'New whiteboard',
       'New browser',
       'New web view…',
       'New sticky note',
       'New file manager',
       'New dino game',
-      'New simulator / emulator',
+      'New simulator (agent-drivable)',
       'New trigger…',
       'Open file…',
       'New file…',
@@ -191,6 +230,7 @@ describe('contentAddItemsToMenuItems', () => {
       sticky: () => calls.push('sticky'),
       dino: () => calls.push('dino'),
       agentsim: () => calls.push('agentsim'),
+      whiteboard: () => calls.push('whiteboard'),
       spawnTeam: () => calls.push('spawnTeam'),
       worktree: () => calls.push('worktree')
     })
@@ -201,7 +241,7 @@ describe('contentAddItemsToMenuItems', () => {
     for (const item of items) {
       if ('onClick' in item) item.onClick()
     }
-    expect(calls.sort()).toEqual(['agentsim', 'browser', 'dino', 'spawnTeam', 'sticky', 'terminal', 'web', 'worktree'])
+    expect(calls.sort()).toEqual(['agentsim', 'browser', 'dino', 'spawnTeam', 'sticky', 'terminal', 'web', 'whiteboard', 'worktree'])
   })
 })
 
@@ -215,6 +255,8 @@ describe('contentAddItemsToDockRows', () => {
     // "New Remote Connection" flow. Emitting a terminal row here duplicated the Terminal entry.
     expect(rows.map((r) => r.kind)).toEqual([
       'run',
+      'simulator',
+      'whiteboard',
       'browser',
       'web',
       'sticky',
@@ -344,12 +386,14 @@ describe('buildGroupedAddMenu', () => {
     }
     expect(children(ADD_GROUP_LABEL.view)).toEqual([
       'New run configuration',
+      'New simulator',
+      'New whiteboard',
       'New browser',
       'New web view…',
       'New sticky note',
       'New file manager',
       'New dino game',
-      'New simulator / emulator'
+      'New simulator (agent-drivable)'
     ])
     expect(children(ADD_GROUP_LABEL.files)).toEqual(['Open file…', 'New file…'])
     expect(children(ADD_GROUP_LABEL.orchestrate)).toEqual([
@@ -481,6 +525,7 @@ describe('buildGroupedAddMenu', () => {
       files: () => calls.push('files'),
       dino: () => calls.push('dino'),
       agentsim: () => calls.push('agentsim'),
+      whiteboard: () => calls.push('whiteboard'),
       trigger: () => calls.push('trigger'),
       openFile: () => calls.push('openFile'),
       newFile: () => calls.push('newFile'),
@@ -507,7 +552,8 @@ describe('buildGroupedAddMenu', () => {
       'sticky',
       'terminal',
       'trigger',
-      'web'
+      'web',
+      'whiteboard'
     ])
   })
 })

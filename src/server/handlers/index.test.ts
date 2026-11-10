@@ -11,6 +11,7 @@ import { DEFAULT_SETTINGS, type GitStatus } from '../../shared/types'
 import { initPlatform, resetPlatformForTests } from '../../core/platform'
 import { DownloadTickets } from '../../core/download-tickets'
 import { projectImagesDir } from '../../core/canvas-images'
+import { projectWhiteboardsDir } from '../../core/whiteboards'
 
 // The per-account hook writers are exercised by src/core/claude-accounts-service.test.ts. Observe
 // them here instead of running them: the real installer writes into the USER's `~/.nodeterm`, and
@@ -99,6 +100,30 @@ describe('registerCoreHandlers (canvas images)', () => {
       args: ['p2', 'shot.png', Buffer.from('png').toString('base64')]
     })
     expect((res as { result: string }).result).toBe(path.join(projectImagesDir(repo), 'shot.png'))
+  })
+
+  it('forwards whiteboardLocation, so a board lands where the SHELL resolved it', async () => {
+    // A folder project kept in app data answers its app-data root here and no folder from
+    // `localProjectCwd`; a missing forward would send its boards to the app's shared folder.
+    resetPlatformForTests()
+    const p2 = new ServerPlatform({ userDataDir: repo, appVersion: '0' })
+    initPlatform(p2)
+    const appRoot = path.join(repo, 'project-files', 'p2')
+    registerCoreHandlers(p2, {
+      getSettings: () => DEFAULT_SETTINGS,
+      localProjectCwd: () => undefined,
+      whiteboardLocation: (id) => (id === 'p2' ? { projectCwd: appRoot, createRoot: true } : {})
+    })
+    const ui2 = p2.attach({ sendText: () => {}, sendBinary: () => {} })
+    const res = await p2.dispatch(ui2, {
+      t: 'req',
+      id: 1,
+      method: IPC.filesSaveWhiteboard,
+      args: ['p2', 'whiteboard-1', '{"type":"excalidraw"}']
+    })
+    expect((res as { result: { path: string } }).result.path).toBe(
+      path.join(projectWhiteboardsDir(appRoot), 'whiteboard-1.excalidraw')
+    )
   })
 })
 

@@ -148,6 +148,8 @@ export function stateToReopenSnapshot(entry: ClosedSessionEntry): ReopenNodeSnap
       textUpdatedBy: n.textUpdatedBy,
       filePath: n.filePath,
       fileMissing: n.fileMissing,
+      // A reopened whiteboard gets a new id; it reads the closed board's file by the old one.
+      whiteboardSource: n.kind === 'whiteboard' ? (n.whiteboardSource ?? n.id) : undefined,
       url: n.url,
       partition: n.partition,
       diffStaged: n.diffStaged,

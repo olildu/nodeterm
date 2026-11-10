@@ -1,5 +1,5 @@
-// The write half of a structural control verb (`group`, `ungroup`, `move`, `arrange`, `align`) run
-// against a project that is NOT on screen.
+// The write half of a structural control verb (`group`, `ungroup`, `move`, `arrange`, `align`,
+// `resize`, `place`) run against a project that is NOT on screen.
 //
 // Those verbs compute a whole new node array through the same pure transforms the live canvas uses
 // (`groupSelectedNodes`, `reparentNode`, `arrangeNodes`, …), over the owning project's serialized
@@ -16,8 +16,13 @@
 import type { CanvasMutation, CanvasNodeState } from '@shared/types'
 import { flowToNodeStates, type CanvasNode } from '../state/workspace'
 
-/** The fields a structural verb may change on a node that already exists. */
-const GEOMETRY = ['position', 'size', 'parentId', 'group'] as const
+/**
+ * The fields a structural verb may change on a node that already exists. `premaxRect` is geometry
+ * too: every layout pass restores a maximized node first (`restoreMaximizedWhere`), and leaving the
+ * stored rect behind kept the node "maximized" on disk — the next panel pin re-claimed the viewport
+ * for it, and its Restore button teleported it back to where it was before the layout.
+ */
+const GEOMETRY = ['position', 'size', 'parentId', 'group', 'premaxRect'] as const
 
 // null and absent are the same fact here (`group: null` vs no `group`), or an untouched node would
 // be rewritten just for its spelling.

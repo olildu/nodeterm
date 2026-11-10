@@ -51,6 +51,14 @@ export const HOST_ONLY_CHANNEL_PREFIXES: readonly string[] = [
   // credentials into the account dir, removal deletes one), and account usage read with the
   // host's stored tokens.
   'license:',
+  // The free-tier open-project allowance: refuses a relay peer's INBOUND `projectLimit:state` /
+  // `projectLimit:claim` requests — a claim spends THIS device's allowance under this machine's hash,
+  // and the state reports the host's Pro and DO_NOT_TRACK facts. A relay tab never sends them (it
+  // keeps its local preload; relay-api.ts spreads `...local`). This list gates inbound req/cast ONLY:
+  // the outbound `projectLimit:changed` push is kept off relay peers separately, by sending it to
+  // this machine's own windows only (core/project-limit.ts), never through `platform().broadcast`,
+  // which fans out to every relay peer.
+  'projectLimit:',
   'claude-accounts:',
   'codex-accounts:',
   'usage:',
@@ -71,7 +79,15 @@ export const HOST_ONLY_CHANNEL_PREFIXES: readonly string[] = [
   'sim:',
   // Agent-integration consent status: paths in the host's home it kept or wrote. The consent itself
   // is in settings (already host-only).
-  'integrations:'
+  'integrations:',
+  // Simulator node: the host's iOS simulators / Android emulators — boot, erase, install, input.
+  // A relay tab never offers the node (relay-api keeps the namespace local), so a peer sending one
+  // of these is asking to drive the host's devices.
+  'simulator:',
+  // `nodeterm://` links: a link clicked on THIS machine opens a node here after THIS machine's user
+  // approves it. Raw ipcMain handlers (no peer reaches them); listed so a move onto the platform
+  // table cannot quietly open them.
+  'open-link:'
 ]
 
 export const HOST_ONLY_CHANNELS: ReadonlySet<string> = new Set([
@@ -80,6 +96,14 @@ export const HOST_ONLY_CHANNELS: ReadonlySet<string> = new Set([
   IPC.projectSetupConsentSubmit,
   IPC.projectSetupRequestTrust,
   IPC.ptyLaunchHeadless,
+  // A relay peer never delivers a held launch (commitOwnedLaunchAttempt), and a peer that could
+  // claim one would make every viewer of the host stand down from it (#1173).
+  IPC.workspaceClaimLaunch,
+  // Executes an agent launch on the host and reads a host-local `--prompt-file` into it. A relay
+  // tab never sends it (its pty bridge omits the member); this holds the refusal host-side too.
+  IPC.ptyExecuteLaunch,
+  // Types into a pane of THIS machine (or its SSH host); a relay peer must never reach it.
+  IPC.ptySendPaneKeys,
   // Prepare-for-update ends EVERY session on this machine's session host and quits the app. Only
   // the host's own user may do that. Raw ipcMain handlers (no peer reaches them); listed here too
   // so moving them onto the platform table later cannot quietly open them.

@@ -4,10 +4,20 @@
 // Access, Tailscale, oauth2-proxy…) already authenticates every request; the proxy
 // asserts the identity in a request header. When configured, a request is treated as
 // authenticated iff its TCP peer address is inside the trusted networks AND it carries
-// the configured header with a non-empty value. The header CONTENT is deliberately not
-// validated (no JWT verification): the trusted-network boundary is the trust statement —
-// only the proxy can be the TCP peer, and the proxy owns setting/stripping the header.
+// the configured header with a non-empty value AND — when a proxy secret is configured —
+// the `X-Nodeterm-Proxy-Secret` header equal to it. The identity header's CONTENT is
+// deliberately not validated (no JWT verification).
+//
+// Why the secret (security audit 2026-10, S2): the trusted-network boundary is a statement
+// about WHO can be the TCP peer, and on loopback the answer is "every process on this host" —
+// every Unix account, every container on the host network, every sandboxed agent. With the
+// default loopback nets the header alone made any of them the server's owner. So a peer on
+// loopback is never header-trusted without the secret: `resolveConfig` turns header trust OFF
+// for loopback nets with no secret (and says so at boot), and `proxyAuthDecision` refuses a
+// loopback peer without one, so a config built any other way cannot reopen it.
+//
 // Everything here is pure (no node:http import) so it unit-tests without sockets.
+import crypto from 'crypto'
 
 export interface TrustedNet {
   /** 4 bytes (IPv4) or 16 bytes (IPv6). */
@@ -19,10 +29,23 @@ export interface TrustProxyConfig {
   /** Header name asserting the authenticated identity, e.g. Cf-Access-Authenticated-User-Email. */
   header: string
   nets: TrustedNet[]
+  /**
+   * The shared secret the proxy sends in {@link PROXY_SECRET_HEADER} on every request (HTTP and the
+   * WebSocket upgrade). Set from `NODETERM_TRUST_PROXY_SECRET` only — never a CLI flag, because argv
+   * is readable by every local user. Never logged. Required when the nets cover loopback.
+   */
+  secret?: string
 }
 
 /** Default trusted networks: loopback only — the recommended same-host proxy deployment. */
 export const DEFAULT_TRUSTED_NETS_SPEC = '127.0.0.0/8, ::1/128'
+
+/** The request header the proxy carries the shared secret in (lower-case: Node's header map). */
+export const PROXY_SECRET_HEADER = 'x-nodeterm-proxy-secret'
+
+/** A secret shorter than this is refused at boot: every request is a guess and nothing rate-limits
+ *  header trust, so the secret has to be long enough not to be guessable. */
+export const MIN_PROXY_SECRET_LENGTH = 32
 
 function parseIPv4(s: string): Uint8Array | null {
   const parts = s.split('.')
@@ -130,6 +153,51 @@ export function describeTrustedNets(nets: TrustedNet[]): string {
     .join(', ')
 }
 
+const LOOPBACK_V4: TrustedNet = { bytes: new Uint8Array([127, 0, 0, 0]), prefix: 8 }
+const LOOPBACK_V6 = (() => {
+  const b = new Uint8Array(16)
+  b[15] = 1
+  return b
+})()
+
+/**
+ * Does any of these nets hold a loopback address (127.0.0.0/8 or ::1)? A net that merely CONTAINS
+ * loopback (0.0.0.0/0, ::/0) counts: it trusts every local process just the same.
+ */
+export function netsCoverLoopback(nets: TrustedNet[]): boolean {
+  return nets.some((net) => {
+    if (net.bytes.length === 4) {
+      // Two IPv4 prefixes overlap iff they agree on the shorter prefix's bits.
+      const shorter = Math.min(net.prefix, LOOPBACK_V4.prefix)
+      return matchesNet(LOOPBACK_V4.bytes, { bytes: net.bytes, prefix: shorter })
+    }
+    return matchesNet(LOOPBACK_V6, net)
+  })
+}
+
+/** Is this peer address a loopback address (127.0.0.0/8, ::1, or ::ffff:127.x)? */
+export function isLoopbackAddress(addr: string | undefined): boolean {
+  if (!addr) return false
+  const parsed = parseAddress(addr)
+  if (!parsed) return false
+  const norm = normalize(parsed)
+  return norm.length === 4 ? norm[0] === 127 : matchesNet(norm, { bytes: LOOPBACK_V6, prefix: 128 })
+}
+
+/** Parse a peer address into bytes, an IPv4-mapped IPv6 address collapsed to IPv4. Null on garbage. */
+export function parsePeerAddress(addr: string | undefined): Uint8Array | null {
+  if (!addr) return null
+  const parsed = parseAddress(addr)
+  return parsed ? normalize(parsed) : null
+}
+
+/** Constant-time equality of two strings (hash first, so the lengths do not leak either). */
+function secretMatches(candidate: string, secret: string): boolean {
+  const a = crypto.createHash('sha256').update(candidate, 'utf8').digest()
+  const b = crypto.createHash('sha256').update(secret, 'utf8').digest()
+  return crypto.timingSafeEqual(a, b)
+}
+
 /** Is this socket peer address inside any of the trusted nets? Garbage/missing → false. */
 export function isTrustedAddress(addr: string | undefined, nets: TrustedNet[]): boolean {
   if (!addr) return false
@@ -140,16 +208,66 @@ export function isTrustedAddress(addr: string | undefined, nets: TrustedNet[]): 
 }
 
 /**
- * The one auth decision: trusted peer + configured header present with a non-empty value.
- * `headers` is Node's lowercased header map; a repeated header (array value) is ambiguous
- * and rejected — fail closed.
+ * Why a request is or is not header-trusted:
+ *  - `trusted`: trusted peer, identity header present, and the secret (when configured) matches;
+ *  - `none`: not a header-trust request at all (peer outside the nets, or no identity header);
+ *  - `bad-secret`: a trusted peer sent the identity header but not the configured secret — the
+ *    case worth a (throttled, value-free) log line, since it usually means the proxy is missing
+ *    its `X-Nodeterm-Proxy-Secret` setting;
+ *  - `loopback-needs-secret`: a loopback peer, and no secret is configured at all (see the header).
+ * Every answer but `trusted` falls through to the normal cookie/login path.
  */
+export type ProxyAuthDecision = 'trusted' | 'none' | 'bad-secret' | 'loopback-needs-secret'
+
+/**
+ * The one auth decision. `headers` is Node's lowercased header map; a repeated header (array
+ * value) is ambiguous and rejected — fail closed.
+ */
+export function proxyAuthDecision(
+  trust: TrustProxyConfig,
+  headers: Record<string, string | string[] | undefined>,
+  remoteAddress: string | undefined
+): ProxyAuthDecision {
+  if (!isTrustedAddress(remoteAddress, trust.nets)) return 'none'
+  const value = headers[trust.header.toLowerCase()]
+  if (typeof value !== 'string' || value.trim() === '') return 'none'
+  if (trust.secret === undefined || trust.secret === '') {
+    return isLoopbackAddress(remoteAddress) ? 'loopback-needs-secret' : 'trusted'
+  }
+  const presented = headers[PROXY_SECRET_HEADER]
+  if (typeof presented !== 'string' || !secretMatches(presented, trust.secret)) return 'bad-secret'
+  return 'trusted'
+}
+
+/** {@link proxyAuthDecision} as a yes/no. */
 export function proxyAuthAllowed(
   trust: TrustProxyConfig,
   headers: Record<string, string | string[] | undefined>,
   remoteAddress: string | undefined
 ): boolean {
-  if (!isTrustedAddress(remoteAddress, trust.nets)) return false
-  const value = headers[trust.header.toLowerCase()]
-  return typeof value === 'string' && value.trim() !== ''
+  return proxyAuthDecision(trust, headers, remoteAddress) === 'trusted'
+}
+
+const REFUSED_LOG_EVERY_MS = 60_000
+let lastRefusedLog = 0
+
+/**
+ * Log — at most once a minute, and never with any header VALUE — that a trusted peer sent the
+ * identity header but header trust was refused. Without it an operator whose proxy forgot the
+ * secret only sees the login page and no reason.
+ */
+export function noteProxyRefusal(decision: ProxyAuthDecision, now = Date.now()): void {
+  if (decision !== 'bad-secret' && decision !== 'loopback-needs-secret') return
+  if (now - lastRefusedLog < REFUSED_LOG_EVERY_MS) return
+  lastRefusedLog = now
+  console.warn(
+    decision === 'bad-secret'
+      ? `[nodeterm-server] a request from a trusted proxy address carried the identity header but no matching ${PROXY_SECRET_HEADER} header; it was treated as signed out. Check that your proxy sends the secret on every request, WebSocket upgrades included.`
+      : `[nodeterm-server] a loopback request carried the identity header, but header trust from loopback needs NODETERM_TRUST_PROXY_SECRET; it was treated as signed out.`
+  )
+}
+
+/** Test seam: forget when the refusal line was last logged. */
+export function _resetProxyRefusalLogForTest(): void {
+  lastRefusedLog = 0
 }

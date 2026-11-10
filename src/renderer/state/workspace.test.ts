@@ -8,6 +8,7 @@ import {
   createCodexAccountLoginNode,
   createAgentNode,
   createDinoNode,
+  createWhiteboardNode,
   duplicateNode,
   createSystemLoginNode,
   isAccountLoginNode,
@@ -1084,6 +1085,47 @@ describe('createSystemLoginNode (issue #420)', () => {
     // trust prompt stood between the click and the OAuth flow.
     expect(createSystemLoginNode(0, undefined, '/work/repo').data.cwd).toBe('/work/repo')
     expect(createSystemLoginNode(0).data.cwd).toBeUndefined()
+  })
+})
+
+describe('whiteboard node serialization', () => {
+  const board = (data: Record<string, unknown> = {}): CanvasNode =>
+    ({
+      id: 'whiteboard-1',
+      type: 'whiteboard',
+      position: { x: 10, y: 20 },
+      width: 900,
+      height: 600,
+      data: { title: 'Board', color: '#64d2ff', group: null, ...data }
+    }) as unknown as CanvasNode
+
+  it('round-trips whiteboardSource and boardRev through both serializers', () => {
+    const states = flowToNodeStates([board({ whiteboardSource: 'whiteboard-orig', boardRev: 1729000000000 })])
+    expect(states[0]).toMatchObject({ kind: 'whiteboard', whiteboardSource: 'whiteboard-orig', boardRev: 1729000000000 })
+    const back = nodeStatesToFlow(states)
+    expect(back[0].type).toBe('whiteboard')
+    expect(back[0].data).toMatchObject({ whiteboardSource: 'whiteboard-orig', boardRev: 1729000000000 })
+  })
+
+  it('drops a whiteboardSource from project.json that is not a plain node id (the core reads files by it)', () => {
+    const states = flowToNodeStates([board()])
+    for (const bad of ['../../etc/passwd', 'a/b', '..', 42]) {
+      const back = nodeStatesToFlow([{ ...states[0], whiteboardSource: bad as string }])
+      expect(back[0].data.whiteboardSource).toBeUndefined()
+    }
+  })
+
+  it('never saves autoEdit — it only opens a board the moment it is created', () => {
+    expect(createWhiteboardNode(0).data.autoEdit).toBe(true)
+    expect(flowToNodeStates([board({ autoEdit: true })])[0]).not.toHaveProperty('autoEdit')
+  })
+
+  it('a duplicate reads the original board by id and gets a whiteboard id, not a terminal one', () => {
+    const copy = duplicateNode(board())
+    expect(copy.id).toMatch(/^whiteboard-/)
+    expect(copy.data.whiteboardSource).toBe('whiteboard-1')
+    // A copy of a copy still points at the board that actually has the drawing.
+    expect(duplicateNode(board({ whiteboardSource: 'whiteboard-orig' })).data.whiteboardSource).toBe('whiteboard-orig')
   })
 })
 

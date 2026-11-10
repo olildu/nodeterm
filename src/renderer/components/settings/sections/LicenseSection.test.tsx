@@ -74,7 +74,10 @@ async function mount(
       upgrade: vi.fn(async () => status)
     },
     clipboard: { writeText },
-    shell: { openExternal }
+    shell: { openExternal },
+    // ProCompare reads the open-project limit store, which subscribes at import time too. Its
+    // initial state is the inactive one, so the comparison renders the pre-limit copy here.
+    projectLimit: { state: vi.fn(), claim: vi.fn(), onChange: vi.fn(() => () => undefined) }
   }
   const { useEntitlement } = await import('../../../state/entitlement')
   const { LicenseSection } = await import('./LicenseSection')
@@ -340,7 +343,7 @@ describe('LicenseSection — existing App Store purchase (#787)', () => {
   it('offers pairing before checkout and beside the key input without promising recovery', async () => {
     await mount(FREE)
     const messages = [...host.querySelectorAll('p')].filter((p) =>
-      p.textContent?.includes('Already have Pro from the App Store?')
+      p.textContent?.includes('Already have Pro from the App Store or Google Play?')
     )
     expect(messages).toHaveLength(2)
     expect(messages[0].closest('details')).toBeNull()

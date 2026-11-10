@@ -11,7 +11,7 @@ import { genKeyPair, deriveSharedKey, publicKeyToB64 } from './e2ee'
 import { isPinned } from './approved-devices-core'
 
 describe('mutual SAS agreement', () => {
-  it('both ends derive the SAME 6-digit code from their shared key', () => {
+  it('both ends derive the SAME 10-digit code from their shared key', () => {
     const host = genKeyPair()
     const client = genKeyPair()
     const hostShared = deriveSharedKey(publicKeyToB64(client.publicKey), host.secretKey)
@@ -19,7 +19,7 @@ describe('mutual SAS agreement', () => {
     const a = mutualSas(hostShared)
     const b = mutualSas(clientShared)
     expect(a).toBe(b)
-    expect(a).toMatch(/^\d{3} \d{3}$/)
+    expect(a).toMatch(/^\d{3} \d{3} \d{4}$/)
   })
 
   it('a man-in-the-middle (different shared key) shows a DIFFERENT code', () => {

@@ -1,5 +1,7 @@
 import { createSession, setActiveSession, type WorkspaceSession } from './session'
 import { thisMachineCap } from '../lib/machineName'
+// Side effect: registers the offline relay session an unbound remote tab resolves to (never local).
+import './offline-relay-session'
 
 /** The single local session: its api is the preload object by identity. Built once at boot.
  *

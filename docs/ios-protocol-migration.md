@@ -309,21 +309,60 @@ Stage 4 makes the phone a **peer**, and a pairing **grants shell access** on the
 machine. The only thing between a relay MITM and that shell is **mutual SAS approval**:
 BOTH humans compare the same 6-digit code out of band, and BOTH press Confirm.
 
-### 3.1 The SAS (6 digits) — `sasFromSharedKey` (e2ee.ts 89–95)
+### 3.1 The SAS (v2: 10 digits) — `sasFromSharedKey` (e2ee.ts)
 
-Both ends derive the identical code from `baseKey` (the ECDH shared secret — **not**
-the session key):
+Both ends derive the identical code from `baseKey` (the ECDH shared secret, i.e. NaCl
+`box.before` = HSalsa20(X25519) — **not** the session key):
 
 ```
-h    = SHA-512(baseKey)                       // nacl.hash
-n    = ((h[0]<<24) | (h[1]<<16) | (h[2]<<8) | h[3]) >>> 0   // first 4 bytes, BIG-endian, unsigned 32-bit
-code = (n % 1_000_000) padded to 6 digits
-SAS  = "NNN NNN"                               // a space between the two triples
+h    = SHA-512(baseKey)                                   // nacl.hash
+a    = BE_u32(h[0..4]) mod 1_000_000                      // the v1 code
+b    = BE_u32(h[4..8]) mod 10_000                         // four more digits
+SAS  = pad6(a)[0..3] + " " + pad6(a)[3..6] + " " + pad4(b)   // e.g. "123 456 7890"
 ```
 
-iOS must compute exactly this and **display it**, so the human can compare it with the
-digits shown on the desktop. A MITM terminating two different ECDH exchanges yields two
-different codes → the humans refuse.
+`BE_u32(x)` = the four bytes read **big-endian, unsigned**. The first seven characters are
+exactly the v1 code (`"NNN NNN"`, ~20 bits), so a peer on an older build that still shows six
+digits can be compared on the first six. v1 alone was grindable: an attacker who substitutes a
+pinned key (a tampered offer, join code or QR) matched both legs in seconds; v2 is ~33 bits.
+
+Every surface that shows the SAS shows, under it, exactly: *"Compare all ten digits. If the
+other device shows only six, it runs an older version: compare the first six."*
+(`src/shared/remote/sas.ts`).
+
+Test vectors (`src/core/relay/e2ee.test.ts`; computed independently with Python `hashlib`):
+
+| baseKey (32 bytes) | SAS |
+|---|---|
+| 32 × `0x00` | `809 281 4822` |
+| 32 × `0x01` (SHA-512 begins `5ce86efb 75fa4e2c`) | `736 635 8284` |
+| `0x00, 0x01, …, 0x1f` | `170 596 5663` |
+| 32 × `0xff` | `773 237 5799` |
+| `0x00, 0x17`, then 30 × `0x00` | `071 120 4361` (leading zero in the six) |
+| `0x00, 0x0b`, then 30 × `0x00` | `243 975 0790` (leading zero in the four) |
+
+End to end: secret A = 32 × `0x01`, secret B = 32 × `0x02` → pubA
+`pOCSkrZRwni5dyxWn1+puxPZBrRqtoyd+dwrRAn4ogk=`, pubB
+`zo060cy2M+x7cMF4FKXHbs0CloUFDTRHRboFhw5YfVk=`, raw X25519
+`2ed76ab549b1e73c031eb49c9448f0798aea81b698279a0c3dc3e49fbfc4b953`, `box.before`
+`18a99320f3488fa18a04239715d8ee738065e65c3d4b2898522d6c3d4ead588c`, SAS **`561 048 8895`**.
+
+A MITM terminating two different ECDH exchanges yields two different codes → the humans refuse.
+
+### 3.1a Key intake: low-order keys and canonical base64
+
+- **Refuse a low-order peer key.** If the raw `X25519(ourSecret, theirPub)` is all zero, the
+  key is a small-order point (0, 1, the two order-8 points, p−1, p, p+1, each also with the top
+  bit set) and `box.before` would be HSalsa20(0): a **public constant**. A secret-less peer then
+  completes the handshake, both humans see the same fixed SAS, and anyone on the wire derives the
+  session key. The desktop refuses such a key everywhere it takes one (handshake both roles,
+  pairing offer, join code, `/pair` `epk`, pin stores, `team add-owner`) and closes the socket
+  without answering. A phone must refuse it too — above all the **host key it pins** (QR
+  `hostKey`, relay block, `relay.json`): check the raw X25519 output, not the `box.before` output.
+- **Canonical base64 only**, padded, standard alphabet: the decoded bytes must re-encode to the
+  exact input. Node's decoder skips junk (`"!!!" + key` decodes to the key), and keys are compared
+  as strings in every pin store, so a second spelling is both a disguise and a key that matches
+  none of its own pins. Every producer pads already.
 
 ### 3.2 The confirm frame — MUST ride the ENCRYPTED tunnel
 
@@ -568,9 +607,11 @@ alone leaves the phone unable to connect. File and land them together.
 
 ## 7. Security requirements iOS MUST honour (checklist)
 
-1. **Compare the SAS out of band.** Compute `sasFromSharedKey(baseKey)` exactly (§3.1),
-   display "NNN NNN", and require the human to confirm it matches the desktop before
-   proceeding. This is the only defence against a relay MITM.
+1. **Compare the SAS out of band.** Compute `sasFromSharedKey(baseKey)` exactly (§3.1, v2),
+   display "NNN NNN NNNN" with the compare-all-ten copy, and require the human to confirm it
+   matches the desktop before proceeding. This is the only defence against a relay MITM.
+1a. **Refuse a low-order peer key and non-canonical base64** (§3.1a), at every place a key is
+   taken — above all the host key you pin.
 2. **Send the confirm ONLY over the encrypted tunnel** as `{t:'cast',
    method:'trust:confirm', args:[]}` via a TAG_TUNNEL_TEXT box. Never send a plaintext
    confirm — the desktop rejects it and it is a security hole.
@@ -588,8 +629,36 @@ alone leaves the phone unable to connect. File and land them together.
 7. **Persist your own box keypair** (keychain). A fresh ephemeral key each launch would
    force re-approval every time and break pinning.
 8. **Endianness discipline:** box seq is little-endian (2×uint32 LE, high then low);
-   `encodePtyData` sidLen is big-endian uint16; SAS folds `h[0..4]` big-endian. Do not
-   cross them.
+   `encodePtyData` sidLen is big-endian uint16; SAS folds `h[0..4]` and `h[4..8]` big-endian.
+   Do not cross them.
+10. **Pin the SSH host key from the pairing QR** (§7.1) instead of trusting the first connect.
+
+### 7.1 The pairing QR's `sshHostKeys` (desktop `pairing-core.ts` `buildPairingPayload`)
+
+The QR now carries this host's SSH host-key fingerprints, so the phone's first SSH connect after
+pairing is no longer trust-on-first-use (an on-path attacker could otherwise serve a forged
+`agent.json` / `relay.json` over that first connection):
+
+- key `sshHostKeys`: JSON array of OpenSSH SHA-256 fingerprints,
+  `"SHA256:<standard base64 of sha256(keyBlob), trailing '=' removed>"` — the `ssh-keygen -lf`
+  spelling; `keyBlob` = base64-decode of the `.pub` line's second field (the SSH wire blob, the same
+  bytes the server presents). At most 4, ordered ed25519, ecdsa, rsa.
+- position: after `relay` (or after `hostKey` / `name` when those are absent), before `ssh`.
+- **complete or absent, never partial.** The phone refuses a key not in the set, and sshd presents
+  whichever of its keys the client's algorithm preference picks, so a partial list would lock the
+  phone out. The desktop lists exactly what sshd would serve: the `HostKey` paths of
+  `/etc/ssh/sshd_config` and the files it `Include`s (else sshd's defaults
+  `/etc/ssh/ssh_host_{rsa,ecdsa,ed25519}_key`), each counted only when its private file exists, and
+  each `.pub` must read and parse (a blob naming a different algorithm than its first field is
+  refused). Any doubt omits the field: an unreadable `.pub`, `HostKeyAgent`, a relative or
+  tokenized path, an `Include` glob form it does not model, more than 4 keys. With the config
+  unreadable, the defaults are used only when all three are present and consistent.
+- omitted when there is no complete list, and **always** omitted with `ssh:false` (Windows) — that
+  payload is byte-identical to before.
+
+Phone side (iOS / Android follow-up): when present, accept the first SSH connect only if the
+server's key fingerprint is in the list, and pin it at commit instead of `forget`ting the pin;
+absent = the old TOFU behaviour.
 9. **`undef` correctness** (§1.2) on both encode and decode, so a meaningful `null`
    (park, presence-clear) is never mistaken for an omitted argument.
 

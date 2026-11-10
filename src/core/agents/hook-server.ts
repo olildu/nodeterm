@@ -2,6 +2,7 @@ import { REPORT_OUTCOME_CONTROL_REFUSAL } from '../../shared/station-outcome'
 import { SIM_CONTROL_REFUSAL } from '../sim/verb'
 import { sessionContextWindow } from '../model-window'
 import { labelHeldForRevision } from './permission-decision'
+import { createCursorApprovalWatch, type CursorApprovalWatch } from './cursor-approval'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'http'
 import { randomUUID, timingSafeEqual } from 'crypto'
 import { readFileSync, mkdirSync, chmodSync, unlinkSync } from 'fs'
@@ -12,6 +13,7 @@ import { platform } from '../platform'
 import { writeFileAtomic } from '../fs-atomic'
 import { parseEndpointEnv } from './hook-endpoint-parse'
 import { hookSockPath } from './hook-sock-path'
+import { browserRequestRefusal } from './hook-browser-guard'
 import { canControlCanvas, type AgentId } from '../../shared/agents/config'
 import { normalizeFor, type NormalizedAgentEvent } from '../../shared/agents/normalize'
 import {
@@ -20,6 +22,12 @@ import {
   type GrokPermissionGate,
   type GrokPermissionGateDeps
 } from './grok-permission-gate'
+import {
+  createCodexPermissionGate,
+  defaultCodexPermissionGateDeps,
+  type CodexPermissionGate,
+  type CodexPermissionGateDeps
+} from './codex-permission-gate'
 import { classifyClaudeConfigDir, configDirFromTranscriptPath } from '../claude-accounts-core'
 import { claudeAccountsSnapshot } from '../claude-config-dir'
 import type { CodexIdentityEvent, ObservedClaudeAccount } from '../../shared/types'
@@ -55,6 +63,7 @@ import {
   type PersistedLedgerRow
 } from '../control-request-ledger'
 import { DurableFactFile } from '../durable-state'
+import { createPaneOriginGate, parseClaudeHookOrigin, type PaneOriginGate } from './claude-pane-origin'
 
 // v2 advertises NODETERM_NODE_TOKEN_DIR so clients read their per-node capability from a file
 // rather than receiving it in argv. Nothing consumes the posted version server-side, so the bump
@@ -517,6 +526,18 @@ export class HookServer {
     this.listener = cb
   }
 
+  /** Cursor's approval prompt has no hook, so a pending tool call earns up to three pane reads
+   *  (CURSOR_APPROVAL_READS_MS, core/agents/cursor-approval.ts). Both shells pass their pty manager's `captureSession`;
+   *  unset = cursor never shows NEEDS YOU, as before. The synthetic `blocked` rides `listener`. */
+  private cursorWatch: CursorApprovalWatch | null = null
+  setPaneReader(readPane: (nodeId: string) => Promise<string | null>): void {
+    this.cursorWatch = createCursorApprovalWatch({ readPane, emit: (e) => this.listener?.(e) })
+  }
+  /** A node was closed or recycled: its pending pane reads must not resurrect it as `blocked`. */
+  releaseCursorNode(nodeId: string): void {
+    this.cursorWatch?.release(nodeId)
+  }
+
   private grokPermissionGate: GrokPermissionGate | null = null
   private grokGateDeps: GrokPermissionGateDeps | undefined
   /** Test seam: the grok permission gate's file/timer deps. */
@@ -533,6 +554,42 @@ export class HookServer {
       )
     }
     return this.grokPermissionGate
+  }
+
+  private codexPermissionGate: CodexPermissionGate | null = null
+  private codexGateDeps: CodexPermissionGateDeps | undefined
+  /** Test seam: the codex permission gate's file/timer deps. */
+  setCodexPermissionGateDeps(deps: CodexPermissionGateDeps): void {
+    this.codexPermissionGate?.dispose()
+    this.codexPermissionGate = null
+    this.codexGateDeps = deps
+  }
+  private codexGate(): CodexPermissionGate {
+    if (!this.codexPermissionGate) {
+      this.codexPermissionGate = createCodexPermissionGate(
+        (e) => this.listener?.(e),
+        this.codexGateDeps ?? defaultCodexPermissionGateDeps()
+      )
+    }
+    return this.codexPermissionGate
+  }
+
+  /**
+   * Which claude may speak for a node (issues #1112, #1153 — claude-pane-origin.ts). Created
+   * eagerly: the "not the foreground of any terminal" half needs no shell at all, so a shell that
+   * never wires a resolver still drops a detached `claude -p`. The pane-tty half needs
+   * `setPaneTtyResolver`, which BOTH shells call (hook-verified-parity.test.ts pins it).
+   */
+  private readonly paneOrigin: PaneOriginGate = createPaneOriginGate()
+
+  /** The node's pane tty, read by each shell from its own PtyManager (`paneOwner(...).tty`). */
+  setPaneTtyResolver(fn: ((nodeId: string) => Promise<string | null>) | undefined): void {
+    this.paneOrigin.setPaneTtyResolver(fn)
+  }
+
+  /** Drop the cached pane tty of a node whose session ended or was recycled (new pane, new tty). */
+  forgetPaneOrigin(nodeId: string): void {
+    this.paneOrigin.forgetNode(nodeId)
   }
 
   // Raw payload listener: receives the parsed (un-normalized) hook JSON. Drives the
@@ -773,6 +830,16 @@ export class HookServer {
         if (req.method !== 'POST') {
           res.writeHead(404)
           res.end()
+          return
+        }
+        // Belt-and-braces BEFORE the bearer: a browser page (DNS rebinding included) is refused
+        // on the Origin / Host it cannot help sending, and learns nothing about the bearer — not
+        // even the 403-vs-421 distinction below. The bearer stays the real gate; every client we
+        // ship passes this unchanged (measured list in hook-browser-guard.ts).
+        const browserRefusal = browserRequestRefusal(req.headers)
+        if (browserRefusal) {
+          res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' })
+          res.end(`${browserRefusal}\n`)
           return
         }
         if (!this.tokenMatches(req.headers['x-nodeterm-hook-token'])) {
@@ -1099,6 +1166,18 @@ export class HookServer {
             if (form.nodeterm_hook_event) payload.nodeterm_hook_event = form.nodeterm_hook_event
             else delete payload.nodeterm_hook_event
           }
+          // A claude event from a process that merely INHERITED this node's id — a detached
+          // `claude -p`, Claude's own daemon hosting a fork — is not the node's, and must reach
+          // NEITHER listener: the raw one rebinds the node's session, meter and context-link
+          // transcript, the normalized one the mirror's session id, title and badge (#1112,
+          // #1153). Decided per node in arrival order; see claude-pane-origin.ts for the rule and
+          // the measurement behind it. Every claude event goes through the gate, with or without
+          // an origin, so an event waiting for a pane read is never overtaken by the next one.
+          if (agentId === 'claude' && !(await this.paneOrigin.admit(nodeId, parseClaudeHookOrigin(form)))) {
+            res.writeHead(204)
+            res.end()
+            return
+          }
           // Raw listener first: it drives the transcript-tailing features (which need
           // transcript_path). Inside the try so a throwing raw listener still ends 204.
           this.rawListener?.(agentId, nodeId, payload, {
@@ -1125,7 +1204,13 @@ export class HookServer {
           // published, and cleared from it once answered (core/agents/grok-permission-gate.ts).
           // Every grok event goes through the gate so their order is kept per node.
           if (agentId === 'grok') this.grokGate().handle(nodeId, payload, labelled)
+          // Codex's PermissionRequest is checked against the session rollout: under codex's own
+          // auto-reviewer nobody is asked, so it must not read as NEEDS YOU (issue #1171,
+          // core/agents/codex-permission-gate.ts). Every codex event goes through the gate so their
+          // order is kept per node.
+          else if (agentId === 'codex') this.codexGate().handle(nodeId, payload, labelled)
           else if (labelled && this.listener) this.listener(labelled)
+          if (agentId === 'cursor') this.cursorWatch?.observe(nodeId, payload, verified)
         }
         res.writeHead(204)
         res.end()
@@ -1565,6 +1650,8 @@ export class HookServer {
     this.requestLedgerFile = null
     this.grokPermissionGate?.dispose()
     this.grokPermissionGate = null
+    this.codexPermissionGate?.dispose()
+    this.codexPermissionGate = null
     this.server?.close()
     this.server = null
     // The file must not advertise a listener that no longer exists (issue #445): a stopped server

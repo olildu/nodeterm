@@ -29,6 +29,7 @@ const { fetchCodexUsage } = vi.hoisted(() => ({
 }))
 
 vi.mock('./codex-usage', () => ({ fetchCodexUsage }))
+vi.mock('./cursor-usage', () => ({ fetchCursorUsage: async () => unavailableRow('cursor') }))
 vi.mock('./gemini-usage', () => ({ fetchGeminiUsage: async () => unavailableRow('gemini') }))
 vi.mock('./grok-usage', () => ({ fetchGrokUsage: async () => unavailableRow('grok') }))
 vi.mock('./kimi-usage', () => ({ fetchKimiUsage: async () => unavailableRow('kimi') }))
@@ -168,5 +169,25 @@ describe('Codex multi-account usage', () => {
     expect(rowB?.limits).toHaveLength(1)
     // The failing account never collapsed into the un-owned system row.
     expect(rows.filter((r) => r.accountId === undefined)).toHaveLength(1)
+  })
+})
+
+describe('a rate-limited Codex read keeps the last good numbers (issue #1168)', () => {
+  it('holds each account row through a 429, marked error + rateLimited', async () => {
+    const limit = {
+      kind: 'session', group: 'session', usedPercent: 40, severity: null,
+      resetsAt: null, windowMinutes: 300, scopeLabel: null, isActive: false
+    }
+    service = startUsageService({ shouldPoll: () => false })
+    fetchCodexUsage.mockImplementationOnce(async () => ({
+      provider: 'codex', account: null, limits: [limit], updatedAt: Date.now(), status: 'ok'
+    }))
+    await platform.handlers[IPC.usageProviders](true)
+    fetchCodexUsage.mockImplementationOnce(async () => ({
+      provider: 'codex', account: null, limits: [], updatedAt: Date.now(), status: 'error', rateLimited: true
+    }))
+    const rows = codexRows((await platform.handlers[IPC.usageProviders](true)) as ProviderUsage[])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ status: 'error', rateLimited: true, limits: [limit] })
   })
 })

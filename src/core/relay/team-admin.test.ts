@@ -23,6 +23,7 @@ import {
 } from './team-admin'
 import { createHostKey } from './host-key'
 import { genKeyPair, publicKeyToB64 } from './e2ee'
+import { lowOrderKeysB64 } from './low-order-keys.test-support'
 import type { HostedService, HostedStatus } from './hosted-service'
 
 // A unix socket path is limited to ~107 bytes, and a long mkdtemp path (macOS's /var/folders/…)
@@ -148,6 +149,12 @@ describe('validation helpers (platform-neutral)', () => {
     expect(ownerKeyProblem(k.replace(/=$/, ''))).toMatch(/canonical/)
     expect(ownerKeyProblem(` ${k}`)).toMatch(/canonical/)
     expect(ownerKeyProblem(k.replace(/\+/g, '-').replace(/\//g, '_').replace(/=$/, ''))).not.toBeNull()
+    // Junk Node's decoder would skip still decodes to the key, but is not its spelling.
+    expect(ownerKeyProblem('!!!' + k)).not.toBeNull()
+  })
+
+  it('refuses a low-order key (the relay handshake refuses it: no device holds its secret)', () => {
+    for (const weak of lowOrderKeysB64()) expect(ownerKeyProblem(weak), weak).toMatch(/low-order/)
   })
 
   it('labels are at most 60 characters and control-free', () => {

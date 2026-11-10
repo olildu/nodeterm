@@ -303,6 +303,19 @@ describe('both shells register a 4-arg raw listener', () => {
 })
 
 
+describe('which claude may speak for a node (#1112, #1153)', () => {
+  const root = resolve(__dirname, '../../..')
+  // Both shell ENTRYPOINTS wire the pane-tty half of the origin gate (claude-pane-origin.ts). A
+  // shell that forgets it compiles, passes every unit test and still drops a detached `claude -p`
+  // — but delivers a daemon-hosted fork's events as the node's, which is #1153 in that shell only.
+  for (const rel of ['src/main/index.ts', 'src/server/index.ts']) {
+    it(`${rel} wires the pane tty from its own PtyManager`, () => {
+      const src = readFileSync(join(root, rel), 'utf8').replace(/\/\/.*|\/\*[\s\S]*?\*\//g, '')
+      expect(src).toMatch(/wireClaudePaneOrigin\(\{[\s\S]*?hooks:\s*hookServer[\s\S]*?ptyManager\.paneOwner\(/)
+    })
+  }
+})
+
 describe('session window metadata', () => {
   it('accepts validated configuration only from this node identity', async () => {
     await post(NODE, nodeAuthToken(SECRET, NODE), '1048576')

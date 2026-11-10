@@ -31,7 +31,7 @@ import { describe, expect, it } from 'vitest'
  * The live half — backdrop roots, which CSS alone cannot see, at rest and mid-animation — is
  * `scripts/glass-trap-probe.mjs` (see CLAUDE.md, Liquid Glass chrome).
  */
-const FILL = /var\(--(glass-chrome-bg|glass-control-bg|term-glass-bg|term-glass-header-bg)\)/
+const FILL = /var\(--(glass-chrome-bg|glass-control-bg|glass-node-bg|term-glass-bg|term-glass-header-bg)\)/
 const PAINT = /(?:^|;)\s*(background(?:-color|-image)?|--[\w-]+)\s*:([^;]*)/g
 const GATE = /^:root\[data-nt-glass='on'\](?:\[[^\]]*\])*\s*/
 
@@ -39,6 +39,8 @@ const GATE = /^:root\[data-nt-glass='on'\](?:\[[^\]]*\])*\s*/
 const IN_FLOW: Record<string, string> = {
   '.kanban-modal__termwrap--glass': 'the card-modal terminal fills the blurred .kanban-modal',
   '.term-node--glass .term-node__header': 'the header row of its own blurred glass node',
+  '.term-node__frost::after':
+    'the static-frost tint: it stacks on its ::before sibling, an opaque blurred copy of the wallpaper behind the node',
 }
 
 interface Rule {

@@ -38,7 +38,7 @@ import { decodePtyData } from '../../shared/rpc'
 import { createRelayPtyGate } from '../../shared/relay-pty-channel'
 
 export interface RelayClientSession {
-  /** The 6-digit SAS both humans compare, or null before the key is derived. */
+  /** The 10-digit SAS (v2, "NNN NNN NNNN") both humans compare, or null before the key is derived. */
   sas(): string | null
   /** The host's stable box public key (base64) this session is bound to, or null before ready. */
   peerKeyB64(): string | null

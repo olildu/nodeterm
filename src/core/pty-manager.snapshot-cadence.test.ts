@@ -26,7 +26,10 @@ vi.mock('child_process', () => {
   const execFile = (file: string, args: string[], a?: unknown, b?: unknown): unknown => {
     const cb = (typeof a === 'function' ? a : b) as Cb | undefined
     if (args.includes('capture-pane')) {
-      const target = args[args.indexOf('-t') + 1]
+      // Recorded as the session NAME; production passes the exact form (`=name:`).
+      const raw = args[args.indexOf('-t') + 1]
+      if (!/^=nt-.*:$/.test(raw)) throw new Error(`capture without an exact target: ${raw}`)
+      const target = raw.slice(1, -1)
       tmux.captures.push(target)
       if (tmux.hold) tmux.held.push({ target, cb: cb! })
       else if (tmux.fail) cb?.(new Error('tmux busy'))

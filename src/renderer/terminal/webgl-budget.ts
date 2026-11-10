@@ -355,7 +355,50 @@ export function loseWebglContexts(canvases: ArrayLike<HTMLCanvasElement> | null)
       // fail open — losing a context is an optimization, never worth breaking release for.
     }
   }
+  lossCounts.released += lost
   return lost
+}
+
+/**
+ * Per-session WebGL loss telemetry. Before this a GPU reset
+ * left no trace: the terminals silently fell back to the DOM renderer and were re-granted, and
+ * the only evidence was a user saying "the text went soft for a second". Each EXTERNAL loss now
+ * writes one `[webgl]` warn — which main's `console-message` mirror carries into the debug log
+ * ring with its tag (in a Server Edition browser tab it stays in the tab's console: no main, a
+ * documented degrade) — and the line carries the running totals so a soak can read the budget's
+ * real loss rate off any single entry.
+ *
+ * The two external kinds are counted apart because they are different failures:
+ *  - `lost`: the addon's own `onContextLoss` — the context stayed lost past the addon's 3s
+ *    restore window (force-eviction, or a GPU that did not come back).
+ *  - `restored`: the browser lost AND restored it (a GPU-process reset; sleep/wake) and we
+ *    rebuilt on a fresh addon instead of trusting the in-place recovery (TerminalNode.tsx).
+ * `released` is the SELF-INFLICTED kind — `loseWebglContexts` on our own release — counted
+ * separately so it is never mistaken for the browser taking contexts away, and never logged per
+ * event (it is routine churn on every pan). Plain integer increments: free on the hot path.
+ */
+export type WebglLossKind = 'lost' | 'restored'
+const lossCounts = { lost: 0, restored: 0, released: 0 }
+
+export function getWebglLossCounts(): { lost: number; restored: number; released: number } {
+  return { ...lossCounts }
+}
+
+/** The `[webgl]` line for one external loss, with the session totals (exported for the test). */
+export function formatWebglLoss(
+  kind: WebglLossKind,
+  counts: { lost: number; restored: number; released: number },
+  held: number,
+  ceiling: number
+): string {
+  const what =
+    kind === 'lost'
+      ? 'context lost (not restored within the addon window)'
+      : 'context lost and restored by the browser (GPU reset; rebuilding on a fresh addon)'
+  return (
+    `[webgl] ${what} — this session: ${counts.lost} lost, ${counts.restored} restored ` +
+    `externally; ${counts.released} released by us; ${held}/${ceiling} held`
+  )
 }
 
 /**
@@ -383,8 +426,9 @@ export interface WebglClientCallbacks {
 export interface WebglClientHandle {
   /** Report this node's viewport visibility (driven by its IntersectionObserver). */
   setVisible(visible: boolean): void
-  /** Report that the addon's own `onContextLoss` fired: drop this grant from the accounting. */
-  contextLost(): void
+  /** Report that the context was lost from outside: drop this grant from the accounting.
+   *  `kind` only labels the telemetry (see `WebglLossKind`); the accounting is identical. */
+  contextLost(kind?: WebglLossKind): void
   /** Node unmount: release any held context, cancel timers, and forget this client. */
   dispose(): void
 }
@@ -596,8 +640,18 @@ export function registerWebglClient(id: string, callbacks: WebglClientCallbacks)
       const c = clients.get(id)
       if (c === client) setVisible(c, visible)
     },
-    contextLost() {
+    contextLost(kind: WebglLossKind = 'lost') {
+      // Counted BEFORE the stale-handle guard: the browser took a real context either way; only
+      // the accounting below belongs to the live registration.
+      lossCounts[kind] += 1
       const c = clients.get(id)
+      try {
+        // `held` AFTER this loss: the live grant being dropped below no longer holds a context.
+        const held = grantCount() - (c === client && client.granted ? 1 : 0)
+        console.warn(formatWebglLoss(kind, lossCounts, held, budget))
+      } catch {
+        /* telemetry must never break the loss path */
+      }
       if (c !== client) return
       // The browser (or our own dispose) already tore the context down; drop the accounting.
       c.granted = false
@@ -650,6 +704,9 @@ export function __resetWebglBudgetForTests(): void {
   devicePixelRatio = Number.POSITIVE_INFINITY
   gestureActive = false
   owed.clear()
+  lossCounts.lost = 0
+  lossCounts.restored = 0
+  lossCounts.released = 0
   if (drainTimer) {
     clearTimeout(drainTimer)
     drainTimer = null

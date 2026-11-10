@@ -78,7 +78,7 @@ import { posixQuote } from '../../shared/ssh'
 import { sanitizePasteText } from '../paste-injection'
 import {
   assertPasteBuffer,
-  isSessionName,
+  exactPaneTarget,
   localTmuxDeleteBufferArgs,
   pasteBufferName,
   type PasteDelivery
@@ -118,12 +118,10 @@ export const KEYS_PER_COMMAND = 1024
  * "Exactly this session, its active pane". Node ids end in a counter, so `nt-a-1` is a prefix of
  * `nt-a-12`, and tmux resolves a bare target by prefix on a miss: a bare target would type into
  * ANOTHER node. `=name:` is exact and resolves (capture-route.ts has the measurement). Throws for a
- * name this app did not generate: the target is spliced UNQUOTED into tmux command text.
+ * name this app did not generate: the target is spliced UNQUOTED into tmux command text. ONE
+ * definition (tmux-naming.ts), shared with every other node-keyed tmux verb.
  */
-export function exactPaneTarget(session: string): string {
-  if (!isSessionName(session)) throw new Error(`not a session name of ours: ${JSON.stringify(session)}`)
-  return `=${session}:`
-}
+export { exactPaneTarget }
 
 /** The stdin of `tmux source-file -`: leave any mode, then type each byte literally. */
 export function keysCommandText(session: string, data: string): string {

@@ -1,3 +1,4 @@
+import { isRecord } from '../is-record'
 // Structured answers to a HELD Claude PermissionRequest (docs/hook-reply-approvals.md).
 //
 // The managed hook holds a PermissionRequest open and polls an answer file. The legacy answer is
@@ -95,8 +96,6 @@ export const QUESTIONS_MAX = 16
 export const QUESTION_OPTIONS_MAX = 32
 export const QUESTION_TEXT_MAX_CHARS = 4000
 
-const isRecord = (v: unknown): v is Record<string, unknown> =>
-  typeof v === 'object' && v !== null && !Array.isArray(v)
 const keyText = (v: unknown): v is string =>
   typeof v === 'string' && v !== '' && v.length <= QUESTION_TEXT_MAX_CHARS
 /** A display-only string (header, description): kept when readable, dropped (never refused) when not. */

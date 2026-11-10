@@ -1,6 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { writeFileSync } from 'node:fs'
-import { describeWhisperLoadError, isGgmlModelHeader, SpeechService, type WhisperEngineHandle } from './speech-service'
+import {
+  describeWhisperLoadError,
+  isGgmlModelHeader,
+  parseCpuFlags,
+  pickWhisperBinary,
+  SpeechService,
+  whisperThreads,
+  type WhisperEngineHandle,
+} from './speech-service'
 import { WhisperModelStore } from './whisper-models'
 import { testTmpDir } from '../test-tmp'
 
@@ -233,5 +241,40 @@ describe('isGgmlModelHeader', () => {
 
   it('rejects the big-endian byte order', () => {
     expect(isGgmlModelHeader(Uint8Array.from([0x67, 0x67, 0x6d, 0x6c]))).toBe(false)
+  })
+})
+
+describe('whisper binary + threads (issue #1267)', () => {
+  const avx2 = new Set(['sse2', 'avx', 'avx2', 'fma', 'f16c'])
+
+  it('parses the flags line of /proc/cpuinfo', () => {
+    const info = 'processor\t: 0\nmodel name\t: X\nflags\t\t: fpu sse2 avx avx2 fma f16c\nbugs\t\t: spectre\n'
+    expect(parseCpuFlags(info)).toEqual(new Set(['fpu', 'sse2', 'avx', 'avx2', 'fma', 'f16c']))
+    expect(parseCpuFlags('processor : 0\n').size).toBe(0)
+  })
+
+  it('picks the SIMD build only on linux x64 with every flag present', () => {
+    expect(pickWhisperBinary({ platform: 'linux', arch: 'x64', cpuFlags: avx2 })).toBe('smart-whisper-avx2')
+    for (const missing of ['avx', 'avx2', 'fma', 'f16c']) {
+      const flags = new Set([...avx2].filter((f) => f !== missing))
+      expect(pickWhisperBinary({ platform: 'linux', arch: 'x64', cpuFlags: flags })).toBe('smart-whisper')
+    }
+  })
+
+  it('falls back to the baseline when the flags are unknown or the platform has no variant', () => {
+    expect(pickWhisperBinary({ platform: 'linux', arch: 'x64', cpuFlags: null })).toBe('smart-whisper')
+    expect(pickWhisperBinary({ platform: 'linux', arch: 'arm64', cpuFlags: avx2 })).toBe('smart-whisper')
+    expect(pickWhisperBinary({ platform: 'darwin', arch: 'x64', cpuFlags: avx2 })).toBe('smart-whisper')
+    expect(pickWhisperBinary({ platform: 'win32', arch: 'x64', cpuFlags: avx2 })).toBe('smart-whisper')
+  })
+
+  it('uses more threads than whisper.cpp\'s default 4, but never every CPU', () => {
+    expect([1, 2, 4].map(whisperThreads)).toEqual([1, 2, 4])
+    expect(whisperThreads(8)).toBe(6)
+    expect(whisperThreads(12)).toBe(8)
+    expect(whisperThreads(16)).toBe(8)
+    expect(whisperThreads(64)).toBe(8)
+    expect(whisperThreads(0)).toBe(1)
+    expect(whisperThreads(Number.NaN)).toBe(1)
   })
 })

@@ -31,6 +31,15 @@ describe('unavailableRecovery', () => {
     expect(unavailableRecovery({ unavailable: false }, 'absent')).toBe('keep')
   })
 
+  it('never rehydrates a project stored in app data from its folder (#1145)', () => {
+    // Whatever the folder holds is a stale copy or a teammate's canvas, never this project's.
+    const appData = { unavailable: true, storeInAppData: true }
+    expect(unavailableRecovery(appData, 'present')).toBe('clear')
+    expect(unavailableRecovery(appData, 'absent')).toBe('clear')
+    expect(unavailableRecovery(appData, 'unreadable')).toBe('clear')
+    expect(unavailableRecovery({ storeInAppData: true }, 'present')).toBe('keep')
+  })
+
   it('never judges a REMOTE project from a local stat — its file lives on the host', () => {
     expect(unavailableRecovery({ unavailable: true, ssh: { server: {} } }, 'absent')).toBe('keep')
   })

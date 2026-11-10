@@ -5,6 +5,8 @@ import {
   pasteBufferName,
   sessionName,
   isSessionName,
+  exactPaneTarget,
+  exactSessionTarget,
   TMUX_SOCKET
 } from './tmux-naming'
 
@@ -27,7 +29,7 @@ describe('localTmuxEnterArgs', () => {
       'sock',
       'send-keys',
       '-t',
-      'nt-x',
+      '=nt-x:',
       'Enter'
     ])
     expect(localTmuxEnterArgs(TMUX_SOCKET, 'nt-x')).not.toContain('-l')
@@ -45,9 +47,9 @@ describe('localTmuxPasteArgs', () => {
     expect(localTmuxPasteArgs('sock', 'nt-x', BUF, true)).toEqual([
       '-L', 'sock',
       'load-buffer', '-b', BUF, '-',
-      ';', 'if-shell', '-F', '-t', 'nt-x', '#{pane_in_mode}', 'send-keys -t nt-x -X cancel',
-      ';', 'paste-buffer', '-d', '-p', '-r', '-b', BUF, '-t', 'nt-x',
-      ';', 'send-keys', '-t', 'nt-x', 'Enter'
+      ';', 'if-shell', '-F', '-t', '=nt-x:', '#{pane_in_mode}', 'send-keys -t =nt-x: -X cancel',
+      ';', 'paste-buffer', '-d', '-p', '-r', '-b', BUF, '-t', '=nt-x:',
+      ';', 'send-keys', '-t', '=nt-x:', 'Enter'
     ])
   })
 
@@ -91,3 +93,26 @@ describe('localTmuxPasteArgs', () => {
 // the messaging envelope now rides `localPasteDelivery` (enter=true) like every other write —
 // tmux ≥ 3.7 passes paste-buffer content through vis(3), so a payload-carried frame cannot
 // arrive as escapes. See the tombstone in tmux-naming.ts.
+
+/**
+ * The exact targets every node-keyed tmux verb uses (security audit F1/F2). A bare `-t nt-x-1` whose
+ * session is gone reaches a live `nt-x-12`; `pty-exact-target.realtmux.test.ts` measures that on a
+ * real tmux. Here: the spelling, and the refusal of anything this app did not generate.
+ */
+describe('exactPaneTarget / exactSessionTarget', () => {
+  it('spells the exact pane and session forms', () => {
+    expect(exactPaneTarget('nt-term-abc-1')).toBe('=nt-term-abc-1:')
+    expect(exactSessionTarget('nt-term-abc-1')).toBe('=nt-term-abc-1')
+    expect(exactPaneTarget(sessionName('a.b'))).toBe('=nt-a_b:')
+  })
+  it('refuses a name that did not come from sessionName — it is spliced unquoted', () => {
+    for (const bad of ['', 'nt-', 'x', 'nt-a b', 'nt-a;kill-server', 'nt-a\nx', '=nt-a:', 'nt-a:0']) {
+      expect(() => exactPaneTarget(bad), JSON.stringify(bad)).toThrow()
+      expect(() => exactSessionTarget(bad), JSON.stringify(bad)).toThrow()
+    }
+  })
+  it('every builder that names a pane uses the exact form', () => {
+    expect(localTmuxEnterArgs('sock', 'nt-x')).not.toContain('nt-x')
+    expect(localTmuxPasteArgs('sock', 'nt-x', 'nt-paste-ab', true).filter((a) => a === 'nt-x')).toEqual([])
+  })
+})

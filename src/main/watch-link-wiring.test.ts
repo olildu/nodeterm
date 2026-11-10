@@ -49,7 +49,9 @@ describe('live-link wiring', () => {
     expect(s).toMatch(/const bootWorkspaceLoad = workspaceStore\.load\(\{ sideline: false \}\)/)
     expect(s).toMatch(/workspaceReady: \(\) => bootWorkspaceLoad/)
     expect(s).toMatch(/entitlement: getStoredEntitlement/)
-    expect(s).toMatch(/initLicense\(\(\) => watchLinks\?\.onEntitlementChanged\(\)\)/)
+    // The license callback is a block since it also re-sends the project-limit state
+    // (project-limit-wiring.test.ts pins that half); a license change must still re-arm the links.
+    expect(s).toMatch(/initLicense\(\(\) => \{[^}]*\bwatchLinks\?\.onEntitlementChanged\(\)[^}]*\}\)/)
     // A node in a HOST's tmux is watched on its host, or not at all — an SSH project's node AND a
     // remote-tmux node in a local project (final review, Minor 4): core's ONE rule, fed the shell's own
     // records — the SSH project, every persisted copy's binding with its project's server, the masters.
@@ -62,6 +64,21 @@ describe('live-link wiring', () => {
     // The secret is sealed through the keychain seam.
     expect(s).toMatch(/seal: corePlatform\.sealSecret\?\.bind\(corePlatform\)/)
     expect(s).toMatch(/unseal: corePlatform\.unsealSecret\?\.bind\(corePlatform\)/)
+  })
+
+  it('the desktop wires read-back through the phone Chat screen\'s page reader, bound late', () => {
+    const s = read(MAIN)
+    const block = blockAfter(s, 'watchLinks = createWatchLinkService({', '  ')
+    // Both deps are optional: dropping either compiles and ships read-back inert.
+    expect(block).toMatch(/history: async \(nodeId, before\) => \{/)
+    expect(block).toMatch(/chat\.page\(nodeId, /)
+    expect(block).toMatch(/historySupported: \(nodeId\) => \{/)
+    expect(block).toMatch(/canChat\(capabilityAgentId\(agentId\)\)/)
+    // Declared before the service, assigned once host-chat exists (a later const would be a TDZ throw).
+    const decl = s.indexOf("let watchHistoryChat: Pick<HostChatOps, 'page'> | null = null")
+    expect(decl).toBeGreaterThan(-1)
+    expect(decl).toBeLessThan(s.indexOf('watchLinks = createWatchLinkService({'))
+    expect(s.indexOf('watchHistoryChat = hostBridge.chat')).toBeGreaterThan(s.indexOf('chat: createHostChat({'))
   })
 
   it('the desktop stops the hosts on the FIRST quit pass, inside the raced flush and before killAll', () => {

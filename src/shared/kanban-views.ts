@@ -15,6 +15,7 @@
  * IDENTITY so a well-formed file is never rewritten.
  */
 import type { KanbanSavedView, KanbanViewQuery, ProjectKanban } from './types'
+import { isRecord } from './is-record'
 
 export const KANBAN_VIEW_SOURCES: ReadonlyArray<NonNullable<KanbanViewQuery['source']>> = [
   'all',
@@ -30,9 +31,6 @@ const LIST_MAX = 200
 
 // eslint-disable-next-line no-control-regex
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/g
-
-const isRecord = (x: unknown): x is Record<string, unknown> =>
-  !!x && typeof x === 'object' && !Array.isArray(x)
 
 /** A shown name: control characters out, trimmed, bounded. '' = no usable name. */
 function cleanName(name: string): string {

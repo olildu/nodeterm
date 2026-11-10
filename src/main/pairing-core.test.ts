@@ -513,6 +513,55 @@ describe('ssh:false in the pairing payload', () => {
   })
 })
 
+describe('sshHostKeys in the pairing payload (the phone pins this host\'s SSH key at pairing)', () => {
+  const input = { host: 'h', user: 'u', token: 't', pairPort: 1, name: 'n' }
+  const FP1 = 'SHA256:4hkcemIeUAnjVwt5EwB/CU/rymSk1jz+o5uJWjj16e4'
+  const FP2 = 'SHA256:KvCpHJYyTp5MLlmTTswZrJdnfnG1ukad9uzDw1PHE8I'
+  const FP3 = 'SHA256:13Wz/nq9riSY3UhwCTNTh+tHZoA2v/gMWgsnDt10ySY'
+  const relay = { hostId: 'abcABC012_-def012ghij', hostPublicKeyB64: 'AAAAhostpub', relayEndpoint: 'wss://relay.nodeterm.dev' }
+
+  it('is placed after relay (the exact byte order the phones parse)', () => {
+    expect(buildPairingPayload({ ...input, hostKey: 'AAAAhostpub', relay, sshHostKeys: [FP1, FP2, FP3] })).toBe(
+      '{"v":1,"host":"h","port":22,"user":"u","token":"t","pairPort":1,"nodeterm":true,"name":"n","hostKey":"AAAAhostpub",' +
+        '"relay":{"hostId":"abcABC012_-def012ghij","hostPublicKeyB64":"AAAAhostpub","relayEndpoint":"wss://relay.nodeterm.dev"},' +
+        `"sshHostKeys":["${FP1}","${FP2}","${FP3}"]}`
+    )
+  })
+
+  it('is placed after hostKey, or after name, when the blocks before it are absent', () => {
+    expect(buildPairingPayload({ ...input, hostKey: 'K', sshHostKeys: [FP1] })).toBe(
+      `{"v":1,"host":"h","port":22,"user":"u","token":"t","pairPort":1,"nodeterm":true,"name":"n","hostKey":"K","sshHostKeys":["${FP1}"]}`
+    )
+    expect(buildPairingPayload({ ...input, sshHostKeys: [FP1] })).toBe(
+      `{"v":1,"host":"h","port":22,"user":"u","token":"t","pairPort":1,"nodeterm":true,"name":"n","sshHostKeys":["${FP1}"]}`
+    )
+  })
+
+  it('is omitted when there is none (byte-for-byte the old payload)', () => {
+    expect(buildPairingPayload({ ...input, sshHostKeys: [] })).toBe(buildPairingPayload(input))
+    expect(buildPairingPayload({ ...input, sshHostKeys: undefined })).toBe(buildPairingPayload(input))
+  })
+
+  it('is ALWAYS omitted on a relay-only host (ssh:false): that payload is unchanged', () => {
+    expect(buildPairingPayload({ ...input, relay, ssh: false, sshHostKeys: [FP1] })).toBe(
+      buildPairingPayload({ ...input, relay, ssh: false })
+    )
+    expect(buildPairingPayload({ ...input, ssh: false, sshHostKeys: [FP1] })).toBe(
+      '{"v":1,"host":"h","port":22,"user":"u","token":"t","pairPort":1,"nodeterm":true,"name":"n","ssh":false}'
+    )
+  })
+
+  it('carries only well-formed fingerprints, at most four', () => {
+    const json = buildPairingPayload({
+      ...input,
+      sshHostKeys: ['junk', FP1, 'SHA256:short', `${FP2}=`, FP2, FP3, FP1.replace('SHA256:', 'MD5:'), FP3, FP2]
+    })
+    expect(JSON.parse(json).sshHostKeys).toEqual([FP1, FP2, FP3])
+    const five = Array.from({ length: 5 }, (_, i) => `SHA256:${String(i).repeat(43)}`)
+    expect(JSON.parse(buildPairingPayload({ ...input, sshHostKeys: five })).sshHostKeys).toEqual(five.slice(0, 4))
+  })
+})
+
 describe('pickPairingIPv4', () => {
   const nic = (address: string, internal = false) => ({ address, family: 'IPv4', internal })
   const ifaces = {

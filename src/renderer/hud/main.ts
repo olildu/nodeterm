@@ -8,6 +8,7 @@ import { CLAUDE_MASCOT, CODEX_MASCOT, DONE_BLOB } from '../lib/mascot'
 import { HUD_BRAND_PULSE_CLASS, brandPulseBackground, brandPulsePlan } from '../lib/brandPulse'
 import { createGrokMarkSvg } from '../lib/grokMark'
 import { createCopilotMarkSvg } from '../lib/copilotMark'
+import { createCursorMarkSvg } from '../lib/cursorMark'
 import { buildIndicator, orderIndicatorAgents } from './indicator'
 import { HUD_ROW_CAP, overflowLabel, splitPanelRows } from './panel-rows'
 import { percentText } from '../lib/usageFormat'
@@ -109,12 +110,18 @@ let showAllRows = false
 const HOVER_OPEN_MS = 180
 let hoverTimer: number | undefined
 
+// A small grow under the pointer (owner: "üzerine gelince biraz daha genişlesin"), so the capsule
+// answers the hover before the dwell opens the panel — and is the only feedback when hover-expand
+// is off. A class, not `:hover`: the window is click-through until this very event, and forwarded
+// moves are what we can rely on, not the CSS hover state. Drawn by `.hud-capsule.hovering`.
 capsule.addEventListener('pointerenter', () => {
+  capsule.classList.add('hovering')
   window.hud.setIgnoreMouse(false)
   window.clearTimeout(hoverTimer)
   if (hoverExpand) hoverTimer = window.setTimeout(() => setExpanded(true), HOVER_OPEN_MS)
 })
 capsule.addEventListener('pointerleave', () => {
+  capsule.classList.remove('hovering')
   window.clearTimeout(hoverTimer)
   window.hud.setIgnoreMouse(true)
   if (expanded) setExpanded(false)
@@ -212,7 +219,9 @@ function workingMascot(agentId?: string): Element {
     return plan.kind === 'inline'
       ? plan.mark === 'copilot'
         ? createCopilotMarkSvg(plan.size, HUD_BRAND_PULSE_CLASS)
-        : createGrokMarkSvg(plan.size, HUD_BRAND_PULSE_CLASS)
+        : plan.mark === 'cursor'
+          ? createCursorMarkSvg(plan.size, HUD_BRAND_PULSE_CLASS)
+          : createGrokMarkSvg(plan.size, HUD_BRAND_PULSE_CLASS)
       : brandPulseMascot(plan.src, plan.size)
   }
   const dot = document.createElement('span')

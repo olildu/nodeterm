@@ -90,14 +90,19 @@ import {
 import { controlPasswordProblem } from '../../shared/watch-link-password'
 import type { HostTokenResult, WatchLinkApi as WatchLinkApiClient } from './api'
 import { WRONG_PER_LINK, createLinkHost, type LinkHost, type QuietClients, type WatchPty } from './link-host'
+import type { HistoryRead } from './history'
 import { hashControlPassword, verifyControlPassword, type ControlPasswordHash } from './password'
 import {
+  CONTROL_LOCK_STEP_MAX,
   WatchLinkStoreUnreadable,
+  controlLockMs,
   type WatchLinkControlRecord,
   type WatchLinkRecord,
   type WatchLinkStore
 } from './store'
 import type { RelayTransport } from '../relay/relay-socket'
+import { errorText } from '../../shared/error-text'
+import { CONTROL_LOCK_MAX_MS } from '../../shared/watch-link/protocol'
 
 /** setTimeout's own ceiling (a longer delay fires at once). A link lives ≤ 24 h, far below it. */
 const MAX_DELAY_MS = 2_147_483_647
@@ -132,6 +137,13 @@ export interface WatchLinkServiceDeps {
   /** Can this node's terminal take a Control link's input (`PtyManager.nodeControlSupport`)? Absent,
    *  throwing or anything else answers `unknown`, which leaves the create to decide. */
   controlSupport?(nodeId: string): ControlSupport
+  /** Read-back (`watch:history`): one transcript page of `nodeId`'s conversation ending at `before`
+   *  (null: the newest), through the SAME reader as the ⌘M panel and the phone's `chat.page`. Rejects
+   *  on a failed read. The link host cuts every page at the link's creation (./history.ts); the reader
+   *  knows nothing of links. Absent: viewers are told read-back is not available. */
+  history?(nodeId: string, before: number | null): Promise<HistoryRead>
+  /** Is `nodeId` an agent whose conversation `history` can read? Rides every join's meta. */
+  historySupported?(nodeId: string): boolean
   /** This shell cannot host links (the Server Edition until it has a license layer — R43). */
   unsupported?: boolean
   now?(): number
@@ -287,7 +299,6 @@ export function sendToOwners(
   for (const id of p.clientIds()) if (p.isOwnerClient?.(id) === true) p.sendTo(id, channel, ...args)
 }
 
-const errorText = (err: unknown): string => (err instanceof Error ? err.message : String(err))
 /** An error's NAME only: what failed around a password (its hash, its check) may be in the message. */
 const errorName = (err: unknown): string => (err instanceof Error ? err.name : 'not an Error')
 const TIMEOUT = Symbol('timeout')
@@ -314,6 +325,8 @@ export function createWatchLinkService(deps: WatchLinkServiceDeps): WatchLinkSer
   const writing = new Map<string, WatchLinkRecord>()
   const hosts = new Map<string, LinkHost>()
   const expiry = new Map<string, unknown>()
+  /** A timed wrong-password lock's timer, per link (finding L2). */
+  const lockTimers = new Map<string, unknown>()
   let initPromise: Promise<void> | null = null
   /** Creates between their cap check and their answer (G17): they count against the cap. A create's
    *  record joins `records` only as it answers, so it is never counted twice. */
@@ -403,7 +416,14 @@ export function createWatchLinkService(deps: WatchLinkServiceDeps): WatchLinkSer
       url: formatWatchLink(r.linkId, r.secret),
       status,
       viewers,
-      control: r.role === 'controller' && r.control ? { enabled: r.control.enabled, locked: r.control.locked } : null
+      control:
+        r.role === 'controller' && r.control
+          ? {
+              enabled: r.control.enabled,
+              locked: r.control.locked,
+              lockedUntil: r.control.locked && typeof r.control.lockedUntil === 'number' ? r.control.lockedUntil : null
+            }
+          : null
     }
   }
   const list = (): WatchLinkView[] => (unsupported ? [] : [...records.values()].map(viewOf))
@@ -503,6 +523,58 @@ export function createWatchLinkService(deps: WatchLinkServiceDeps): WatchLinkSer
     )
   }
 
+  /**
+   * A Control link's wrong-password lock lifts by itself at `lockedUntil` (finding L2): arm that, or
+   * lift it now when its time has passed (an app restart past it, a lid-close). A lock with no
+   * `lockedUntil` (one written before timed locks) has nothing to arm: it waits for the owner, as it
+   * always did. A `lockedUntil` further away than the longest lock (the clock went back, a hand edit)
+   * is brought in to that: no lock outlasts `CONTROL_LOCK_MAX_MS` from now.
+   */
+  function armLock(r: WatchLinkRecord): void {
+    const t = lockTimers.get(r.linkId)
+    if (t !== undefined) clearT(t)
+    lockTimers.delete(r.linkId)
+    const c = r.control
+    if (!c || !c.locked || typeof c.lockedUntil !== 'number') return
+    if (c.lockedUntil - now() > CONTROL_LOCK_MAX_MS) c.lockedUntil = now() + CONTROL_LOCK_MAX_MS
+    const until = c.lockedUntil
+    const delay = until - now()
+    if (delay <= 0) {
+      liftLock(r, until)
+      return
+    }
+    lockTimers.set(
+      r.linkId,
+      setT(() => {
+        lockTimers.delete(r.linkId)
+        liftLock(r, until)
+      }, Math.min(MAX_DELAY_MS, delay))
+    )
+  }
+  /** The lock armed for `until` lifts: unlocking is allowed again and the link-wide count starts over;
+   *  `lockStep` stays, so the next lock lasts twice as long. Nothing if the link ended, or the lock
+   *  changed meanwhile (lifted by the owner, or a new lock). The record changes first and is then
+   *  written; a write that fails changes nothing that matters — a `lockedUntil` in the past reads as
+   *  lifted at the next launch too. */
+  function liftLock(r: WatchLinkRecord, until: number): void {
+    const c = r.control
+    if (stopped || !c || !c.locked || c.lockedUntil !== until) return
+    if (now() < until) {
+      armLock(r) // a clamped delay: not yet
+      return
+    }
+    c.locked = false
+    c.lockedUntil = null
+    c.wrong = 0
+    // The link may still be loading (`init` lifts a lapsed lock before any host exists).
+    if (records.get(r.linkId) !== r) return
+    tellHost(r.linkId, (h) => h.allowControl())
+    emitState()
+    void persist().then((saved) => {
+      if (!saved) warn("a Control link's lifted lock could not be saved; it reads as lifted at the next launch anyway")
+    })
+  }
+
   /** The host's pty seam, with the node-gone check before every join (R29, G8). */
   function guardedPty(r: WatchLinkRecord): WatchPty {
     return {
@@ -537,6 +609,9 @@ export function createWatchLinkService(deps: WatchLinkServiceDeps): WatchLinkSer
   function start(r: WatchLinkRecord): void {
     if (stopped || hosts.has(r.linkId)) return
     armExpiry(r)
+    // Before the host exists: a lock whose time passed while nodeterm was closed is lifted first, so the
+    // host starts from a wrong count of 0.
+    armLock(r)
     if (!deps.relayAllowed()) return // kept and listed `refused`, never hosted (G21)
     let host: LinkHost
     try {
@@ -565,6 +640,9 @@ export function createWatchLinkService(deps: WatchLinkServiceDeps): WatchLinkSer
           notice({ kind: 'joined', linkId: r.linkId, nodeId: r.nodeId, title: stripBidiControls(r.title), viewers: count }),
         onGone: (reason) => end(r.linkId, reason, { serverRevoke: false, notify: true }),
         verifyPassword: (pw) => checkPassword(r, pw),
+        // Bound to THIS link's node: a viewer names no node, only a cursor.
+        ...(deps.history ? { history: (before: number | null) => deps.history!(r.nodeId, before) } : {}),
+        ...(deps.historySupported ? { historySupported: () => deps.historySupported!(r.nodeId) } : {}),
         onControlTaken: (name) => {
           notice({
             kind: 'control-taken',
@@ -576,17 +654,36 @@ export function createWatchLinkService(deps: WatchLinkServiceDeps): WatchLinkSer
           })
           emitState()
         },
-        onControlLocked: () => {
+        onControlLocked: (by) => {
           // SYNCHRONOUSLY, before any I/O: the host's lock rests on this flag (it reads the record live
-          // and never writes it). Never undone: a lock whose write fails still holds until quit.
-          if (r.control) r.control.locked = true
+          // and never writes it). Never undone by a failed write: a lock whose write fails still holds,
+          // and still lifts at its time (finding L2: it lifts by itself — 15 minutes for the first since
+          // the owner last allowed control, doubling each time, 24 h at most).
+          const c = r.control
+          let until: number | null = null
+          if (c) {
+            const step = Number.isInteger(c.lockStep) ? (c.lockStep as number) : 0
+            until = now() + controlLockMs(step)
+            c.locked = true
+            c.lockedUntil = until
+            c.lockStep = Math.min(CONTROL_LOCK_STEP_MAX, step + 1)
+          }
           takeTurn(r, 'locked') // an "allow again" still being written must not land over it
           if (records.get(r.linkId) === r) {
+            armLock(r)
             void persist().then((saved) => {
-              if (!saved) warn("a Control link's lock could not be saved; it holds until nodeterm quits")
+              if (!saved) warn("a Control link's lock could not be saved; a restart would lift it early")
             })
           }
-          notice({ kind: 'control-locked', linkId: r.linkId, nodeId: r.nodeId, title: stripBidiControls(r.title) })
+          notice({
+            kind: 'control-locked',
+            linkId: r.linkId,
+            nodeId: r.nodeId,
+            title: stripBidiControls(r.title),
+            // A name the attempt gave itself (sanitized by the host): a claim, shown as one.
+            by: typeof by === 'string' && by ? stripBidiControls(by) : null,
+            until
+          })
           emitState()
         },
         onWrongAttempt: (count) => {
@@ -623,6 +720,9 @@ export function createWatchLinkService(deps: WatchLinkServiceDeps): WatchLinkSer
     const t = expiry.get(linkId)
     if (t !== undefined) clearT(t)
     expiry.delete(linkId)
+    const lt = lockTimers.get(linkId)
+    if (lt !== undefined) clearT(lt)
+    lockTimers.delete(linkId)
     const host = hosts.get(linkId)
     hosts.delete(linkId)
     return { record, host }
@@ -830,7 +930,7 @@ export function createWatchLinkService(deps: WatchLinkServiceDeps): WatchLinkSer
             return fail('unsupported')
           }
           parsed.password = null
-          control = { enabled: true, locked: false, wrong: 0, salt: h.salt, hash: h.hash }
+          control = { enabled: true, locked: false, wrong: 0, lockedUntil: null, lockStep: 0, salt: h.salt, hash: h.hash }
         }
         const secret = newWatchLinkSecret()
         const joinKeyHash = await sha256Hex(deriveWatchLinkKeys(secret).joinKey)
@@ -1035,9 +1135,14 @@ export function createWatchLinkService(deps: WatchLinkServiceDeps): WatchLinkSer
       return widenControl(r, 'locked', {
         change: (x) => {
           x.locked = false
+          x.lockedUntil = null
           x.wrong = 0 // the count starts over with the lock (the host resets its own)
+          x.lockStep = 0 // and so does the backoff: the next lock lasts 15 minutes again
         },
-        host: (h) => h.allowControl()
+        host: (h) => {
+          armLock(r) // nothing left to lift
+          h.allowControl()
+        }
       })
     },
 
@@ -1051,6 +1156,8 @@ export function createWatchLinkService(deps: WatchLinkServiceDeps): WatchLinkSer
         stopped = true
         for (const t of expiry.values()) clearT(t)
         expiry.clear()
+        for (const t of lockTimers.values()) clearT(t)
+        lockTimers.clear()
         const all = [...hosts.values()]
         hosts.clear()
         for (const h of all) stopHost(h, 'host-stopping')

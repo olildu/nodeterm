@@ -130,6 +130,37 @@ describe('the control shim tags each run with its own request id', () => {
   })
 })
 
+// The shim loop as it stood before 2026-08-15: it took the token after ANY flag as that flag's
+// value. It still runs on an SSH host until that project reconnects (the shim is rewritten there only
+// on connect), which is why every flag of a new verb must take a value.
+const oldLoop = [
+  'nt_count=$#',
+  'nt_i=0',
+  'while [ "$nt_i" -lt "$nt_count" ]; do',
+  '  nt_a="$1"; shift; nt_i=$((nt_i + 1))',
+  '  case "$nt_a" in',
+  '    --*)',
+  '      nt_k=${nt_a#--}',
+  '      nt_v=""',
+  '      if [ "$nt_i" -lt "$nt_count" ]; then nt_v="$1"; shift; nt_i=$((nt_i + 1)); fi',
+  '      set -- "$@" --data-urlencode "arg.$nt_k=$nt_v"',
+  '      ;;',
+  '  esac',
+  'done',
+  'for a in "$@"; do case "$a" in arg.*) printf \'%s\\n\' "$a" ;; esac; done'
+].join('\n')
+// What the server reads: curl's `--data-urlencode name=content` splits on the FIRST `=`.
+const oldShim = (flags: string[]): Record<string, string> =>
+  Object.fromEntries(
+    execFileSync('sh', ['-c', oldLoop, 'sh', ...flags], { encoding: 'utf8' })
+      .split('\n')
+      .filter(Boolean)
+      .map((pair) => {
+        const at = pair.indexOf('=')
+        return [pair.slice('arg.'.length, at), pair.slice(at + 1)]
+      })
+  )
+
 describe('the control shim translates flags', () => {
   it('a --flag followed by another --flag does NOT eat it', () => {
     // THE BUG: this used to yield ['arg.read=--node'] and `b1` was lost with no error anywhere.
@@ -183,33 +214,6 @@ describe('the control shim translates flags', () => {
   // had no `--*=*` branch. An SSH host keeps whatever shim it got at its last connect, so this
   // loop can still be what an agent there runs. Executed under real `sh`, not modelled.
   it('on the pre-2026-08-15 shim loop --run-now survives only LAST on the line, in either form (#925)', () => {
-    const oldLoop = [
-      'nt_count=$#',
-      'nt_i=0',
-      'while [ "$nt_i" -lt "$nt_count" ]; do',
-      '  nt_a="$1"; shift; nt_i=$((nt_i + 1))',
-      '  case "$nt_a" in',
-      '    --*)',
-      '      nt_k=${nt_a#--}',
-      '      nt_v=""',
-      '      if [ "$nt_i" -lt "$nt_count" ]; then nt_v="$1"; shift; nt_i=$((nt_i + 1)); fi',
-      '      set -- "$@" --data-urlencode "arg.$nt_k=$nt_v"',
-      '      ;;',
-      '  esac',
-      'done',
-      'for a in "$@"; do case "$a" in arg.*) printf \'%s\\n\' "$a" ;; esac; done'
-    ].join('\n')
-    // What the server reads: curl's `--data-urlencode name=content` splits on the FIRST `=`.
-    const oldShim = (flags: string[]): Record<string, string> =>
-      Object.fromEntries(
-        execFileSync('sh', ['-c', oldLoop, 'sh', ...flags], { encoding: 'utf8' })
-          .split('\n')
-          .filter(Boolean)
-          .map((pair) => {
-            const at = pair.indexOf('=')
-            return [pair.slice('arg.'.length, at), pair.slice(at + 1)]
-          })
-      )
     // Last on the line: both forms are on, and nothing is lost.
     for (const last of ['--run-now', '--run-now=1']) {
       const args = oldShim(['--agent', 'claude', '--project', 'p2', last])
@@ -240,6 +244,11 @@ describe('the control shim translates flags', () => {
   // keep working, or the fix trades one silent misparse for another.
   it('a negative number is still consumed as a value', () => {
     expect(run(['browser', '--scroll', '-600'])).toEqual(['arg.scroll=-600'])
+  })
+
+  it('preserves explicitly positive scroll pixels in both flag forms (#539)', () => {
+    expect(run(['browser', '--scroll', '+200'])).toEqual(['arg.scroll=+200'])
+    expect(run(['browser', '--scroll=+200'])).toEqual(['arg.scroll=+200'])
   })
 
   it('an ordinary --flag value pair is unchanged', () => {
@@ -332,3 +341,24 @@ describe('the sim verb parses through the shim (current loop)', () => {
     }
   })
 })
+
+// Issue #1288: every new flag takes a value, so the current loop and the pre-2026-08-15 one (still on
+// an SSH host until it reconnects) read the same request — including a negative coordinate.
+describe('the geometry flags reach the server intact, on the current and the old shim loop', () => {
+  const lines: Array<[string[], string[]]> = [
+    [['arrange', '--nodes', 'a,b', '--layout', 'grid', '--cols', '2', '--gap', '0'], ['arg.nodes=a,b', 'arg.layout=grid', 'arg.cols=2', 'arg.gap=0']],
+    [['resize', '--nodes', 'a,b', '--width', '540', '--height', '480'], ['arg.nodes=a,b', 'arg.width=540', 'arg.height=480']],
+    [['place', '--nodes', 'a', '--x', '-120', '--y', '0'], ['arg.nodes=a', 'arg.x=-120', 'arg.y=0']],
+    [['place', '--nodes', 'a', '--dx', '-8', '--dy', '-8'], ['arg.nodes=a', 'arg.dx=-8', 'arg.dy=-8']],
+    [['list', '--geometry', 'on'], ['arg.geometry=on']]
+  ]
+
+  it.each(lines)('%j', (argv, expected) => {
+    expect(run(argv)).toEqual(expected)
+    const [, ...flags] = argv
+    expect(oldShim(flags)).toEqual(
+      Object.fromEntries(expected.map((pair) => [pair.slice('arg.'.length, pair.indexOf('=')), pair.slice(pair.indexOf('=') + 1)]))
+    )
+  })
+})
+

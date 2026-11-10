@@ -3,6 +3,7 @@
 // The host key inside is what authenticates the host to the joiner, and the hostId must derive
 // from it, so a code cannot point a teammate at a different room than the key it carries.
 import { hostIdFromPublicKeyB64 } from './relay-id'
+import { isUsablePeerKeyB64 } from './e2ee'
 // The prefix is shared with the renderer (which cannot import this file); one definition.
 import { JOIN_CODE_PREFIX as PREFIX, isJoinCode } from '../../shared/relay-join-code'
 
@@ -25,16 +26,33 @@ export function encodeJoinCode(c: JoinCode): string {
   return PREFIX + Buffer.from(JSON.stringify(c), 'utf-8').toString('base64url')
 }
 
+/** The code body's bytes, or null. Canonical base64url only: Node's decoder skips characters
+ *  outside the alphabet, so junk inside a code (or after it) would otherwise decode to the same
+ *  code. ASCII whitespace is removed first — a code that travelled through a chat or a mail client
+ *  arrives wrapped across lines, and a line break is visible, not a disguise. */
+function codeBytes(body: string): Buffer | null {
+  const b = body.replace(/[\t\n\r ]+/g, '')
+  if (!b || !/^[A-Za-z0-9_-]+$/.test(b)) return null
+  const bytes = Buffer.from(b, 'base64url')
+  return bytes.toString('base64url') === b ? bytes : null
+}
+
 export function decodeJoinCode(s: string): JoinCode | null {
   const t = s.trim()
   if (!t.startsWith(PREFIX)) return null
   try {
-    const o = JSON.parse(Buffer.from(t.slice(PREFIX.length), 'base64url').toString('utf-8')) as Record<string, unknown>
+    const bytes = codeBytes(t.slice(PREFIX.length))
+    if (!bytes) return null
+    const o = JSON.parse(bytes.toString('utf-8')) as Record<string, unknown>
     const str = (k: string, max: number) => typeof o[k] === 'string' && (o[k] as string).length > 0 && (o[k] as string).length <= max
     if (o.v !== 1 || !str('relayEndpoint', 512) || !str('hostId', 64) || !str('hostPublicKeyB64', 64) || !str('hostDeviceId', 128)) return null
     if (typeof o.label !== 'string' || o.label.length > 60) return null
     if (!allowedEndpoint(o.relayEndpoint as string)) return null
-    // May throw on a malformed key; inside the try, so junk decodes to null.
+    // The joiner PINS this key, so it is held to the handshake's rules: canonical base64 (one
+    // spelling per key) and not a low-order point (a public-constant shared secret — the SAS would
+    // be a fixed value both humans "match"). A chosen low-order key satisfies the hostId check
+    // below, so that check alone never covered it.
+    if (!isUsablePeerKeyB64(o.hostPublicKeyB64)) return null
     if (hostIdFromPublicKeyB64(o.hostPublicKeyB64 as string) !== o.hostId) return null
     return { v: 1, relayEndpoint: o.relayEndpoint as string, hostId: o.hostId as string, hostPublicKeyB64: o.hostPublicKeyB64 as string, hostDeviceId: o.hostDeviceId as string, label: o.label }
   } catch {

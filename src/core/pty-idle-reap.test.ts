@@ -76,7 +76,9 @@ vi.mock('child_process', () => {
     execCalls.push({ file, args })
     const ok = (stdout: string): void => cb?.(null, { stdout, stderr: '' })
     if (args.includes('has-session')) {
-      const target = args[args.indexOf('-t') + 1]
+      // Production asks with the EXACT form (`=nt-…` / `=nt-…:`); tmux matches it against the name.
+      const raw = args[args.indexOf('-t') + 1]
+      const target = raw.startsWith('=') ? raw.slice(1).replace(/:$/, '') : raw
       if (liveTmuxSessions.has(target)) ok('')
       else cb?.(Object.assign(new Error('no such session'), { code: 1 }))
     } else if (args[0] === '-ilc') {

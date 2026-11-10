@@ -81,7 +81,9 @@ vi.mock('child_process', () => {
     const cb = (typeof a === 'function' ? a : b) as Cb | undefined
     const ok = (stdout: string): void => cb?.(null, { stdout, stderr: '' })
     if (args.includes('has-session')) {
-      const target = args[args.indexOf('-t') + 1]
+      // Production asks with the EXACT form (`=nt-…`); tmux matches it against the bare name.
+      const raw = args[args.indexOf('-t') + 1]
+      const target = raw.startsWith('=') ? raw.slice(1).replace(/:$/, '') : raw
       if (liveTmuxSessions.has(target)) ok('')
       else cb?.(Object.assign(new Error('no such session'), { code: 1 }))
     } else if (args[0] === '-ilc') {
@@ -232,7 +234,8 @@ describe('control-mode shadow clients for released sessions', () => {
     fake.senderListeners[IPC.ptyKill](clientId, sessionId)
   /** Run the sweep past the idle threshold (it only decides on its own ticks). */
   const idle = (ms = REAP_IDLE_MS + REAP_SWEEP_MS) => vi.advanceTimersByTime(ms)
-  const attachArgs = (key: string) => ['-L', TMUX_SOCKET, '-C', 'attach-session', '-t', sessionName(key)]
+  // Exact (`=name`): a bare target prefix-matches a longer session when this one is gone.
+  const attachArgs = (key: string) => ['-L', TMUX_SOCKET, '-C', 'attach-session', '-t', `=${sessionName(key)}`]
 
   it('shadows a session the reap stranded — over pipes, taking no pty device', async () => {
     const m = await tmuxManager()

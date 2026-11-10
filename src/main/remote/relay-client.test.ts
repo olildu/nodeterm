@@ -217,9 +217,9 @@ afterEach(() => {
 })
 
 describe('relay client — SAS + mutual approval', () => {
-  it('both ends derive the SAME 6-digit SAS from this session', () => {
+  it('both ends derive the SAME 10-digit SAS from this session', () => {
     const p = pairHostAndClient()
-    expect(p.clientSas()).toMatch(/^\d{3} \d{3}$/)
+    expect(p.clientSas()).toMatch(/^\d{3} \d{3} \d{4}$/)
     expect(p.clientSas()).toBe(p.host.sas())
   })
 

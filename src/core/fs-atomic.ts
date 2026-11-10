@@ -49,6 +49,7 @@
 import { promises as fs, renameSync } from 'fs'
 import { randomUUID } from 'crypto'
 import path from 'path'
+import { sleep } from '../shared/sleep'
 
 /**
  * Errors that mean "someone else has the destination open right now", rather than "this will
@@ -68,8 +69,6 @@ const RETRY_DELAYS_MS = [10, 25, 75, 200]
 function codeOf(e: unknown): string {
   return typeof e === 'object' && e && 'code' in e ? String((e as { code: unknown }).code) : ''
 }
-
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
 /**
  * Rename `tmp` over `target`, retrying briefly if the destination is momentarily held open.
@@ -173,6 +172,8 @@ function atomicTempCandidate(base: string, entry: string): AtomicTempCandidate |
  * Unknown temp-name shapes are left alone. Every current writer removes its own temp on failure;
  * this sweep exists only for process death and must never recreate the writer-vs-sweeper race that
  * unique names fixed.
+ *
+ * A store whose orphaned temp would be a live credential uses `sweepForeignTempFiles` instead.
  */
 export async function sweepStaleTempFiles(
   target: string,
@@ -201,6 +202,37 @@ export async function sweepStaleTempFiles(
     }
   } catch {
     // A directory we cannot read is not a reason to fail the load/save that requested the sweep.
+  }
+}
+
+/**
+ * The AGGRESSIVE sibling of `sweepStaleTempFiles`, for a target whose orphaned temp is a live
+ * credential (a token, a cookie, a device bearer). With no age grace it removes the legacy fixed
+ * `<target>.tmp` and every pid-bearing temp whose pid is not this process's. Temps bearing our own
+ * pid stay: one may be a concurrent write sitting between its `writeFile` and its `rename`.
+ *
+ * This deliberately gives up what `sweepStaleTempFiles` protects. A foreign pid can be a second
+ * LIVE process on the same directory (desktop multi-instance, two servers on one `--data-dir`, the
+ * host agent on ~/.nodeterm), and deleting its temp makes that process's rename fail with ENOENT,
+ * rethrown to its caller. The callers accept that trade because the alternative is worse for
+ * them: a unique temp name is never written twice, so an orphan holding a secret would otherwise
+ * sit on disk at 0600 forever.
+ *
+ * It recognizes exactly the shapes `atomicTempCandidate` does, so a change to `tempNameFor`
+ * reaches both sweeps. This rule used to be re-typed at five call sites, each with its own copy of
+ * the temp-name regex. Best effort: an unreadable directory never fails the caller's save.
+ */
+export async function sweepForeignTempFiles(target: string): Promise<void> {
+  try {
+    const directory = path.dirname(target)
+    const base = path.basename(target)
+    for (const entry of await fs.readdir(directory)) {
+      const candidate = atomicTempCandidate(base, entry)
+      if (!candidate || candidate.ownerPid === process.pid) continue
+      await fs.rm(path.join(directory, entry), { force: true }).catch(() => undefined)
+    }
+  } catch {
+    // A directory we cannot read is not a reason to fail (or skip) the save that requested it.
   }
 }
 

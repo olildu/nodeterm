@@ -29,6 +29,7 @@
 // in 'running' with no listener and no timer, i.e. hosting silently dead until a restart.
 import type { MintResult } from './host-token'
 import { POP_REFUSED_MESSAGE, type PopRefusal } from './relay-pop'
+import { errorText } from '../../shared/error-text'
 export type { MintResult } from './host-token'
 
 const REFRESH_LEAD_MS = 30_000
@@ -85,7 +86,6 @@ interface Entry {
 }
 
 const clampDelay = (ms: number): number => Math.min(MAX_DELAY_MS, ms)
-const errorText = (err: unknown): string => (err instanceof Error ? err.message : String(err))
 
 export function createHostedScheduler(deps: SchedulerDeps, now: () => number) {
   if (deps.maxBridged !== undefined && !(Number.isInteger(deps.maxBridged) && deps.maxBridged >= 1)) {

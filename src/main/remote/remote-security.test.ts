@@ -136,7 +136,7 @@ describe('projects.list serves the host projects blob', () => {
 // --- R2: SAS determinism -----------------------------------------------------
 
 describe('R2: channel SAS', () => {
-  it('is identical for both peers and stable, formatted NNN NNN', () => {
+  it('is identical for both peers and stable, formatted NNN NNN NNNN', () => {
     const host = genKeyPair()
     const client = genKeyPair()
     const hostShared = deriveSharedKey(publicKeyToB64(client.publicKey), host.secretKey)
@@ -144,7 +144,7 @@ describe('R2: channel SAS', () => {
     const a = sasFromSharedKey(hostShared)
     const b = sasFromSharedKey(clientShared)
     expect(a).toBe(b)
-    expect(a).toMatch(/^\d{3} \d{3}$/)
+    expect(a).toMatch(/^\d{3} \d{3} \d{4}$/)
     expect(sasFromSharedKey(hostShared)).toBe(a) // deterministic
   })
 })

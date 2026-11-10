@@ -1,6 +1,14 @@
 import { describe, it, expect } from 'vitest'
 import type { CanvasNodeState } from '@shared/types'
-import { applyOwnCanvasMutation, groupSelectedNodes, nodeStatesToFlow, ungroupNodes } from '../state/workspace'
+import {
+  applyOwnCanvasMutation,
+  arrangeNodes,
+  groupSelectedNodes,
+  nodeStatesToFlow,
+  placeNodes,
+  resizeNodes,
+  ungroupNodes
+} from '../state/workspace'
 import { groupsFirst } from '@shared/node-order'
 import { geometryMutations } from './storedGeometry'
 
@@ -60,4 +68,45 @@ describe('geometryMutations — a structural verb run off screen', () => {
     const ms = geometryMutations(stored, nodeStatesToFlow(stored.slice(0, 2)))
     expect(ms).toEqual([])
   })
+
+  // Issue #1288: `resize` / `place` run off screen through the same write. Their whole effect is
+  // geometry, so the patch must carry it and nothing else.
+  it('resize writes the new persisted size, and leaves every other stored field alone', () => {
+    const out = resizeNodes(nodeStatesToFlow(stored), ['a', 'b'], { width: 540, height: 480 })
+    if (!out.ok) throw new Error(out.error)
+    const after = apply(stored, geometryMutations(stored, out.nodes))
+    expect(after.find((n) => n.id === 'a')!.size).toEqual({ width: 540, height: 480 })
+    expect(after.find((n) => n.id === 'b')!.size).toEqual({ width: 540, height: 480 })
+    expect(after.find((n) => n.id === 'c')!.size).toEqual({ width: 600, height: 400 })
+    expect(after.find((n) => n.id === 'a')!.pendingLaunch).toEqual({ after: [], command: 'claude' })
+  })
+
+  it('a collapsed stored node keeps collapsed, and stores the height it will expand to', () => {
+    const folded = [term('f', 0, { collapsed: true })]
+    const out = resizeNodes(nodeStatesToFlow(folded), ['f'], { height: 500 })
+    if (!out.ok) throw new Error(out.error)
+    const [f] = apply(folded, geometryMutations(folded, out.nodes))
+    expect(f.collapsed).toBe(true)
+    expect(f.size).toEqual({ width: 600, height: 500 })
+  })
+
+  it('place writes the position; a maximized stored node loses its restore rect (premaxRect is geometry)', () => {
+    const premaxRect = { x: 50, y: 60, width: 600, height: 400 }
+    const maxed = [term('m', 0, { premaxRect, size: { width: 1900, height: 1000 } } as Partial<CanvasNodeState>), term('o', 2000)]
+    const out = placeNodes(nodeStatesToFlow(maxed), ['m'], { x: 10, y: 20 })
+    if (!out.ok) throw new Error(out.error)
+    const [m] = apply(maxed, geometryMutations(maxed, out.nodes))
+    expect(m.position).toEqual({ x: 10, y: 20 })
+    expect(m.size).toEqual({ width: 600, height: 400 })
+    expect(m.premaxRect).toBeUndefined()
+  })
+
+  it('an arrange over a maximized stored node clears its restore rect too (it was left behind before)', () => {
+    const premaxRect = { x: 50, y: 60, width: 600, height: 400 }
+    const maxed = [term('m', 0, { premaxRect, size: { width: 1900, height: 1000 } } as Partial<CanvasNodeState>), term('o', 2000)]
+    const next = arrangeNodes(nodeStatesToFlow(maxed), ['m', 'o'], { layout: 'row', gap: 0 })
+    const [m] = apply(maxed, geometryMutations(maxed, next))
+    expect(m.premaxRect).toBeUndefined()
+  })
 })
+

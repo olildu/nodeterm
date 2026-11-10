@@ -16,15 +16,15 @@
 //   - RPC `pty.destroy {streamId}` -> the injected `destroyNode` (the phone's "End session"):
 //     permanently ends the stream's tmux session and takes the node off its canvas — the same two
 //     steps the desktop × performs. The target is resolved from the stream, never client params.
-// Output backpressure: when `sendFrame` returns false the host pauses the PTY via `setFlow`
-// and resumes it on the next successful send.
+// Output backpressure: when `sendFrame` returns false the host pauses the PTY via `setFlow`; a
+// 250 ms drain sweep (armed only while a stream is paused) resumes it once the socket is back under
+// 256 KB and repaints the phone with a fresh snapshot — see FLOW_SWEEP_MS.
 //
 // This file is glue over already-tested units (relay-socket, framing, pairing, pty-manager).
 // The pure RPC/frame -> pty-manager mapping lives in `createHostHandlers` so it is unit-
 // testable with fakes; `initRemoteHost` wires it to IPC, the license gate, and the API call.
 
 import { randomUUID } from 'crypto'
-import path from 'path'
 import { app, ipcMain, type BrowserWindow } from 'electron'
 import { IPC } from '../../shared/ipc'
 import { REF_MAX_LEN } from '../../shared/presence'
@@ -53,6 +53,13 @@ import { connectRelay, type RelaySocket, type RpcRequest } from './relay-socket'
 import { initHostCanvasHub, currentCanvas, subscribeCanvas } from './host-canvas-hub'
 import { createPhonePresence, type PhonePresence } from './phone-presence'
 import { registerPeerSessionKiller } from './peer-revoke'
+import type { KeyOutcome, KeyRequest, KeyAnswerKind } from './host-chat'
+import { parseRelayKeys } from '../../core/relay-keys'
+import { parseRelayLaunch, type RelayLaunchRequest } from '../../core/relay-launch'
+import { browseHostDirectory, isWithinRootsFor, type BrowseFs } from '../../core/remote/host-fs-rpc'
+import { stripAnsi } from '../../core/transcript-reader'
+import type { VisibleCapture } from '../../core/watch-link/capture-route'
+import { resumeRepaintText } from '../../shared/capture-paint'
 
 // Default relay endpoint; `NODETERM_RELAY_URL` overrides it (mirrors license.ts's API_BASE /
 // CHECKOUT_URL env-override pattern — used both as the dev gate and for local testing).
@@ -68,6 +75,23 @@ const textDecoder = new TextDecoder()
  *  now precedes the attach response and its own timeout is 6 s. */
 const FRESH_PROBE_BUDGET_MS = 750
 
+/**
+ * Relay backpressure recovery for a paused phone stream. `sendFrame` refuses (and DROPS) a frame
+ * once the socket holds more than 8 MB (`MAX_BINARY_BUFFERED_AMOUNT`); the host then pauses the
+ * pty. A paused node-pty emits no `onData`, so a resume driven off "the next successful send" can
+ * never happen — and it did not: after one >8 MB burst the phone's
+ * terminal froze until it detached. The sweep is the drain trigger instead, mirroring
+ * `core/ui-sink-registry.ts` (RESYNC_SWEEP_MS / WS_LOW_WATER: "never the next chunk as the drain
+ * trigger"). It exists only while some stream is paused, so the healthy path pays nothing.
+ */
+const FLOW_SWEEP_MS = 250
+/** Resume below this many buffered bytes — the registry's WS_LOW_WATER, so "less full" never flaps. */
+const FLOW_LOW_WATER = 256_000
+/** A repaint the socket refused is retried on 250 ms, 500, 1 s … capped here. While the relay is
+ *  between transports `bufferedAmount()` reads 0 but every send fails, so without a backoff each
+ *  tick would spawn a `tmux capture-pane` (the registry's RESYNC_BACKOFF_MAX_MS guards the same). */
+const FLOW_BACKOFF_MAX_MS = 10_000
+
 // --- pure host handlers (RPC/frame <-> pty-manager) -------------------------
 
 // The slice of pty-manager the host needs. PtyManager satisfies this; tests pass a fake.
@@ -79,8 +103,17 @@ export interface HostPtyManager {
   prepareRelayAttach(
     nodeId: string,
     size: { cols: number; rows: number },
-    hint?: { projectId?: string }
+    hint?: { projectId?: string; launch?: RelayLaunchRequest }
   ): Promise<RelayAttachPrep>
+  /** Where a `pty.scroll` wheel for this stream goes (`PtyManager.scrollRoute`). Optional so a
+   *  pre-feature fake keeps today's tmux-only behaviour. */
+  scrollRoute?(sessionId: string): Promise<'tmux' | 'app-mouse' | 'local'>
+  /** The stream's VISIBLE screen and cursor in one capture (`PtyManager.captureVisible`), for the
+   *  backpressure resume's repaint. Optional: absent, or `unavailable`, the resume repaints from the
+   *  attach's own capture with no cursor. */
+  captureVisible?(sessionId: string): Promise<VisibleCapture>
+  /** The node's recent output as plain text (`PtyManager.captureSession`) — `pty.capture`. */
+  captureSession?(persistKey: string, full?: boolean): Promise<string>
   /** Does a session for this node id exist RIGHT NOW? (The destroy path's outcome check.) */
   sessionExists(persistKey: string): Promise<boolean>
   /** `clientId` identifies WHO typed (the bridged phone's presence peer), so the keystroke can be
@@ -104,6 +137,10 @@ export interface HostPtyManager {
 export interface HostRelaySocket {
   respond(id: string, ok: boolean, body: unknown): void
   sendFrame(op: number, streamId: number, seq: number, payload: Uint8Array): boolean
+  /** Bytes queued and not yet flushed (RelaySocket.bufferedAmount). Drives the drain sweep that
+   *  resumes a paused stream. Optional so fakes compile; absent reads as 0 (drained), because a
+   *  socket that cannot report must fail toward resuming — never toward "paused forever". */
+  bufferedAmount?(): number
 }
 
 export interface HostHandlers {
@@ -211,6 +248,9 @@ export interface HostChatOps {
   /** Answer the node's held request (`answerHeldPermission`: validated against the pending
    *  request file, structured-ticket gated). `false` = nothing was written. */
   answer(nodeId: string, pendingId: string, answer: unknown): Promise<boolean>
+  /** Type a closed-set keyed answer (`agent.key`) after re-checking the node's state and open ask
+   *  on the host. Optional so a pre-feature host / test fake answers an honest "not served". */
+  key?(nodeId: string, req: KeyRequest): Promise<KeyOutcome | 'unknown-node'>
 }
 
 interface Stream {
@@ -222,6 +262,16 @@ interface Stream {
   seq: number
   /** True while the PTY is paused due to relay backpressure. */
   paused: boolean
+  /** True while a drain-triggered repaint (capture → snapshot → resume) is in flight. */
+  resuming?: boolean
+  /** Refused repaints since the pause, and when the next one may be tried (FLOW_BACKOFF_MAX_MS). */
+  resumeAttempts?: number
+  resumeNotBefore?: number
+  /** The current-screen capture for this stream (the attach's own `prep.snapshot`), kept so a
+   *  resume after backpressure can repaint the phone when no visible capture is available: the
+   *  frame that crossed the 8 MB line was dropped, so the phone's emulator is desynced and only a
+   *  fresh screen can fix it. */
+  snapshot?: () => Promise<string>
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -248,15 +298,33 @@ function str(value: unknown): string | undefined {
  * or `~/.ssh` via `../../`. (Symlinks inside a shared root are not chased; the shared roots are
  * the user's own project directories.)
  */
-function isWithinRoots(target: string, roots: string[]): boolean {
-  if (!target) return false
-  const resolved = path.resolve(target)
-  for (const root of roots) {
-    if (!root) continue
-    const r = path.resolve(root)
-    if (resolved === r || resolved.startsWith(r + path.sep)) return true
-  }
-  return false
+function isWithinRoots(target: string, roots: string[], platform: NodeJS.Platform = process.platform): boolean {
+  // The dialect-aware jail lives in core (`host-fs-rpc.ts`): on a Windows host containment is
+  // case-insensitive and UNC / drive-relative paths are refused; POSIX is the historical rule.
+  return isWithinRootsFor(target, roots, platform)
+}
+
+/**
+ * The relay verbs added for relay-only (Windows) hosts — one bag, so `createHostHandlers` stops
+ * growing positionally. Every member is optional: absent ⇒ the verb answers an honest "not served".
+ */
+export interface HostRelayExtras {
+  /** `process.platform` of this host (test seam). Rides `host.info` and the launch-aware attach. */
+  platform?: NodeJS.Platform
+  /** A phone read the node's finished turn (`inbox.ack`): resolve its done event(s) and clear the
+   *  desktop unread dot — `applyPhoneReadAck`, the same pair the ack sweeper runs. */
+  inboxAck?: (nodeId: string) => void
+  /** The folder browser's jail root (the host's home) and fs (`fs.browse`). */
+  browse?: { home: () => string; fs: BrowseFs }
+}
+
+/** Methods this host serves beyond the pre-relay-parity set, for `host.info` feature detection. A
+ *  phone that gets `Unknown method: host.info` is talking to an older host and keeps its old path. */
+export const RELAY_PARITY_VERBS = ['host.info', 'agent.key', 'inbox.ack', 'fs.browse', 'pty.capture'] as const
+
+/** An inbox event id (`${ts}-${seq}`, agent-status-mirror) — the same closed shape as a pending id. */
+function isInboxEventId(id: string): boolean {
+  return /^[0-9]{1,16}-[0-9]{1,12}$/.test(id)
 }
 
 export function createHostHandlers(
@@ -300,16 +368,90 @@ export function createHostHandlers(
   kanban?: HostKanbanOps,
   // The phone's Chat screen (`chat.page` / `chat.status` / `chat.send` / `agent.answer`).
   // Absent ⇒ the verbs answer an honest "not served".
-  chat?: HostChatOps
+  chat?: HostChatOps,
+  // Relay-only-host parity verbs (`inbox.ack`, `fs.browse`, `host.info`; see HostRelayExtras).
+  extras: HostRelayExtras = {}
 ): HostHandlers {
+  const hostPlatform = extras.platform ?? process.platform
   // streamId -> Stream. PTY callbacks close over their own `streamId` directly, so no
   // reverse (sessionId -> streamId) index is needed.
   const streams = new Map<number, Stream>()
   let streamCounter = 0
+  // The drain sweep (FLOW_SWEEP_MS). Armed on a pause, cleared once no stream is paused.
+  let flowSweep: ReturnType<typeof setInterval> | null = null
+
+  function armFlowSweep(): void {
+    if (flowSweep) return
+    flowSweep = setInterval(() => {
+      for (const [id, s] of streams) if (s.paused) maybeResume(id, s)
+      stopFlowSweepIfIdle()
+    }, FLOW_SWEEP_MS)
+    flowSweep.unref?.() // never the reason the main process stays alive
+  }
+
+  function stopFlowSweepIfIdle(): void {
+    if (!flowSweep) return
+    for (const s of streams.values()) if (s.paused) return
+    clearInterval(flowSweep)
+    flowSweep = null
+  }
+
+  /**
+   * The repaint a resumed stream gets, '' for none. Unlike the attach snapshot (painted into an
+   * EMPTY emulator), this lands on a phone that still shows the old screen and feeds a snapshot in
+   * with no reset of its own — so it clears and homes first, uses CRLF (SwiftTerm runs with
+   * convertEol off; bare LFs staircase), and puts the cursor back when the capture read it. The
+   * visible capture is preferred (screen + cursor in one tmux call); without one the attach's own
+   * capture is used, with the cursor left where the paint ends.
+   */
+  async function resumeRepaint(stream: Stream): Promise<string> {
+    const visible =
+      stream.sessionId && pty.captureVisible ? await pty.captureVisible(stream.sessionId).catch(() => null) : null
+    if (visible && !visible.unavailable) return visible.screen ? resumeRepaintText(visible.screen, visible.cursor) : ''
+    const screen = stream.snapshot ? await stream.snapshot() : ''
+    return screen ? resumeRepaintText(screen, null) : ''
+  }
+
+  /** Resume a paused stream IF its socket has drained: capture → snapshot → resume, in that order.
+   *  While paused no `onData` can fire, so nothing interleaves with the repaint; resuming first
+   *  would let live output race ahead of a now-stale snapshot. */
+  function maybeResume(streamId: number, stream: Stream): void {
+    if (!stream.paused || stream.resuming) return
+    if (Date.now() < (stream.resumeNotBefore ?? 0)) return
+    if ((socket.bufferedAmount?.() ?? 0) > FLOW_LOW_WATER) return
+    stream.resuming = true
+    void (async () => {
+      let screen = ''
+      try {
+        screen = await resumeRepaint(stream)
+      } catch {
+        screen = ''
+      }
+      stream.resuming = false
+      // Killed / closed while the capture was in flight: its pty is released, never resume it.
+      if (streams.get(streamId) !== stream || !stream.paused) return
+      // An empty capture skips the repaint but STILL resumes. Unlike the registry (which keeps a
+      // client desynced and retries on an empty capture), staying here means staying paused —
+      // the very freeze this sweep exists to end. A stale screen beats a frozen one.
+      if (screen && !sendSnapshot(streamId, stream, screen)) {
+        // Refused (refilled, or the relay is reconnecting): stay paused, retry with backoff.
+        const attempts = (stream.resumeAttempts ?? 0) + 1
+        stream.resumeAttempts = attempts
+        stream.resumeNotBefore = Date.now() + Math.min(FLOW_SWEEP_MS * 2 ** (attempts - 1), FLOW_BACKOFF_MAX_MS)
+        return
+      }
+      stream.resumeAttempts = 0
+      stream.resumeNotBefore = 0
+      stream.paused = false
+      pty.setFlow(null, stream.sessionId, true)
+      stopFlowSweepIfIdle()
+    })()
+  }
 
   function dropStream(streamId: number): void {
     const stream = streams.get(streamId)
     streams.delete(streamId)
+    stopFlowSweepIfIdle()
     // Report AFTER the delete: `detached` may consult the live viewer set via its own bookkeeping,
     // and a callback that throws must not leave the stream registered.
     if (stream) {
@@ -341,15 +483,21 @@ export function createHostHandlers(
         socket.sendFrame(OP.Resized, streamId, stream.seq++, payload)
       },
       onData: (data) => {
+        if (stream.paused) {
+          // A batch already queued before the pause took hold. The phone is desynced (a frame was
+          // dropped), so streaming more of it only paints garbage: drop it, and let the repaint
+          // that resumes the stream bring the screen back. A chunk we can see is a free drain check.
+          maybeResume(streamId, stream)
+          return
+        }
         const bytes = textEncoder.encode(data)
         const ok = socket.sendFrame(OP.Output, streamId, stream.seq++, bytes)
-        if (!ok && !stream.paused) {
-          // Relay buffer is full — pause the PTY so the OS pipe backpressures the producer.
+        if (!ok) {
+          // Relay buffer is full — pause the PTY so the OS pipe backpressures the producer. The
+          // sweep, not the next chunk, resumes it (a paused pty produces no next chunk).
           stream.paused = true
           pty.setFlow(null, stream.sessionId, false)
-        } else if (ok && stream.paused) {
-          stream.paused = false
-          pty.setFlow(null, stream.sessionId, true)
+          armFlowSweep()
         }
       },
       onExit: (exitCode) => {
@@ -370,18 +518,22 @@ export function createHostHandlers(
   // (with colors) stays small in practice.
   const SNAPSHOT_CHUNK_BYTES = 256 * 1024
 
-  function sendSnapshot(streamId: number, stream: Stream, text: string): void {
-    socket.sendFrame(OP.SnapshotStart, streamId, stream.seq++, new Uint8Array(0))
+  /** Send `text` as a Start/Chunk…/End snapshot. Returns false if any frame was refused — the
+   *  attach ignores that (as it always has); a backpressure resume retries on the next sweep, and
+   *  the client's reassembler discards a partial buffer on the next Start (snapshot.ts). */
+  function sendSnapshot(streamId: number, stream: Stream, text: string): boolean {
+    let ok = socket.sendFrame(OP.SnapshotStart, streamId, stream.seq++, new Uint8Array(0))
     const bytes = textEncoder.encode(text)
     for (let i = 0; i < bytes.length; i += SNAPSHOT_CHUNK_BYTES) {
-      socket.sendFrame(
-        OP.SnapshotChunk,
-        streamId,
-        stream.seq++,
-        bytes.subarray(i, i + SNAPSHOT_CHUNK_BYTES)
-      )
+      ok =
+        socket.sendFrame(
+          OP.SnapshotChunk,
+          streamId,
+          stream.seq++,
+          bytes.subarray(i, i + SNAPSHOT_CHUNK_BYTES)
+        ) && ok
     }
-    socket.sendFrame(OP.SnapshotEnd, streamId, stream.seq++, new Uint8Array(0))
+    return socket.sendFrame(OP.SnapshotEnd, streamId, stream.seq++, new Uint8Array(0)) && ok
   }
 
   /**
@@ -425,10 +577,22 @@ export function createHostHandlers(
     // local node gets the env the desktop would give it. The phone's optional `projectId` can only
     // choose among those records or refuse; it never routes a node anywhere on its own.
     const projectHint = str(p.projectId)
+    // `launch` (additive): the phone asks the HOST to start the agent in a session this attach
+    // creates, instead of typing a POSIX shell line into it — which a Windows host's pwsh / cmd
+    // cannot parse (core/relay-launch.ts). Shape-checked here; registry, account and agent checks
+    // happen in core. A cwd outside the shared roots is dropped (the record / home stands), never
+    // trusted: the jail is the same one `fs.*` lives in.
+    const launchAsked = p.launch !== undefined
+    const launchReq = launchAsked ? parseRelayLaunch(p.launch) : null
+    if (launchReq?.cwd && !isWithinRoots(launchReq.cwd, getRoots(), hostPlatform)) delete launchReq.cwd
     void (async () => {
       let prep: RelayAttachPrep
       try {
-        prep = await pty.prepareRelayAttach(nodeId, { cols, rows }, { projectId: projectHint })
+        prep = await pty.prepareRelayAttach(
+          nodeId,
+          { cols, rows },
+          launchReq ? { projectId: projectHint, launch: launchReq } : { projectId: projectHint }
+        )
       } catch {
         prep = { kind: 'refused', reason: 'not-connected', message: 'Could not prepare this session.' }
       }
@@ -453,7 +617,29 @@ export function createHostHandlers(
         prep.sessionExists().catch(() => true),
         new Promise<boolean>((r) => setTimeout(() => r(true), FRESH_PROBE_BUDGET_MS))
       ])
-      socket.respond(req.id, true, { streamId, fresh: !existed })
+      // The host owns the launch only for a session this attach is CREATING, and only once (the
+      // reply is the one place that says so: `launched: true` = "type nothing").
+      const launch = !existed && prep.launch ? prep.launch : undefined
+      socket.respond(req.id, true, {
+        streamId,
+        fresh: !existed,
+        // Additive, and only when they say something an old phone could get wrong: `scroll:'local'`
+        // = no tmux in front of this pane (session host / plain shell), so `pty.scroll` will not
+        // move history — scroll your own buffer. A tmux stream's reply is unchanged.
+        ...(prep.scroll === 'local' ? { scroll: 'local' as const } : {}),
+        // `paneShell` says whether a typed POSIX line is safe in THIS pane — not the same question
+        // as `hostPlatform`: a Windows desktop's SSH-project node runs on a POSIX host's tmux (the
+        // host does not own that launch, so `launched:false` + `paneShell:'posix'` = "type it as
+        // before"), while a local pane on a win32 host is pwsh / cmd ("never type shell syntax").
+        ...(launchAsked
+          ? {
+              launched: !!launch,
+              hostPlatform,
+              paneShell: prep.remote || hostPlatform !== 'win32' ? ('posix' as const) : ('windows' as const)
+            }
+          : {})
+      })
+      stream.snapshot = () => prep.snapshot()
       const snapshot = await prep.snapshot().catch(() => '')
       // The stream may have been killed/closed while the capture was in flight.
       if (!streams.has(streamId)) return
@@ -468,6 +654,7 @@ export function createHostHandlers(
           return
         }
         stream.sessionId = sessionId
+        if (launch) void launch().catch(() => false)
       } catch {
         // Attach failed (e.g. tmux unavailable, master gone) — surface as an exit so the client
         // tears down.
@@ -492,7 +679,7 @@ export function createHostHandlers(
     // Confine remote filesystem access to the shared project roots. A path outside them (or any
     // `../` traversal) is denied — degrade to the same empty/false shape fs-ops returns on error,
     // so the remote Explorer/Editor just sees "nothing there" rather than a thrown RPC.
-    if (!isWithinRoots(filePath, getRoots())) {
+    if (!isWithinRoots(filePath, getRoots(), hostPlatform)) {
       switch (req.method) {
         case 'fs.list':
           respond({ entries: [] })
@@ -528,10 +715,17 @@ export function createHostHandlers(
    * Scroll a remote client's view of the session's tmux history.
    *
    * Scrolling belongs to tmux (its mouse is on and the pane lives on the alternate screen, so the
-   * client's emulator has no scrollback of its own). This stream's pty IS a tmux client, so the
+   * client's emulator has no scrollback of its own). When this stream's pty IS a tmux client, the
    * wheel is simply written into it as an SGR mouse event and tmux does the rest — no tmux command
    * channel, no copy-mode bookkeeping on our side. The phone drives this because it cannot deliver
    * the wheel itself: its own emulator would swallow the gesture.
+   *
+   * Not every stream has a tmux in front of it. A session-host pane (Windows) or a plain shell has
+   * nothing to consume the wheel, so the bytes would land in the prompt as escape text. The route
+   * (`PtyManager.scrollRoute`) therefore decides: `tmux` and `app-mouse` (a TUI that asked for the
+   * mouse) get the wheel exactly as before; `local` gets nothing — the phone was told
+   * `scroll:'local'` at attach and holds the full buffer. Still answered ok, so an old phone that
+   * keeps sending scrolls sees no error.
    *
    * `lines` is untrusted (it arrives from a remote client) — clamp it, and address the wheel to
    * cell 1,1 so a hostile value cannot be interpolated anywhere interesting.
@@ -539,13 +733,29 @@ export function createHostHandlers(
   function handleScroll(req: RpcRequest): void {
     const p = asRecord(req.params)
     const stream = streams.get(num(p.streamId, -1))
-    if (stream) {
-      const up = str(p.dir) !== 'down'
-      const notches = Math.min(20, Math.max(1, Math.floor(num(p.lines, 1))))
-      const seq = `\x1b[<${up ? 64 : 65};1;1M`
+    if (!stream) {
+      socket.respond(req.id, true, {})
+      return
+    }
+    const up = str(p.dir) !== 'down'
+    const notches = Math.min(20, Math.max(1, Math.floor(num(p.lines, 1))))
+    const seq = `\x1b[<${up ? 64 : 65};1;1M`
+    const write = (): void => {
       for (let i = 0; i < notches; i++) pty.write(getClientId(), stream.sessionId, seq)
     }
-    socket.respond(req.id, true, {})
+    if (!pty.scrollRoute) {
+      write()
+      socket.respond(req.id, true, {})
+      return
+    }
+    void pty
+      .scrollRoute(stream.sessionId)
+      .catch(() => 'local' as const)
+      .then((route) => {
+        // Re-checked: the stream may have closed while the route was asked.
+        if (route !== 'local' && streams.get(num(p.streamId, -1)) === stream) write()
+        socket.respond(req.id, true, {})
+      })
   }
 
   // Serve a typed `git.*` verb against the injected GitService slice, jailed to the shared roots
@@ -558,7 +768,7 @@ export function createHostHandlers(
     }
     const p = asRecord(req.params)
     const cwd = str(p.cwd) ?? ''
-    if (!isWithinRoots(cwd, getRoots())) {
+    if (!isWithinRoots(cwd, getRoots(), hostPlatform)) {
       socket.respond(req.id, false, { message: 'cwd is outside the shared project roots.' })
       return
     }
@@ -922,6 +1132,50 @@ export function createHostHandlers(
           .catch(() => socket.respond(req.id, true, { result: 'refused', reason: 'unavailable' }))
         return
       }
+      case 'agent.key': {
+        // `agent.key {nodeId, key | digits, expect: {ask, states?}, pendingId?}` — the keyed half of
+        // the Inbox / push / Live Activity answers, for a host the phone cannot reach over SSH. A
+        // CLOSED key set (relay-keys.ts): no free text crosses. The node's state and open ask are
+        // re-checked against the host's own mirror inside `chat.key`.
+        if (!chat.key) {
+          fail('agent.key is not served on this host.')
+          return
+        }
+        const keys = parseRelayKeys({ key: p.key, digits: p.digits })
+        if (!keys) {
+          fail('agent.key requires key (a digit 1-9, "escape" or "enter") or digits (1-9).')
+          return
+        }
+        const expect = asRecord(p.expect)
+        const ask = str(expect.ask)
+        if (ask !== 'approval' && ask !== 'question' && ask !== 'submit') {
+          fail('agent.key requires expect.ask: "approval", "question" or "submit".')
+          return
+        }
+        // A multi-select batch is only ever a question's Submit.
+        if (p.digits !== undefined && ask !== 'submit') {
+          fail('agent.key digits are a multi-select submit (expect.ask "submit").')
+          return
+        }
+        const states = Array.isArray(expect.states)
+          ? expect.states.filter((x): x is string => typeof x === 'string')
+          : undefined
+        const pendingId = str(p.pendingId)
+        void chat
+          .key(nodeId, {
+            keys,
+            ask: ask as KeyAnswerKind,
+            ...(states ? { states } : {}),
+            ...(pendingId && isValidPendingId(pendingId) ? { pendingId } : {})
+          })
+          .then((out) =>
+            out === 'unknown-node'
+              ? fail('Unknown node.')
+              : socket.respond(req.id, true, out satisfies KeyOutcome)
+          )
+          .catch(() => socket.respond(req.id, true, { result: 'refused', reason: 'unavailable' }))
+        return
+      }
       case 'agent.answer': {
         const pendingId = str(p.pendingId)
         if (!pendingId || !isValidPendingId(pendingId)) {
@@ -937,9 +1191,98 @@ export function createHostHandlers(
     }
   }
 
+  /** A node id a list-scoped verb may take from the client (the `handleNodeAction` envelope). */
+  function validNodeId(v: unknown): string | null {
+    const id = str(v)
+    // eslint-disable-next-line no-control-regex -- refusing control chars is the point
+    return id && id.length <= REF_MAX_LEN && !/[\x00-\x1f\x7f-\x9f]/.test(id) ? id : null
+  }
+
+  /**
+   * `inbox.ack {nodeId, eventId}` — the phone READ a finished turn. Over SSH the phone drops
+   * `~/.nodeterm/acks/<nodeId>.seen` for the ack sweeper; a relay-only host (Windows) has no SSH,
+   * so the ack arrives here and runs the SAME pair the sweeper runs (`applyPhoneReadAck`: resolve
+   * the node's done event(s) + clear the desktop unread dot without re-acking). Idempotent: the
+   * mirror's `ackDone` is a no-op once nothing is unresolved.
+   */
+  function handleInboxAck(req: RpcRequest): void {
+    if (!extras.inboxAck) {
+      socket.respond(req.id, false, { message: 'inbox.ack is not served on this host.' })
+      return
+    }
+    const p = asRecord(req.params)
+    const nodeId = validNodeId(p.nodeId)
+    const eventId = str(p.eventId)
+    if (!nodeId || !eventId || !isInboxEventId(eventId)) {
+      socket.respond(req.id, false, { message: 'inbox.ack requires a nodeId and an eventId.' })
+      return
+    }
+    try {
+      extras.inboxAck(nodeId)
+      socket.respond(req.id, true, { ok: true })
+    } catch {
+      socket.respond(req.id, true, { ok: false })
+    }
+  }
+
+  /**
+   * `fs.browse {path?}` — the phone's new-project folder browser on a host it cannot SSH into.
+   * Directories only, jailed to the host's home (in the host's own path dialect: case-insensitive,
+   * no UNC, no other drive on Windows), capped. Unlike `fs.*`, which is jailed to project roots,
+   * this is the one way to see a folder that is NOT a project yet — so it reveals names, never
+   * contents. A refusal answers `ok:false` with a sentence.
+   */
+  function handleBrowse(req: RpcRequest): void {
+    const browse = extras.browse
+    if (!browse) {
+      socket.respond(req.id, false, { message: 'fs.browse is not served on this host.' })
+      return
+    }
+    const target = str(asRecord(req.params).path)
+    void browseHostDirectory(target, { platform: hostPlatform, home: browse.home(), fs: browse.fs })
+      .then((res) =>
+        res
+          ? socket.respond(req.id, true, res)
+          : socket.respond(req.id, false, { message: 'This folder cannot be opened from here.' })
+      )
+      .catch(() => socket.respond(req.id, false, { message: 'This folder cannot be opened from here.' }))
+  }
+
+  /**
+   * `pty.capture {streamId}` — the stream's recent output as PLAIN text (the phone's clean copy
+   * reconciles against it). Resolved from the stream, never a client node id, and through
+   * PtyManager's own capture (tmux capture-pane, the remote host's, or the session host's emulator)
+   * — never a raw tmux command. A failure is `{text: ''}`: the phone then keeps its own buffer.
+   */
+  function handleCapture(req: RpcRequest): void {
+    const stream = streams.get(num(asRecord(req.params).streamId, -1))
+    if (!stream || !pty.captureSession) {
+      socket.respond(req.id, true, { text: '' })
+      return
+    }
+    void pty
+      .captureSession(stream.persistKey, false)
+      // The session host's capture is a serialized screen (SGR, modes); tmux's `-p` is plain.
+      .then((text) => socket.respond(req.id, true, { text: stripAnsi(text ?? '') }))
+      .catch(() => socket.respond(req.id, true, { text: '' }))
+  }
+
   return {
     onRpc(req) {
       switch (req.method) {
+        case 'host.info':
+          // Feature detection for the relay-only-host verbs (no client params, read-only).
+          socket.respond(req.id, true, { platform: hostPlatform, verbs: [...RELAY_PARITY_VERBS] })
+          break
+        case 'inbox.ack':
+          handleInboxAck(req)
+          break
+        case 'fs.browse':
+          handleBrowse(req)
+          break
+        case 'pty.capture':
+          handleCapture(req)
+          break
         case 'pty.create':
           // Reject: remote clients only ever attach to the host's existing tmux sessions
           // (`pty.attach`). `pty.create` would let a client spawn an arbitrary shell with a
@@ -986,6 +1329,7 @@ export function createHostHandlers(
         case 'chat.status':
         case 'chat.send':
         case 'agent.answer':
+        case 'agent.key':
           handleChat(req)
           break
         case 'node.wake':
@@ -1035,6 +1379,7 @@ export function createHostHandlers(
         pty.kill(null, stream.sessionId)
       }
       streams.clear()
+      stopFlowSweepIfIdle()
       for (const stream of closing) {
         try {
           remoteViewer?.detached(stream.persistKey)
@@ -1239,6 +1584,8 @@ export interface HostSessionOptions {
   kanban?: HostKanbanOps
   /** The phone's Chat screen verbs (`chat.*` / `agent.answer`). Optional: absent ⇒ "not served". */
   chat?: HostChatOps
+  /** Relay-only-host parity verbs (`inbox.ack`, `fs.browse`). Optional: absent ⇒ "not served". */
+  relayExtras?: HostRelayExtras
   /** Extra fs/git jail roots beyond the shared canvas's node cwds — production passes the
    *  workspace's local project cwds: the phone browses EVERY project over `projects.list`, so a
    *  canvas-only jail denied whichever project the desktop didn't happen to have focused. */
@@ -1364,7 +1711,8 @@ export function connectHostSession(opts: HostSessionOptions): HostSession {
     opts.remoteViewer,
     opts.nodeActions,
     opts.kanban,
-    opts.chat
+    opts.chat,
+    opts.relayExtras ?? {}
   )
   canvasSync = createHostCanvasSync(socket, opts.applyMutation)
   unsubCanvas = opts.subscribeCanvas(() => scheduleBroadcast())
@@ -1397,6 +1745,8 @@ export interface HostBridgeDeps {
   kanban?: HostKanbanOps
   /** The phone's Chat screen verbs — see main/remote/host-chat.ts and main/index.ts's wiring. */
   chat?: HostChatOps
+  /** Relay-only-host parity verbs (`inbox.ack`, `fs.browse`) — see main/index.ts's wiring. */
+  relayExtras?: HostRelayExtras
   /** Workspace-level jail roots (local project cwds) merged with the canvas node cwds. */
   workspaceRoots?: () => string[]
 }
@@ -1479,6 +1829,7 @@ export function initRemoteHost(
       nodeActions: bridge.nodeActions,
       kanban: bridge.kanban,
       chat: bridge.chat,
+      relayExtras: bridge.relayExtras,
       extraRoots: bridge.workspaceRoots,
       // Typing attribution: this session's input frames are this phone's keystrokes.
       getClientId: () => phone.id(),

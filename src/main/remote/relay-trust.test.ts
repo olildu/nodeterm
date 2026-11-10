@@ -215,7 +215,7 @@ describe('obligation (a): only the encrypted tunnel can confirm the peer', () =>
 
   it('both ends see the same SAS (the digits the humans compare)', () => {
     const { hostGate, peerGate } = bridgedPair()
-    expect(hostGate.sas()).toMatch(/^\d{3} \d{3}$/)
+    expect(hostGate.sas()).toMatch(/^\d{3} \d{3} \d{4}$/)
     expect(hostGate.sas()).toBe(peerGate.sas())
   })
 

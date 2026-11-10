@@ -6,6 +6,7 @@ import fs from 'fs'
 import type { ContextWindowUsage } from '../shared/types'
 import { cachedWindowFor } from './model-window'
 import { splitCompleteLines } from './subagent-tail'
+import { claudeInterruptMarkerOf } from '../shared/agents/claude-interrupt'
 
 const POLL_MS = 1000
 // Cap the initial read: a resumed Claude transcript can be many MB, and reading the whole file
@@ -133,18 +134,7 @@ export function parseToolResultIds(text: string | string[]): string[] {
   return ids
 }
 
-/**
- * The two texts Claude Code writes as a USER record when the user interrupts a turn (Esc, or
- * Ctrl+C once). A CLOSED set: measured on 2.1.285 (`shared/agents/__fixtures__/claude/
- * interrupt-capture.json`) — `[Request interrupted by user]` after streamed text,
- * `… for tool use]` when a tool call or its permission dialog was cancelled. Any other wording is
- * ignored, so a future CLI that words it differently degrades to what happened before this
- * existed (the node waits for its next hook, or the stale sweep), never to a guess.
- */
-export const CLAUDE_INTERRUPT_MARKERS: ReadonlySet<string> = new Set([
-  '[Request interrupted by user]',
-  '[Request interrupted by user for tool use]'
-])
+export { CLAUDE_INTERRUPT_MARKERS } from '../shared/agents/claude-interrupt'
 
 const PROMPT_ID_RE = /^[A-Za-z0-9_-]{1,128}$/
 
@@ -159,12 +149,7 @@ type TranscriptRecord = {
   message?: { content?: unknown }
 }
 
-const isMarkerRecord = (o: TranscriptRecord): boolean => {
-  const content = o.message?.content
-  if (!Array.isArray(content) || content.length !== 1) return false
-  const part = content[0] as { type?: unknown; text?: unknown } | null
-  return part?.type === 'text' && typeof part.text === 'string' && CLAUDE_INTERRUPT_MARKERS.has(part.text)
-}
+const isMarkerRecord = (o: TranscriptRecord): boolean => claudeInterruptMarkerOf(o.message?.content) !== null
 
 /** A main-thread user record that OPENS a turn: the typed (or dequeued) prompt itself — not a tool
  *  result, not a meta record, not the interrupt marker. */
@@ -300,6 +285,13 @@ export interface ContextTailOptions {
    * keeps paying for. The file is a few KB, so re-reading it whole costs nothing worth optimizing.
    */
   wholeFile?: boolean
+  /**
+   * Replace the byte read entirely, for a source that is not a text file: cursor's numbers live in a
+   * SQLite `store.db` (WAL), whose bytes parse as nothing. Called every tick with the key the last
+   * successful read returned; a change gate lives in the source (return null when nothing changed
+   * or the read failed, so the meter keeps its last value). `text` is handed to `parse` as one line.
+   */
+  readSource?: (path: string, lastKey: string | undefined) => Promise<{ text: string; key: string } | null>
 }
 
 interface Tracked {
@@ -332,6 +324,8 @@ interface Tracked {
    * usage in it leaves the last known window alone.
    */
   parsedWindow: number | null
+  /** `readSource`'s last change key (undefined until its first successful read). */
+  sourceKey?: string
 }
 
 export interface ContextTail {
@@ -380,10 +374,24 @@ export function createContextTail(
     t.reading = true
     try {
       let size = -1
-      try {
-        size = (await fs.promises.stat(t.path)).size
-      } catch {
-        // file not created yet / unreadable — skip the byte read, still reconcile below
+      if (opts?.readSource) {
+        const r = await opts.readSource(t.path, t.sourceKey)
+        if (r) {
+          t.sourceKey = r.key
+          const latest = parse([r.text])
+          if (latest) {
+            t.used = latest.used
+            t.model = latest.model ?? t.model
+            t.effort = latest.effort ?? null
+            t.parsedWindow = latest.window ?? t.parsedWindow
+          }
+        }
+      } else {
+        try {
+          size = (await fs.promises.stat(t.path)).size
+        } catch {
+          // file not created yet / unreadable — skip the byte read, still reconcile below
+        }
       }
       if (size >= 0) {
         const before = t.offset

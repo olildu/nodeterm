@@ -61,10 +61,17 @@ describe('createControlDecoder', () => {
 })
 
 describe('encodeSendKeysHex', () => {
-  it('encodes bytes as hex send-keys arguments', () => {
-    expect(encodeSendKeysHex('nt-term-1', 'ls\n')).toBe('send-keys -t nt-term-1 -H 6c 73 0a')
+  it('encodes bytes as hex send-keys arguments, on the EXACT target', () => {
+    expect(encodeSendKeysHex('nt-term-1', 'ls\n')).toBe('send-keys -t =nt-term-1: -H 6c 73 0a')
   })
   it('encodes multi-byte UTF-8 per byte', () => {
-    expect(encodeSendKeysHex('s', 'ç')).toBe('send-keys -t s -H c3 a7')
+    expect(encodeSendKeysHex('nt-s', 'ç')).toBe('send-keys -t =nt-s: -H c3 a7')
+  })
+  // The target is spliced UNQUOTED into a control-mode line, and a bare name prefix-matches a
+  // longer session: a name this app did not generate is refused, never sent.
+  it('refuses a target that is not one of our session names', () => {
+    for (const bad of ['s', 'nt-', 'nt-a b', 'nt-a;kill-server', '=nt-a:']) {
+      expect(() => encodeSendKeysHex(bad, 'x'), bad).toThrow()
+    }
   })
 })

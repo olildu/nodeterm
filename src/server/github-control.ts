@@ -1,6 +1,6 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
-import { renameAtomic, tempNameFor } from '../core/fs-atomic'
+import { renameAtomic, sweepForeignTempFiles, tempNameFor } from '../core/fs-atomic'
 import type { GitHubSecretStore } from '../core/github/credentials'
 import type { SecretStore } from '../core/secret-store'
 import type { CorePlatform } from '../core/platform'
@@ -17,38 +17,6 @@ export class ServerSecretStoreError extends Error {
 
 function validToken(token: string): boolean {
   return token.trim() === token && token.length > 0 && token.length <= 4096 && !/[\r\n\0]/.test(token)
-}
-
-/**
- * Remove temp files no writer in THIS process owns: the legacy fixed `<file>.tmp` (written by
- * builds before per-call names) and any `<file>.<pid>.<seq>[.<uuid>].tmp` whose pid is not ours.
- * Best effort — a failure here must never break a save.
- *
- * The token file is not config: an orphan here is a live PAT at 0600 that nothing will ever
- * overwrite, because a unique name is never written twice. So it has to be collected rather than
- * left. Temps bearing our own pid are untouchable: one may belong to a concurrent write sitting
- * between its `writeFile` and its `rename`, and deleting it would recreate the exact race the
- * unique names fixed. A foreign pid can be a second LIVE server on the same data dir; that setup
- * has no lock to begin with, and the worst case is that process's rename failing cleanly (ENOENT,
- * rethrown to its caller) instead of a forgotten PAT sitting on disk forever.
- */
-async function sweepStaleTmp(target: string): Promise<void> {
-  try {
-    const directory = path.dirname(target)
-    const base = path.basename(target)
-    for (const entry of await fs.readdir(directory)) {
-      if (!entry.startsWith(base) || !entry.endsWith('.tmp')) continue
-      const middle = entry.slice(base.length, -'.tmp'.length) // '' or '.<pid>.<seq>[.<uuid>]'
-      const owner =
-        /^\.(\d+)\.\d+(?:\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})?$/
-          .exec(middle)?.[1]
-      if (middle === '' || (owner && owner !== String(process.pid))) {
-        await fs.rm(path.join(directory, entry), { force: true }).catch(() => undefined)
-      }
-    }
-  } catch {
-    // A dir we cannot read is not a reason to fail (or skip) the write below.
-  }
 }
 
 /** Generic headless secret store. Server Edition has no OS keyring, so callers receive the same
@@ -83,7 +51,7 @@ export class ServerSecretStore implements SecretStore {
   private async saveNow(token: string): Promise<void> {
     if (!validToken(token)) throw new ServerSecretStoreError('invalid-token')
     await fs.mkdir(this.userDataDir, { recursive: true })
-    await sweepStaleTmp(this.filePath)
+    await sweepForeignTempFiles(this.filePath)
     // The store's per-instance chain orders this write against its sibling mutations; the per-call
     // temp name covers the writers the chain cannot see — a second `nodeterm-server --data-dir X`
     // process on the same dir (every process's counter starts at 0, hence the pid) and a crash
@@ -110,7 +78,7 @@ export class ServerSecretStore implements SecretStore {
   clear(): Promise<void> {
     return this.chained(async () => {
       // Sweep here too: clearing a token that leaves an orphan temp behind has not cleared anything.
-      await sweepStaleTmp(this.filePath)
+      await sweepForeignTempFiles(this.filePath)
       await fs.rm(this.filePath, { force: true })
     })
   }

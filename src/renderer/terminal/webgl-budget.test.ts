@@ -4,6 +4,8 @@ import {
   __resetWebglBudgetForTests,
   getWebglBudget,
   loseWebglContexts,
+  getWebglLossCounts,
+  formatWebglLoss,
   releaseAllHiddenGrants,
   setWebglBudget,
   setWebglEnabled,
@@ -814,5 +816,69 @@ describe('loseWebglContexts', () => {
 
   it('returns 0 for a null canvas list', () => {
     expect(loseWebglContexts(null)).toBe(0)
+  })
+})
+
+describe('WebGL loss telemetry', () => {
+  let warn: ReturnType<typeof vi.spyOn>
+  beforeEach(() => {
+    vi.useFakeTimers()
+    __resetWebglBudgetForTests()
+    warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+  })
+  afterEach(() => {
+    warn.mockRestore()
+    __resetWebglBudgetForTests()
+    vi.useRealTimers()
+  })
+
+  it('counts the two EXTERNAL kinds apart and writes one [webgl] line per loss', () => {
+    const a = fakeClient('a')
+    const b = fakeClient('b')
+    grant(a)
+    grant(b)
+    a.handle.contextLost() // the addon's onContextLoss (default kind)
+    b.handle.contextLost('restored') // lost + restored by the browser, rebuilt by us
+    expect(getWebglLossCounts()).toEqual({ lost: 1, restored: 1, released: 0 })
+    expect(warn).toHaveBeenCalledTimes(2)
+    const [first] = warn.mock.calls[0] as [string]
+    const [second] = warn.mock.calls[1] as [string]
+    expect(first).toMatch(/^\[webgl\] context lost \(not restored/)
+    // `held` is the count AFTER the loss: two were granted, a's is gone.
+    expect(first).toContain(`1 lost, 0 restored externally; 0 released by us; 1/${WEBGL_BUDGET} held`)
+    expect(second).toContain('restored by the browser')
+    expect(second).toContain(`1 lost, 1 restored externally; 0 released by us; 0/${WEBGL_BUDGET} held`)
+  })
+
+  it('counts a loss reported through a superseded handle, without touching the live grant', () => {
+    const old = fakeClient('a')
+    grant(old)
+    const live = fakeClient('a') // re-register under the same id supersedes `old`
+    grant(live)
+    old.handle.contextLost()
+    expect(getWebglLossCounts().lost).toBe(1)
+    expect(live.rec.held).toBe(true)
+  })
+
+  it('counts self-inflicted releases separately and never logs them per event', () => {
+    const lose = vi.fn()
+    const canvas = { getContext: (t: string) => (t === 'webgl2' ? { getExtension: () => ({ loseContext: lose }) } : null) }
+    loseWebglContexts([canvas, canvas] as never)
+    expect(getWebglLossCounts()).toEqual({ lost: 0, restored: 0, released: 2 })
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('a reset zeroes the counters', () => {
+    const a = fakeClient('a')
+    grant(a)
+    a.handle.contextLost()
+    __resetWebglBudgetForTests()
+    expect(getWebglLossCounts()).toEqual({ lost: 0, restored: 0, released: 0 })
+  })
+
+  it('formats the line from its inputs alone', () => {
+    expect(formatWebglLoss('lost', { lost: 3, restored: 12, released: 40 }, 8, 14)).toBe(
+      '[webgl] context lost (not restored within the addon window) — this session: 3 lost, 12 restored externally; 40 released by us; 8/14 held'
+    )
   })
 })

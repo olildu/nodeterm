@@ -16,12 +16,11 @@ hidden tabs.
 [![License](https://img.shields.io/badge/license-BUSL--1.1-blue)](./LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/eneskirca/nodeterm?style=flat)](https://github.com/eneskirca/nodeterm/stargazers)
 [![Latest release](https://img.shields.io/github/v/release/eneskirca/nodeterm?include_prereleases&sort=semver)](https://github.com/eneskirca/nodeterm/releases)
-<!-- Installer downloads: .dmg + .AppImage + .deb + .rpm + Setup .exe across every release, hand-written on purpose.
-     shields' github/downloads/…/total reads ~12× higher because electron-updater's own traffic
-     (latest-*.yml polls, mac .zip deltas, blockmaps) is counted as downloads there. Recount with:
-     gh api --paginate repos/eneskirca/nodeterm/releases --jq \
-       '[.[].assets[] | select(.name|test("\\.(dmg|AppImage|deb|rpm|exe)$")) | .download_count] | add' -->
-[![Downloads](https://img.shields.io/badge/downloads-1.2k-brightgreen)](https://github.com/eneskirca/nodeterm/releases)
+<!-- Installer downloads only (.dmg + .AppImage + .deb + .rpm + .exe across every release), kept live by
+     .github/workflows/download-badge.yml, which writes a shields endpoint JSON to the `badges` branch.
+     shields' github/downloads/…/total reads ~14× higher because electron-updater's own traffic
+     (latest-*.yml polls, mac .zip deltas, blockmaps) is counted as downloads there. -->
+[![Downloads](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Feneskirca%2Fnodeterm%2Fbadges%2Fdownloads.json)](https://github.com/eneskirca/nodeterm/releases)
 
 <a href="https://trendshift.io/repositories/103825?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-103825" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/103825" alt="eneskirca%2Fnodeterm | Trendshift" width="250" height="55"/></a>
 
@@ -124,7 +123,7 @@ never leaves the machine.
 ### Node kinds
 
 🖥 **Terminal** (xterm + tmux, AI naming) · 🤖 **Agent** (Claude Code / Codex / Antigravity /
-Gemini / GitHub Copilot / opencode / Grok / custom) · 📝 **Sticky note** (link to an agent as context) · 🗂 **Group**
+Gemini / GitHub Copilot / opencode / Grok / Cursor / custom) · 📝 **Sticky note** (link to an agent as context) · 🗂 **Group**
 (bind to a **git worktree** for agent-per-branch) · ✏️ **Editor** (Monaco, ⌘S) ·
 🔀 **Diff** · 🌐 **Web / Video**
 
@@ -153,7 +152,9 @@ Gemini / GitHub Copilot / opencode / Grok / custom) · 📝 **Sticky note** (lin
   from your phone — plus push notifications and a mobile board view.
 - **Power & sleep** — while an agent is working, nodeterm keeps the machine from
   idle-sleeping, and lets go the moment it finishes (on by default; toggle in the setup
-  tour or Settings → Behavior). No app can hold a machine awake through a closed lid —
+  tour or Settings → Behavior). It lets the machine sleep anyway on battery below 5% or
+  when the machine runs critically hot. No app can hold a machine awake through a closed lid
+  (a Mac with the lid closed stays awake only while plugged in with an external display) —
   for overnight runs keep the laptop open and plugged in, or run the agents on a box
   that doesn't sleep via the [Server Edition](./docs/SERVER.md).
 - **Command palette** (⌘K), **file explorer** (⌘⇧E), **markdown view** (⌘M),
@@ -197,7 +198,8 @@ Grab the latest build from **[nodeterm.dev](https://nodeterm.dev)** — the down
 detects your platform. Everything is also listed at
 [nodeterm.dev/releases](https://nodeterm.dev/releases):
 
-- **macOS** — `.dmg` for Apple Silicon and Intel (auto-updates), or **Homebrew**:
+- **macOS 12 Monterey or newer** — `.dmg` for Apple Silicon and Intel (auto-updates), or
+  **Homebrew**:
 
   ```bash
   brew install --cask nodeterm
@@ -216,13 +218,15 @@ detects your platform. Everything is also listed at
 - **Windows (x64) — beta** — `nodeterm-Setup-<version>.exe` (per-user installer) or a
   portable `-win.zip`. Early support, so know what you are getting: the installer is
   **unsigned** (SmartScreen will ask — *More info → Run anyway*), **updates are manual**
-  for now (grab the next build from the same page), and **session continuity across
+  for now (the app tells you when a new version is out and links the download), and **session continuity across
   restarts is still landing** — Windows has no tmux, so the standalone session host that
   replaces it is being packaged in [#579](https://github.com/eneskirca/nodeterm/pull/579).
   Everything else — canvas, agents, kanban, hooks — is the same app. Please
   [report what breaks](https://github.com/eneskirca/nodeterm/issues).
 - **iOS** — **nodeterm mobile** on the
   [App Store](https://apps.apple.com/app/nodeterm/id6790581233).
+- **Android** — **nodeterm mobile** on
+  [Google Play](https://play.google.com/store/apps/details?id=com.nodeterm.android).
 
 **Trying it out?** Removal is one script — it stops every process nodeterm started, reverts
 the status-hook/skill entries it merged into your agent CLIs' config (your own hooks and
@@ -246,7 +250,7 @@ your logo goes in this grid and on [nodeterm.dev](https://nodeterm.dev), and you
 requests go first.
 
 <p align="center">
-  <b>0 of 10 spots taken</b> · <a href="https://buy.stripe.com/3cI6oJfveehDeIL90w7EQ04">Become a Founding Sponsor →</a>
+  <b>1 of 10 spots taken</b> · <a href="https://buy.stripe.com/3cI6oJfveehDeIL90w7EQ04">Become a Founding Sponsor →</a>
 </p>
 
 <!-- Taking a spot: replace one open cell (in order, top-left first) with
@@ -257,7 +261,7 @@ requests go first.
      renewing). If a sponsor cancels, raise the limit by one to reopen their spot. -->
 <table>
   <tr>
-    <td align="center" width="20%"><a href="https://buy.stripe.com/3cI6oJfveehDeIL90w7EQ04"><img src="docs/assets/sponsors/open-spot.svg" alt="Open Founding Sponsor spot" width="136" /></a></td>
+    <td align="center" width="20%"><a href="https://locomotive.agency/"><img src="docs/assets/sponsors/locomotive.png" alt="LOCOMOTIVE Agency" width="136" /></a></td>
     <td align="center" width="20%"><a href="https://buy.stripe.com/3cI6oJfveehDeIL90w7EQ04"><img src="docs/assets/sponsors/open-spot.svg" alt="Open Founding Sponsor spot" width="136" /></a></td>
     <td align="center" width="20%"><a href="https://buy.stripe.com/3cI6oJfveehDeIL90w7EQ04"><img src="docs/assets/sponsors/open-spot.svg" alt="Open Founding Sponsor spot" width="136" /></a></td>
     <td align="center" width="20%"><a href="https://buy.stripe.com/3cI6oJfveehDeIL90w7EQ04"><img src="docs/assets/sponsors/open-spot.svg" alt="Open Founding Sponsor spot" width="136" /></a></td>
@@ -277,8 +281,8 @@ support@nodeterm.dev — and a ⭐ helps too.
 
 ## 🛠 Build from source
 
-Requires Node.js 20+ on macOS or Linux (tmux recommended — it's what makes sessions
-survive restarts). A source checkout does **not** carry the bundled tmux: run
+Requires Node.js 20+ on **macOS 12 Monterey or newer** or Linux (tmux recommended — it's
+what makes sessions survive restarts). A source checkout does **not** carry the bundled tmux: run
 `node scripts/build-tmux.mjs` once on macOS to build it into `resources/bin/tmux` (the
 release job does this automatically), or just install tmux yourself. On **Windows**, run
 `bootstrap-windows.bat` from a fresh checkout first — it checks for Node, the Visual Studio
@@ -309,6 +313,14 @@ npm run dist:linux # AppImage + .deb + .rpm into dist/ (on a Linux host; .rpm ne
 npm run dist:win   # unsigned NSIS installer + zip into dist/ (on a Windows host)
 npm run server:dev # build + run the browser Server Edition (needs Node 22 + tmux)
 ```
+
+**Minimum macOS is 12 (Monterey), for the app and for building it.** Both floors belong to
+the toolchain, not to nodeterm: Electron 42 ships binaries for Monterey and up, so the `.dmg`
+does not launch on Big Sur, and the `esbuild` binary that Vite and the Server Edition build
+use is compiled with Go 1.25, which dropped macOS 11 — on Big Sur `npm install` dies in
+esbuild's postinstall with `dyld: Symbol not found: _SecTrustCopyCertificateChain`, and
+nothing downstream (`electron-vite`, `server:dev`) exists. An older Mac can still use nodeterm
+by running the [Server Edition](./docs/SERVER.md) on a Linux host and opening it in a browser.
 
 ## ⌨️ Keyboard shortcuts
 
@@ -367,8 +379,9 @@ setup, the process-boundary rules, and the house rules that come up in review.
 you work with an AI coding agent). Questions or bug reports are also happy at
 [nodeterm.dev/support](https://nodeterm.dev/support) / support@nodeterm.dev. nodeterm is licensed under the
 [Business Source License 1.1](https://mariadb.com/bsl11/) — you can use, modify,
-and redistribute it freely, including in production, except offering it as a
-competing product or service (see [License](#-license)).
+and redistribute it, including in production, except offering it as a competing
+product or service or running a copy whose license or usage-limit checks were removed
+or bypassed (see [License](#-license)).
 
 By submitting a contribution (pull request, patch, or code snippet), you agree
 that it is licensed under the same [BUSL-1.1](./LICENSE) terms as the rest of
@@ -379,9 +392,11 @@ the project, and that the project may continue to relicense future versions
 
 **[BUSL-1.1](./LICENSE)** ([Business Source License](https://mariadb.com/bsl11/)): you may
 copy, modify, redistribute, and — under the Additional Use Grant — make **production
-use** of nodeterm; the one thing you may not do is offer it (hosted, embedded, or as a
+use** of nodeterm, with two exceptions: you may not offer it (hosted, embedded, or as a
 standalone product/service) in a way that **competes** with nodeterm or with the
-Licensor's products built on it. Each release automatically becomes plain **MIT** four
+Licensor's products built on it, and you may not use in production a copy whose license
+key, entitlement or usage-limit checks have been **removed, disabled or bypassed**
+(changing that code to develop, test or contribute to nodeterm is fine). Each release automatically becomes plain **MIT** four
 years after it is published. See [`LICENSE`](./LICENSE) for the full terms and
 [`THIRD-PARTY-NOTICES.md`](./THIRD-PARTY-NOTICES.md) for the bundled open-source
 components. For a commercial license beyond the grant, contact eneskirca@gmail.com.

@@ -55,8 +55,9 @@ import { cellSnapEnabled, createWebgl2GL, setCellSnap } from '../glyphgrid/gl-we
 import { createCanvasRasterizer, type AtlasPageHealth } from '../glyphgrid/raster'
 import { useProjects } from '../state/projects'
 import { useSettings } from '../state/settings'
-import { useViewMode, viewFor } from '../state/viewMode'
+import { isGlobalKanbanOpen, useViewMode, viewFor } from '../state/viewMode'
 import { readLocal } from '../lib/localStore'
+import { rootPositionWith } from '@shared/root-position'
 
 /** Atlas page edge, in DEVICE pixels. 2048 (not Phase 0's 1024) because the atlas cells are
  *  device-sized AND the page is now keyed by COLOUR: at dpr 2 a 13px terminal font is roughly a
@@ -472,18 +473,7 @@ function absoluteRect(node: StackedNode, byId: Map<string, StackedNode>): StackR
   const w = positiveSize(node.measured?.width) ?? positiveSize(node.width)
   const h = positiveSize(node.measured?.height) ?? positiveSize(node.height)
   if (w === null || h === null) return null
-  let { x, y } = node.position
-  let parentId = node.parentId
-  const seen = new Set<string>([node.id])
-  for (let depth = 0; parentId && depth < MAX_PARENT_DEPTH; depth++) {
-    if (seen.has(parentId)) break
-    seen.add(parentId)
-    const parent = byId.get(parentId)
-    if (!parent) break
-    x += parent.position.x
-    y += parent.position.y
-    parentId = parent.parentId
-  }
+  const { x, y } = rootPositionWith(node, (id) => byId.get(id), MAX_PARENT_DEPTH)
   return { x, y, w, h }
 }
 
@@ -1547,8 +1537,15 @@ export function setSharedGlyphCamera(cam: Camera): void {
  * predicate Canvas derives `kanbanOpen` from, and it has to stay literally the same one — two
  * answers to "is the board up" that can disagree is how a canvas ends up not drawing for a reason
  * nobody can find.
+ *
+ * Including the OMNI board (`isGlobalKanbanOpen`, which already folds in the feature flag): it is
+ * the same opaque full-page overlay, and Canvas's `kanbanOpen` is `globalKanbanOpen ||
+ * perProjectKanbanOpen`. Leaving it out kept the shared canvas drawing under the all-projects
+ * board — the same omission 12564a20 fixed for the window-activation focus restore.
+ * Like Canvas's own term, Omni needs no active project.
  */
 export function boardCoversCanvas(): boolean {
+  if (isGlobalKanbanOpen()) return true
   const { activeProjectId } = useProjects.getState()
   return !!activeProjectId && viewFor(useViewMode.getState(), activeProjectId) === 'kanban'
 }
@@ -2243,7 +2240,14 @@ export function SharedGlyphLayer(): JSX.Element {
       // The two gates that can move without the board moving: the blink SETTING and which terminal
       // holds focus. Both are change-gated inside `sync`.
       const unsubBlinkTarget = subscribeCursorBlinkTarget(() => clock.sync())
-      const unsubBlinkSetting = useSettings.subscribe(() => clock.sync())
+      // The settings store moves the board too (the Omni feature flag gates `globalKanban`), so this
+      // one subscription re-syncs the gate as well — `syncBoard` below, inlined because it is
+      // declared after; both members are change-gated, so a settings write that moved neither is
+      // two comparisons.
+      const unsubBlinkSetting = useSettings.subscribe(() => {
+        gate.sync()
+        clock.sync()
+      })
       // ...and the cursor MOVING, which is not a gate at all: it holds the cursor solid and starts
       // the period over, exactly as xterm does while you type. Its own channel, because `sync` is
       // deliberately a no-op while the interval is already running.

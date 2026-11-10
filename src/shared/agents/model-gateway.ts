@@ -1,4 +1,4 @@
-import { canSwitchModel, capabilityAgentId, type AgentId } from './config'
+import { canSwitchModel, capabilityAgentId, hasGatewayModels, type AgentId } from './config'
 import { shellSingleQuote } from '../shell-quote'
 import { expandEnvVars } from './expansion'
 
@@ -190,15 +190,20 @@ export function parseGatewayModels(payload: unknown): GatewayModel[] {
 export function modelsForAgent(
   models: GatewayModel[],
   agentId: AgentId,
-  grokModels: readonly GatewayModel[] = []
+  grokModels: readonly GatewayModel[] = [],
+  cursorModels: readonly GatewayModel[] = [],
+  antigravityModels: readonly GatewayModel[] = []
 ): GatewayModel[] {
   if (!canSwitchModel(agentId)) return []
-  // grok is offered ITS OWN models, never the gateway's, and this is a correctness rule rather than
-  // a preference: grok cannot be routed through the gateway at all (see `modelGatewayEnv` below —
-  // its custom models live in `~/.grok/config.toml`, not in environment variables). Handing it the
-  // gateway catalogue would put ids on the menu that its CLI rejects at launch: a picker that looks
-  // like it worked and kills the node.
-  if (capabilityAgentId(agentId) === 'grok') return [...grokModels]
+  // grok, cursor and antigravity are offered THEIR OWN models, never the gateway's, and this is a
+  // correctness rule rather than a preference: none can be routed through the gateway env (see
+  // `modelGatewayEnv` below). Handing them the gateway catalogue would put ids on the menu that
+  // their CLIs reject at launch: a picker that looks like it worked and kills the node.
+  const capId = capabilityAgentId(agentId)
+  if (capId === 'grok') return [...grokModels]
+  if (capId === 'cursor') return [...cursorModels]
+  if (capId === 'antigravity') return [...antigravityModels]
+  if (!hasGatewayModels(agentId)) return []
   return models
 }
 
@@ -237,6 +242,66 @@ export function grokModelsFrom(stdout: string | null | undefined): GatewayModel[
     // Same charset discipline as every other id that reaches a command line.
     if (!/^[A-Za-z0-9][A-Za-z0-9._:\/-]*$/.test(id)) continue
     if (!byId.has(id)) byId.set(id, { id })
+  }
+  return [...byId.values()]
+}
+
+/**
+ * Parse `cursor-agent models`. MEASURED (2026.09.28, 246 lines, all matching):
+ *
+ *   Available models
+ *
+ *   auto - Auto (default)
+ *   gpt-5.3-codex-low - Codex 5.3 Low
+ *   grok-4.7-low-fast - Grok 4.7  Low Fast<U+200B><U+200B>
+ *
+ *   Tip: use --model <id> ...
+ *
+ * Only `<id> - <label>` lines are read: the id is a bare token from the charset every command-line
+ * id already uses, the label is the rest with zero-width spaces stripped and whitespace collapsed.
+ * The header and the trailing `Tip:` prose never match (`Tip:` has no ` - ` after its first word).
+ * The list is network-backed and account-scoped, so anything unparseable is an EMPTY list, which
+ * the UI reads as "no model switching".
+ */
+export function cursorModelsFrom(stdout: string | null | undefined): GatewayModel[] {
+  const byId = new Map<string, GatewayModel>()
+  for (const raw of (stdout ?? '').split('\n')) {
+    const m = /^([A-Za-z0-9][A-Za-z0-9._/-]*) - (\S.*)$/.exec(raw.replace(/[\u200b-\u200d\ufeff]/g, '').trimEnd())
+    if (!m || byId.has(m[1])) continue
+    byId.set(m[1], { id: m[1], name: m[2].replace(/\s+/g, ' ').trim() })
+  }
+  return [...byId.values()]
+}
+
+/**
+ * Parse `agy models` — Antigravity's own model list (`<id>\t<Display Name>` rows after the
+ * `Fetching available models...` header).
+ *
+ * MEASURED output (1.2.7, Windows 11, 2026-10-14):
+ *
+ *   Fetching available models...
+ *   gemini-4-argon-medium	Gemini 4 Argon (Medium)
+ *   gemini-4-argon-high	Gemini 4 Argon (High)
+ *   gemini-4-argon-low	Gemini 4 Argon (Low)
+ *   gemini-3.8-flash-high	Gemini 3.8 Flash (High)
+ *   claude-opus-5-5-high	Claude Opus 5.5 (High)
+ *   gpt-oss-120b-medium	GPT-OSS 120B (Medium)
+ *
+ * Only tab-separated `<id>\t<label>` lines are accepted, with `id` validated by the same charset
+ * rule as `grokModelsFrom`. Prose banners or error lines without a tab are ignored.
+ */
+export function antigravityModelsFrom(stdout: string | null | undefined): GatewayModel[] {
+  const text = stdout ?? ''
+  const byId = new Map<string, GatewayModel>()
+  for (const raw of text.split(/\r?\n/)) {
+    const tab = raw.indexOf('\t')
+    if (tab <= 0) continue
+    const id = raw.slice(0, tab).trim()
+    const name = raw.slice(tab + 1).trim()
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:\/-]*$/.test(id)) continue
+    if (!byId.has(id)) {
+      byId.set(id, name ? { id, name } : { id })
+    }
   }
   return [...byId.values()]
 }

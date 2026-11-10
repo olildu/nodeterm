@@ -7,6 +7,8 @@ import {
   CHAT_NOT_SENT_MESSAGE,
   chipView,
   formatUntil,
+  controlLockedText,
+  controlLockedNoticeText,
   watchableOnlyWhileOpen,
   commentFromChat,
   createErrorMessage,
@@ -385,6 +387,17 @@ describe('watchableOnlyWhileOpen', () => {
     expect(watchableOnlyWhileOpen({ persistence: undefined, remoteNode: false })).toBe(false)
     expect(watchableOnlyWhileOpen({ persistence: null, remoteNode: false })).toBe(false)
   })
+
+  it('a session host that speaks watch-attach can be watched with the node closed', () => {
+    const p = (backend: string | null, watchJoin?: boolean, enabled = true) => ({ enabled, backend, watchJoin })
+    expect(watchableOnlyWhileOpen({ persistence: p('session-host', true), remoteNode: false })).toBe(false)
+    // An older running host, or one not connected yet: the conservative note stays.
+    expect(watchableOnlyWhileOpen({ persistence: p('session-host', false), remoteNode: false })).toBe(true)
+    expect(watchableOnlyWhileOpen({ persistence: p('session-host'), remoteNode: false })).toBe(true)
+    // The flag is the session host's alone, and persistence switched off still wins.
+    expect(watchableOnlyWhileOpen({ persistence: p('zellij', true), remoteNode: false })).toBe(true)
+    expect(watchableOnlyWhileOpen({ persistence: p('session-host', true, false), remoteNode: false })).toBe(true)
+  })
 })
 
 // R64/M3: the stream follows the terminal CLIENT, so tmux's chooser and a session switch reach viewers.
@@ -515,6 +528,33 @@ describe('control notices', () => {
     expect(noticeText({ kind: 'control-locked', linkId: 'L', nodeId: 'n', title: 'api‮-server' })).toBe(
       'Control of api-server was locked after 10 wrong passwords. Allow it again from the LIVE chip.'
     )
+  })
+
+  // Finding L2: the lock lifts by itself, and the owner is told until when and who tipped it.
+  it('control-locked from a timed lock says until when and who tipped it — a name as a claim, else "a viewer"', () => {
+    const now = new Date(2026, 9, 23, 14, 0).getTime()
+    const until = new Date(2026, 9, 23, 14, 15).getTime()
+    const at = formatUntil(until, now)
+    expect(controlLockedNoticeText({ title: 'api‮-server', by: 'Me‮rt', until }, now)).toBe(
+      `Control of api-server is locked until ${at} after 10 wrong passwords; the last came from a viewer using the name “Mert”. Allow it again from the LIVE chip.`
+    )
+    expect(controlLockedNoticeText({ title: 'api-server', by: null, until }, now)).toBe(
+      `Control of api-server is locked until ${at} after 10 wrong passwords; the last came from a viewer. Allow it again from the LIVE chip.`
+    )
+    // A lock that waits for the owner (no lift time) but names who tipped it.
+    expect(controlLockedNoticeText({ title: 'api-server', by: '  ', until: null }, now)).toBe(
+      'Control of api-server is locked after 10 wrong passwords; the last came from a viewer. Allow it again from the LIVE chip.'
+    )
+    // Tomorrow is named as such (a 24 h lock).
+    expect(controlLockedNoticeText({ title: 'a', by: null, until: until + 24 * 3600_000 }, now)).toContain(`until tomorrow`)
+  })
+
+  it('the locked line says until when a timed lock lasts, and nothing more for one that waits for the owner', () => {
+    const now = new Date(2026, 9, 23, 14, 0).getTime()
+    const until = new Date(2026, 9, 23, 14, 15).getTime()
+    expect(controlLockedText(until, now)).toBe(`Control locked after 10 wrong passwords, until ${formatUntil(until, now)}.`)
+    expect(controlLockedText(null, now)).toBe(CONTROL_LOCKED_TEXT)
+    expect(controlLockedText(undefined, now)).toBe(CONTROL_LOCKED_TEXT)
   })
 })
 

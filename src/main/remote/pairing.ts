@@ -4,6 +4,8 @@
 // Electron, and no zod — validation is hand-rolled so decode never throws
 // (returns null instead).
 
+import { isUsablePeerKeyB64 } from '../../core/relay/e2ee'
+
 export type PairingOffer = {
   // The relay WebSocket endpoint the client connects to.
   relayEndpoint: string
@@ -95,6 +97,8 @@ function isPairingOffer(value: unknown): value is PairingOffer {
     typeof o.pairingToken === 'string' &&
     o.pairingToken.length > 0 &&
     typeof o.hostPublicKeyB64 === 'string' &&
-    o.hostPublicKeyB64.length > 0
+    // The client PINS this key: canonical base64 only, and never a low-order point (its shared
+    // secret is a public constant, so the SAS would be a fixed value both humans "match").
+    isUsablePeerKeyB64(o.hostPublicKeyB64)
   )
 }

@@ -222,7 +222,8 @@ export function answersOffCanvas(verb: string): boolean {
  *     to read `activeProjectId`, which off canvas was a second bug hiding behind the first: after
  *     the travel the two projects were the same, so the wrong read was never wrong in practice.
  *
- *   - `group` / `ungroup` / `move` / `arrange` / `align` lay out from persisted sizes (below).
+ *   - `group` / `ungroup` / `move` / `arrange` / `align` / `resize` / `place` lay out from
+ *     persisted sizes (below).
  *
  * Deliberately NOT here — and these REFUSE rather than travel, see `offScreenDisposition`: the
  * verbs that arm a graph, park a live terminal, read the worktree store or drive a webview. A refusal an agent can act on is strictly better than hijacking the human's
@@ -240,6 +241,11 @@ const STORED_NODE_VERBS: ReadonlySet<string> = new Set([
   'move',
   'arrange',
   'align',
+  // `resize` / `place` (issue #1288) are the same kind of write: pure transforms over the stored
+  // nodes, geometry-only mutations back (`geometryMutations`). An orchestrator rebuilding a layout
+  // after replacing a session is typically NOT the project the user is looking at.
+  'resize',
+  'place',
   'write',
   'close',
   'run',

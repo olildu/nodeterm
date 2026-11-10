@@ -14,10 +14,13 @@ import type { Project } from '@shared/types'
  * resuming them here too would put two processes on one transcript, and "Open here anyway" skips
  * that automatic resume once.
  *
+ * The finished copy names no way out ("open it from the team tab", "run team unshare first"),
+ * because neither gives the project back: after `team unshare` there is no team tab, and the
+ * server still holds the project and keeps its agents running (unshare only stops sharing it).
+ * So the copy says what is true in every state, shared or unshared.
+ *
  * `teamLabel` is the team's name from this device's bookmark of it, when one is known; anything
- * else (no bookmark, a blank label) reads as "the hosted team". A finished mark always carries the
- * server's project id in practice; a hand-edited one without it still names the command, with the
- * same `<projectId>` placeholder the server's own usage text prints.
+ * else (no bookmark, a blank label) reads as "the hosted team".
  */
 /** "Open here anyway" skips each agent's automatic resume once (terminal/handed-off-resume.ts). */
 const AGENTS_NOT_RESUMED = 'Its agents are not resumed here automatically.'
@@ -38,12 +41,11 @@ export function handedOffWarning(
   }
   const team = teamLabel?.trim() || 'the hosted team'
   const host = p.ssh?.server.host || 'its host'
-  const projectId = to.projectId ?? '<projectId>'
   return (
-    `${p.name} is now managed by team ${team} on ${host}. Open it from the team tab, or run ` +
-    `"team unshare ${projectId}" on the server first.\n\n` +
-    'Open it here anyway? Two copies editing one canvas can overwrite each other, and its agents ' +
-    'would start the same conversations the server is running. ' +
+    `${p.name} was handed to team ${team} on ${host}. The server keeps its canvas and keeps ` +
+    'running its agents, even after it is unshared. Opening it here gives one canvas two editors ' +
+    'that can overwrite each other, and its agents would start the same conversations the server ' +
+    'is running.\n\nOpen it here anyway? ' +
     AGENTS_NOT_RESUMED
   )
 }

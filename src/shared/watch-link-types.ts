@@ -94,8 +94,13 @@ export interface WatchLinkViewerView {
 export interface WatchLinkControlView {
   /** Typing is on: a viewer with the password may unlock. */
   enabled: boolean
-  /** Too many wrong passwords across the link: nobody may unlock until the owner allows it again. */
+  /** Too many wrong passwords across the link: nobody may unlock until it lifts by itself
+   *  (`lockedUntil`) or the owner allows it again. */
   locked: boolean
+  /** While locked: when the lock lifts by itself (epoch ms, this machine's clock); null for a lock that
+   *  waits for the owner (one written before timed locks), and always null while not locked. Absent
+   *  from a core older than timed locks. */
+  lockedUntil?: number | null
 }
 
 export interface WatchLinkView {
@@ -131,8 +136,10 @@ export type WatchLinkNotice =
   | { kind: 'not-persistent' }
   /** A viewer unlocked a Control link. `name` is the name it gave itself: a claim, shown as one. */
   | { kind: 'control-taken'; linkId: string; nodeId: string; title: string; name: string }
-  /** Too many wrong passwords: control is locked on that link until the owner allows it again. */
-  | { kind: 'control-locked'; linkId: string; nodeId: string; title: string }
+  /** Too many wrong passwords: control is locked on that link until `until` (epoch ms; null: until the
+   *  owner allows it again) or until the owner allows it sooner. `by`: the name the attempt that tipped
+   *  it gave itself (a claim), null when it gave none — so a kick and a new password are obvious. */
+  | { kind: 'control-locked'; linkId: string; nodeId: string; title: string; by?: string | null; until?: number | null }
 
 /** Whether a node's terminal can take a Control link's input: `ok` (tmux, the Windows session host, a
  *  plain shell), `unsupported` (Zellij — its key bindings are session-wide), or `unknown` (nothing
@@ -143,7 +150,7 @@ export type ControlSupport = 'ok' | 'unsupported' | 'unknown'
  * What "Stop all" reached. THIS machine's links always stop at once, before the answer; the answer
  * is about the license-wide server revoke, the only thing that ends links shared from other machines:
  *  - `stopped` — the server accepted it: every other machine's links end at their next mint (≤ ~90 s)
- *    or, while a link is full, at its status poll (≤ 5 min).
+ *    or, while a link is full, at its status poll (≤ 1 min).
  *  - `no-entitlement` — no Pro entitlement is stored here, so the server was not asked: links on
  *    other machines keep running.
  *  - `failed` — the server call failed (no answer, a refusal, an expired token): they keep running.

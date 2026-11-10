@@ -11,6 +11,7 @@ import { initPlatform, resetPlatformForTests } from '../core/platform'
 import { WorkspaceStore } from '../core/workspace-store'
 import { createCanvasAuthority } from '../core/canvas-authority'
 import { initCanvasSync, publishCanvasMutation, setReflectedListener } from '../core/canvas-sync'
+import { AGENT_HOOK_TARGETS } from '../shared/agents/config'
 import type { AgentState } from '../shared/agents/normalize'
 import { MAX_LAUNCH_LINE_BYTES } from '../shared/canonical-line'
 import { RUN_NOW_AFTER_REFUSAL } from '../shared/control-verbs'
@@ -34,6 +35,7 @@ import {
   type HeadlessPty,
   type HeadlessWorkspace
 } from './headless-node-factory'
+import { STICKY_NODE_MIN_SIZE, STICKY_NODE_SIZE } from '../shared/default-node-size'
 
 class FakePty implements HeadlessPty {
   readonly creates: PtyCreateOptions[] = []
@@ -176,13 +178,17 @@ describe('HeadlessNodeFactory', () => {
   /** Stations with unfinished handed-over work (core/station-handover.ts), as the tracker answers. */
   let handedOver: Set<string>
 
+  /** Per-test settings on top of the defaults; reset before each test. */
+  let settingsOverride: Partial<Settings> = {}
   const settings = (): Settings => ({
     ...DEFAULT_SETTINGS,
     // Makes command expectations independent of the local Claude version probe.
-    claudePermissionMode: 'manual'
+    claudePermissionMode: 'manual',
+    ...settingsOverride
   })
 
   beforeEach(async () => {
+    settingsOverride = {}
     dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nodeterm-headless-factory-'))
     projectDir = path.join(dataDir, 'project')
     fs.mkdirSync(projectDir, { recursive: true })
@@ -1446,16 +1452,21 @@ describe('HeadlessNodeFactory', () => {
 
     it('refuses a station that could never report, and --run-now, before creating anything', async () => {
       const ws = await store.load({ sideline: false })
-      ws.projects[0].nodes.push({ ...terminal('term-agy', 'Agy'), agentId: 'antigravity' })
+      ws.projects[0].nodes.push({ ...terminal('term-hook-only', 'HookOnly'), agentId: 'custom:hook-only' })
       await store.save(ws)
-      ownership.record('term-agy', { sourceNodeId: 'term-source', projectId: 'project-1' })
+      ownership.record('term-hook-only', { sourceNodeId: 'term-source', projectId: 'project-1' })
       const before = (await store.load({ sideline: false })).projects[0].nodes.length
-      const r = await factory.openAgent(
-        'term-source',
-        { agent: 'claude', prompt: 'x', 'after-success': 'term-agy' },
-        true
-      )
-      expect(r).toMatchObject({ ok: false, error: expect.stringContaining('cannot report an outcome') })
+      ;(AGENT_HOOK_TARGETS as unknown as string[]).push('custom:hook-only')
+      try {
+        const r = await factory.openAgent(
+          'term-source',
+          { agent: 'claude', prompt: 'x', 'after-success': 'term-hook-only' },
+          true
+        )
+        expect(r).toMatchObject({ ok: false, error: expect.stringContaining('cannot report an outcome') })
+      } finally {
+        ;(AGENT_HOOK_TARGETS as unknown as string[]).pop()
+      }
       await expect(
         factory.openAgent(
           'term-source',
@@ -1568,6 +1579,20 @@ describe('HeadlessNodeFactory', () => {
       'Round 1 complete\nRound 2 ready'
     )
     expect(published.filter((node) => node.id === id)).toHaveLength(2)
+  })
+
+  it('creates a sticky at the per-kind default size, clamped like the renderer', async () => {
+    const sizeOf = async (ref: string): Promise<unknown> => {
+      const reply = await factory.sticky('term-source', { node: ref, create: 'yes', text: 'x' })
+      const id = (reply.result as { id: string }).id
+      const workspace = await store.load({ sideline: false })
+      return workspace.projects[0].nodes.find((node) => node.id === id)?.size
+    }
+    expect(await sizeOf('Built-in')).toEqual(STICKY_NODE_SIZE)
+    settingsOverride = { defaultNodeSizes: { sticky: { width: 400, height: 320 } } }
+    expect(await sizeOf('Configured')).toEqual({ width: 400, height: 320 })
+    settingsOverride = { defaultNodeSizes: { sticky: { width: 1, height: 99999 } } }
+    expect(await sizeOf('Clamped')).toEqual({ width: STICKY_NODE_MIN_SIZE.width, height: 1600 })
   })
 
   it('refuses a non-v1 agent before a node or PTY is created', async () => {

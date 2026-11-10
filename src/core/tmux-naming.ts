@@ -27,6 +27,41 @@ export function isSessionName(target: string): boolean {
 }
 
 /**
+ * ── EXACT TARGETS: every node id that becomes a tmux `-t` goes through one of these two ─────────
+ *
+ * tmux resolves a BARE target by exact name, then fnmatch, then PREFIX on a miss. Node ids end in a
+ * counter or a random tail, so `nt-x-1` is a prefix of `nt-x-12`: a bare `-t nt-x-1` whose own
+ * session is gone (or never existed) reaches the LONGER, unrelated session. Measured on tmux 3.4
+ * with only `nt-term-abc-12` alive:
+ *   display-message -p -t nt-term-abc-1 '#{session_name}'      → nt-term-abc-12, exit 0  (the trap)
+ *   has-session -t nt-term-abc-1                                → exit 0                  (the trap)
+ *   send-keys / capture-pane / paste-buffer -t =nt-term-abc-1:  → "can't find session", exit 1
+ *   display-message -p -t =nt-term-abc-1: '<fmt>'              → exit 0, every format EMPTY
+ * so a miss is a failed command, or an empty read that every parser here answers null for. A relay
+ * peer that could name a PREFIX of another project's node id reached that terminal through every
+ * node-keyed pty verb (security audit F1/F2, 2026-10).
+ *
+ * For an EXISTING session `=name:` resolves exactly like the bare name did: the session's current
+ * window, its active pane (re-measured with three windows and a split, the selection moved between
+ * reads — `pty-exact-target.realtmux.test.ts`).
+ *
+ * Both throw for a name this app did not generate: the result is spliced UNQUOTED into tmux command
+ * text (`if-shell` bodies, control-mode lines). On a REMOTE command line it must still be
+ * single-quoted (`posixQuote`): zsh's EQUALS option expands a word that STARTS with `=` as a command
+ * path (`=nt-x:` → "nt-x: not found").
+ */
+export function exactPaneTarget(session: string): string {
+  if (!isSessionName(session)) throw new Error(`not a session name of ours: ${JSON.stringify(session)}`)
+  return `=${session}:`
+}
+
+/** The session-target form (`has-session`, `attach-session`, `kill-session`): `=name`, exact. */
+export function exactSessionTarget(session: string): string {
+  if (!isSessionName(session)) throw new Error(`not a session name of ours: ${JSON.stringify(session)}`)
+  return `=${session}`
+}
+
+/**
  * ── DELETED: `localTmuxSendKeysArgs` ────────────────────────────────────────────────────────────
  *
  * It built `send-keys -t <t> -l -- <body>`, and the `--` was load-bearing: `-l` means "literal
@@ -56,7 +91,7 @@ export function isSessionName(target: string): boolean {
  */
 export function localTmuxEnterArgs(socket: string, target: string): string[] {
   assertPasteTarget(target)
-  return ['-L', socket, 'send-keys', '-t', target, 'Enter']
+  return ['-L', socket, 'send-keys', '-t', exactPaneTarget(target), 'Enter']
 }
 
 /**
@@ -143,6 +178,9 @@ export function localTmuxPasteArgs(
   enter: boolean
 ): string[] {
   assertPasteTarget(target, buffer)
+  // `target` is the session NAME (asserted above); tmux is handed the EXACT form, never the bare
+  // name, which prefix-matches a longer session on a miss (see `exactPaneTarget`).
+  const t = exactPaneTarget(target)
   const args = [
     '-L',
     socket,
@@ -155,9 +193,9 @@ export function localTmuxPasteArgs(
     'if-shell',
     '-F',
     '-t',
-    target,
+    t,
     '#{pane_in_mode}',
-    `send-keys -t ${target} -X cancel`,
+    `send-keys -t ${t} -X cancel`,
     ';',
     // -d: drop our private buffer afterwards, so the user's paste stack is untouched
     // -p: tmux decides framing from the pane's REAL bracketed-paste state
@@ -169,12 +207,12 @@ export function localTmuxPasteArgs(
     '-b',
     buffer,
     '-t',
-    target
+    t
   ]
   // Same invocation as the paste, so the Enter can never be re-chunked into it — and, because
   // tmux aborts a command list at the first failure, a paste that did not happen can never leave
   // a lone Enter behind to submit whatever the human had composed.
-  if (enter) args.push(';', 'send-keys', '-t', target, 'Enter')
+  if (enter) args.push(';', 'send-keys', '-t', t, 'Enter')
   return args
 }
 

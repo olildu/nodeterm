@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useEntitlement } from '../../../state/entitlement'
 import { useTeamAccess } from '../../../state/teamAccess'
 import { listSeats, usedCount, type SeatEntry } from '../../../state/teamAccessCore'
@@ -43,8 +43,12 @@ export function TeamAccessSection({
 }): React.JSX.Element {
   const ent = useEntitlement()
   const seats = useEntitlement((s) => s.seats)
-  const used = useTeamAccess((s) => usedCount(s.seats))
-  const seatList = useTeamAccess((s) => listSeats(s.seats))
+  // Select the table itself and derive from it. `listSeats` builds a NEW array on every call, and
+  // zustand 5 compares selector results with Object.is, so selecting it directly never settled:
+  // React error #185 (maximum update depth) took the whole section down.
+  const seatTable = useTeamAccess((s) => s.seats)
+  const used = usedCount(seatTable)
+  const seatList = useMemo(() => listSeats(seatTable), [seatTable])
   const view = teamAccessView({ premium: ent.isPremium, seats, used })
 
   const [email, setEmail] = useState('')

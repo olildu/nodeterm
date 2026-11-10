@@ -107,7 +107,9 @@ export async function handleDownload(
 function streamTarball(res: http.ServerResponse, dirPath: string): void {
   const parent = path.dirname(dirPath)
   const base = path.basename(dirPath)
-  const child = spawn('tar', ['-czf', '-', '-C', parent, base], { stdio: ['ignore', 'pipe', 'ignore'] })
+  // `--` before the name (security audit 2026-10, S7): a folder called `--transform=…` or
+  // `--checkpoint-action=…` — committed in a cloned repository, say — was parsed by tar as an option.
+  const child = spawn('tar', ['-czf', '-', '-C', parent, '--', base], { stdio: ['ignore', 'pipe', 'ignore'] })
   let started = false
   const fail = (): void => {
     if (started || res.headersSent) res.destroy()

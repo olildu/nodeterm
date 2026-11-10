@@ -114,7 +114,7 @@ export interface RelayHostHooks {
 export interface RelayHostSession {
   /** The peer's presence/platform ClientId once it is open, else null. */
   clientId(): number | null
-  /** The 6-digit SAS both humans compare, or null before the key is derived. */
+  /** The 10-digit SAS (v2, "NNN NNN NNNN") both humans compare, or null before the key is derived. */
   sas(): string | null
   /** The peer's stable box public key (base64), or null before the handshake learned it. */
   peerKeyB64(): string | null

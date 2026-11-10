@@ -205,7 +205,11 @@ function EditableProjectSection({
     <SettingsSection
       id={projectSectionId(project.id)}
       title={project.name}
-      description={`Settings for this project only. Name, color and defaults live in ${project.ssh ? 'the project file on the server' : '.nodeterm/project.json'}, which is shared with anyone who has the repo.`}
+      description={
+        project.storeInAppData && !project.ssh
+          ? 'Settings for this project only. They are stored in app data on this machine, not in the folder.'
+          : `Settings for this project only. Name, color and defaults live in ${project.ssh ? 'the project file on the server' : '.nodeterm/project.json'}, which is shared with anyone who has the repo.`
+      }
       isActive={isActive}
       searchEntries={entries}
       forceVisible={forceVisible}

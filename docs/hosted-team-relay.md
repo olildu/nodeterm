@@ -349,11 +349,15 @@ host is a handover that started and did not finish, and the same guard applies.
 Reopening the project from "Recently closed", with ⇧⌘T, or by opening the same host and folder as an
 SSH project again, warns first:
 
-> <name> is now managed by team <team> on <host>. Open it from the team tab, or run "team unshare
-> <projectId>" on the server first.
+> <name> was handed to team <team> on <host>. The server keeps its canvas and keeps running its
+> agents, even after it is unshared. Opening it here gives one canvas two editors that can overwrite
+> each other, and its agents would start the same conversations the server is running.
 >
-> Open it here anyway? Two copies editing one canvas can overwrite each other, and its agents would
-> start the same conversations the server is running. Its agents are not resumed here automatically.
+> Open it here anyway? Its agents are not resumed here automatically.
+
+The warning offers no other way out on purpose: `team unshare` only stops sharing the project, and
+the server keeps it and its running agents, so neither the team tab (gone once it is unshared) nor
+the command gives the project back to this desktop.
 
 or, for a handover that did not finish:
 
@@ -394,7 +398,7 @@ and host key already exists, sets `approvedAt` on it and keeps its device token 
 That is safe only because of what `seedBookmark` is given: the join code `team bootstrap` just
 returned over the project's own SSH channel, whose host key `known_hosts` already authenticated. The
 code names the relay key it was minted for (`decodeJoinCode` checks that the host id is the hash of
-that key), which is the assurance comparing six digits by eye gives. Main enforces that input: it
+that key), which is the assurance comparing the SAS digits by eye gives. Main enforces that input: it
 seeds only a code a successful `team bootstrap` returned during this app run (kept per project, in
 memory), and refuses any other code, however valid, so that join compares the SAS. The host approves
 its own half because your key is an owner in `team.json`. If the seed fails, the join asks for the
@@ -506,12 +510,13 @@ session key** in the team store.
 | `pty:kill` | Detaches the caller's own view; the session keeps running. |
 | `pty:capture`, `pty:read-scrollback`, `pty:pane-command` | Nodes of shared projects only. |
 | `pty:tmux-status` | Allowed. |
-| `fs:list`, `fs:read`, `fs:read-binary`, `fs:exists` | The path must be absolute and its **realpath** inside a shared project's cwd (also realpathed). A symlink planted inside the project that points out of it is outside. This server's data directory is refused even when a shared project's folder contains it (a project opened on `$HOME`, say): "Viewers can't read this server's own data folder." It holds the host key, `team.json`, every terminal's scrollback snapshot and the unshared canvases. The same holds for a git cwd, and for the file of a `git:diff`. |
+| `fs:list`, `fs:read`, `fs:read-binary`, `fs:exists` | The path must be absolute and its **realpath** inside a shared project's cwd (also realpathed). A symlink planted inside the project that points out of it is outside. A shared project whose folder is the disk root, the home directory, or an ancestor of either or of this server's data directory is **not a root at all** (`core/relay/share-root.ts`, security audit F4): every file under it would be readable, `~/.ssh` included, so nothing under it is. Behind that, this server's data directory is refused wherever a path resolves into it (a symlink planted inside a project): "Viewers can't read this server's own data folder." It holds the host key, `team.json`, every terminal's scrollback snapshot and the unshared canvases. The same holds for a git cwd, and for the file of a `git:diff`. |
 | `git:status`, `git:repo-root`, `git:history` | The cwd is jailed like a file read, **and** the shared project that contains it must be the top folder of its own repository: a `.git` directory that holds `HEAD`, or a worktree's `.git` file. An empty `.git` directory, or a `.git` symlink to a folder that is not a repository, does not count: git skips it and uses the enclosing repository. Otherwise: "Git is available to viewers only in a project that is the top folder of its own repository, never in a subfolder of a larger one." A cwd jail alone does not bound git: `git status` and `git log` report the whole repository, and `git show <ref>:<path>` reads `<path>` from the repository's top level, so from a shared `repo/shared/` a Viewer could read `repo/secret/key.txt`. |
 | `git:diff` | The cwd (with the repository rule above) **and** the file are jailed; a pathspec starting with `:` is refused; an untracked diff (`git diff --no-index`, which diffs any file) needs a real path inside. The file is relative to the cwd, not the repository's top level. |
 | `git:show-file` | The cwd jailed, with the repository rule above; a ref starting with `-` is refused (it would become an option, and `--output=` writes a file). Any other revision is allowed. |
 | `agent:subagent-snapshot` | The response is trimmed to shared nodes. |
-| `board-log:read/subscribe/unsubscribe` (+ `append` for Commenters) | Shared projects only. A Commenter's `append` must be a comment (`kind: 'comment'`): an activity entry ("moved a card to Done") is Editor-only. |
+| `agent:status-snapshot` | The response is trimmed to shared nodes. |
+| `board-log:read/subscribe/unsubscribe` (+ `append` for Commenters) | Shared projects only. A Commenter's `append` must be a comment (`kind: 'comment'`): an activity entry ("moved a card to Done") is Editor-only. The entry is reduced to a comment's own fields (`id`, `ts`, `author`, `kind`, `text`, `nodeId`), and appends are bounded per peer key (one every 2 s, 32 KiB a minute, `core/relay/append-budget.ts`): the log keeps one rotated generation (4 MiB), and a flood used to rotate the project's real history out of it (security audit F3). |
 
 **Which project a node is in** is read from the saved canvases (`WorkspaceStore.projectIdsForNode`).
 Node ids travel in git-shared project files, so one id can sit in several projects; it counts as
@@ -521,9 +526,18 @@ shared only when **every** project holding it is shared, never by whichever come
 receives only the events `VIEW_EVENTS` lists: `canvas:mut`, `workspace:external-change` /
 `server-change` and `project-trust:changed` for shared projects; `agent:status` and
 `agent:unread-clear` for shared nodes; `agent:subagent-activity` for subagents a shared node
-started; `context:update`, `presence:sync` and `presence:peer` for everyone (see
-[Limitations](#limitations-v1)); the per-session pty channels, which only a session's subscribers
-receive; and `board-log:changed:<id>` / `project-setup:event:<id>` for shared projects.
+started; `context:update` for a shared node's agent session (by the payload's `nodeId`, else through
+the agent-status mirror's session → node record; an update it cannot attribute is dropped); the
+per-session pty channels, which only a session's subscribers receive; and
+`board-log:changed:<id>` / `project-setup:event:<id>` for shared projects.
+
+**Presence is rewritten per peer** (`createPresenceFilter`, security audit (a)): `presence:sync` and
+`presence:peer` carried every client's project, focused node, typing node, dino node and live cursor
+chat for every project on the core, which also told a peer the exact node ids of work it was never
+shared. A non-editor now sees only peers whose project is shared, with any node reference outside the
+shared projects nulled; a peer moving onto a shared project is announced with a `join` (its cursor
+chat from the other project cleared), moving off with a `leave`. Editors get the stream unchanged; a
+role change resends the whole list on the next presence event.
 
 **A terminal is judged by its node on every frame.** Terminal output and `pty:resync` (a repaint of
 the screen) reach a non-editor only while **every** project holding the session's node is shared.
@@ -602,6 +616,100 @@ Once connected, the host's own refusals arrive over the encrypted tunnel: "An ow
 request.", "No owner answered the request in time." (a first join waits up to the host's 10-minute
 pending window) and "Your access to this team was removed by an owner.". While a mount is still
 unapproved after 2.5 s, the tab says "Waiting for an owner of X to approve this device…".
+
+## Agent status on a joined tab
+
+A team tab's agent nodes show the host session's RUNNING / NEEDS YOU badge and unread dot. This
+holds for a hosted team's tabs and for a Team Access relay tab alike: both open through
+`openRelayTab` (`session/relay-tab.ts`).
+
+- **The host sends it.** The Server Edition broadcasts `agent:status` to every attached client
+  (`wireAgentStatus`, `src/server/agent-status.ts`). A desktop Team Access host sends it too: the
+  agent emits in `src/main/index.ts` go through `corePlatform.broadcast`, its own window plus every
+  non-quiet relay peer, while `agent:unread-clear` stays on its own window. A non-editor receives
+  `agent:status` only for shared nodes (see [Roles](#roles)).
+- **The tab keeps it in its own store, never this desktop's.** For its whole lifetime the relay
+  session subscribes the host's `agent:status` on its own api (`wireRelayAgentStatus`,
+  `session/relay-agent-status.ts`, held as one of the session's teardowns) and feeds
+  `applyAgentEvent`, the reducer Canvas's listener uses, into the session's own in-memory store.
+  Nothing reaches this desktop's own agent-status table or its saved `nodeterm.agentStatus`: after
+  Share with team, the handed-off SSH project and the team tab hold the same node ids, and each must
+  show its own status. The v1 readers below ask through the node's project
+  (`agentStatusForProject`) or the session the node renders under (`useSessionStores()`).
+- **It subscribes first, then asks for a snapshot.** State events are not replayed, so a node that
+  started working before the tab joined would stay blank until its next event. Right after
+  subscribing, the tab asks `agent:status-snapshot` once: the host's agent-status mirror, at most
+  2000 entries, trimmed to the shared nodes for a Viewer, Commenter or scoped guest. A node a live
+  event reached while the request was in flight keeps the live state, and the snapshot fills only
+  the rest. A host entry restored from disk, or one whose state expired, arrives with no state: its
+  agent, session id and account travel, and the node reads Unknown until its next event. A state
+  carries its age on the host (`ageMs`), never a host timestamp, so the tab's 60 s stale-working
+  sweep judges a served `working` by when the host last asserted it instead of decaying it on its
+  first tick. A host without the channel rejects the request, and the tab starts from live events
+  alone. A reconnect is a new session, so it asks again.
+- **Reading a finished session clears unread on this desktop only, and tells the host nothing.**
+  The tab's store has no ack: no `agent:ack-done` is sent, so the host's own read state, its paired
+  phone's Live Activity included, stays as it was. The tab does not subscribe `agent:unread-clear`
+  either, so a read recorded on the host clears nothing here.
+- **No notification and no sound** for a team tab's sessions. A finished turn, or a node that needs
+  input, marks the node unread unless this window has focus on that very node.
+- **A pause made on a team tab is this desktop's own view and is reported nowhere**: not to the
+  host, and not to this desktop's agent-status mirror or the phone that reads it (the tab's store
+  has no `reportHibernated`, as it has no ack).
+- **The host's node ids are input.** An event or a snapshot entry whose node id is not a safe id,
+  or is a name `Object.prototype` owns (`__proto__`, `constructor`, …), is dropped whole
+  (`isHostNodeId`) before it reaches the tab's table.
+- **Where it shows (v1):** the terminal node (badge, unread dot, session chip), the sessions
+  sidebar, the project tab's unread dot, and kanban cards and the card modal.
+- **What stays off on a team tab's node** (`relayStatusGates`, `terminal/relay-status-gates.ts`):
+  Approve/Deny (they answer this machine's permission server, which holds no ticket for the host's
+  session), the session-title sync (it would rewrite the host's canvas from every tab that shows the
+  node), the find bar's transcript search and the ⌘M chat view (both read this machine's
+  transcripts). ⌘M keeps the Markdown output view. The kanban card modal gates its find bar's
+  transcript search the same way (`ModalTerminal`); its ⌘M chat view reads through the tab's relay
+  api, which refuses transcript reads (`E_UNSUPPORTED`), and the view says so.
+- **A dropped or closed tab reads Unknown.** The teardown ends the subscription and empties the
+  store; a frame that arrives afterwards writes nothing.
+- **Mobile:** N/A. The phone speaks the legacy relay dialect and reads the host's agent-status
+  mirror file; nothing here changes what it sees.
+
+**Follow-ups, not built:**
+
+- The minimap's status stroke reads this desktop's own store.
+- The ⌘M chat view's live progress (`ChatPanel`) reads this desktop's own store; the view itself is
+  off on a team tab's node.
+- Issue run chips (`IssueRunChips`) read this desktop's own store.
+- No subagent cards: the tab's reducer writes none, and it does not subscribe
+  `agent:subagent-activity`.
+- The Server Edition's own browser canvas does not ask for the snapshot, so after a reload its
+  nodes start without the host's current states.
+- The context meter: the host sends `context:update` to relay peers, but the tab does not subscribe
+  it, and the meter's store is fed only from this desktop's own api.
+- On a desktop Team Access host, the SSH-project tails (`src/main/remote-context-tail.ts` for
+  Claude, `src/main/remote-subagent-tail.ts`) still send to the window captured at boot, not
+  through `corePlatform.broadcast`, so no peer hears a Claude node's meter or subagent transcript
+  from one of the host's SSH projects.
+- Canvas-level readers still on this desktop's store: the node menu's restart / pause / account
+  switch eligibility (`lib/nodeActionItems.tsx`), bulk pause, the Eco plan, `stationNoticeWiring`,
+  `loopCard`, the app badge count (Dock / taskbar), the sidebar row's account-chip "multiple
+  identities" check, and the focused-node skip of "next needing you".
+- The project tab's pause badge ("⏸ N", `usePauseCounts` in `state/pauseCounts.ts`) counts from
+  this desktop's store by bare node id: a team tab shows the handed-off SSH project's paused nodes as
+  its own, and a shallow pause made on the team tab never shows there.
+- The node menu's Transfer submenu takes the session id from this desktop's store
+  (`lib/nodeActionItems.tsx`), not the team tab's.
+- The status-grouped sidebar lists a node id once (`buildStatusList` dedups by bare id), so a
+  shared id shows one row when both the handed-off SSH project and the team tab are open.
+- A shallow pause made on a team tab lives in the tab's in-memory store and does not survive a
+  reconnect.
+- The resume line a team tab's node types builds from THIS machine's permission mode and launch
+  settings, not the host's.
+- A project shared into a live team mid-session gets no fresh `agent:status-snapshot`, so a Viewer's
+  or Commenter's newly shared nodes read Unknown until their next event; the re-ask belongs in the
+  shared-change path.
+- The relay client keeps frames on channels no relay code subscribes yet (`context:update`,
+  `agent:subagent-activity`, `agent:unread-clear`) in its bounded early buffer (4096 frames); the
+  first relay subscriber of those channels must drain or age out that backlog.
 
 ## Hosted tabs
 
@@ -798,9 +906,6 @@ it is a new way to use it.
   client's baseline and is never cast, so on a governed project it never reaches disk: every load
   derives it again. The repairs are deterministic, so this costs nothing visible, but a repair that
   must persist on a shared project has to be cast.
-- **The card modal's comments on a relay tab** (`BoardLogPanel`) still read and write the local core's
-  board log, not the host's, because the modal renders outside the tab's session. This predates the
-  authority; it is a follow-up.
 
 ## Status and troubleshooting
 
@@ -1162,16 +1267,25 @@ are unchanged.
 
 ## Limitations (v1)
 
-- **Presence and context metadata cross projects.** Non-editors receive `presence:sync` /
-  `presence:peer` (focus, project ids, cursor chat of every client on the core) and
-  `context:update` (token counts and model per agent session) for everything on the core, shared or
-  not. The recommended deployment is **one core per team**.
+- **The facepile does not show peers working elsewhere.** A non-editor's presence is filtered to
+  peers on its shared projects (security audit (a), see [Roles](#roles)), so a teammate on an unshared
+  project does not appear in its facepile at all, not even as "elsewhere".
+- **A context meter needs an attributable session.** `context:update` reaches a non-editor only for a
+  session the host's agent-status mirror attributes to a shared node; a session the mirror has not
+  seen a hook event for since the host started shows no meter to a Viewer until it does. Delivery
+  aside, a team tab subscribes no `context:update`, so it shows no meter at all (see
+  [Agent status on a joined tab](#agent-status-on-a-joined-tab)).
 - **A Viewer can still pause a shared terminal indirectly.** `pty:flow` pauses are refused, but a
   relay peer whose socket backlog passes 1 MB takes Stage 2's socket-backpressure ticket, which
   pauses the shared pty for every subscriber until that backlog drains below 256 KB or the peer
   leaves. Past 8 MB its output is dropped (redrawn later) and the pause is handed back
   (`ui-sink-registry.ts`).
 - **Shared canvas edits:** see [Known limits](#known-limits) under Shared canvas authority.
+- **The issue summary modal's "Agent runs" on a relay tab** (`GitHubIssueSummaryModal` →
+  `BoardLogPanel`) still pairs the LOCAL api with the relay project's id: `KanbanView` renders under
+  App's local provider, and unlike the card modal this modal is not wrapped in
+  `ProjectSessionScope`, so the history is read from this machine's core, not the host's. It is
+  pre-existing; a follow-up.
 - **No git for Viewers in a subfolder of a larger repository.** Viewers and Commenters get the git
   panel only for a project that is the top folder of its own repository (or a worktree's). A
   monorepo subfolder shows its files but refuses every git read (see [Roles](#roles)).
@@ -1194,9 +1308,10 @@ are unchanged.
   "No team member has that key." Restart the service: every session is cut, members reconnect on
   their own, and that device becomes a pending request again. (`team rotate-key` also works, but
   invalidates every join code.)
-- **A board-log comment's author is what the commenter's tab says.** The entry is written as the
-  client sent it, author included (its presence name and color), so a Commenter can post a comment
-  under another member's name. The host checks the project and that it is a comment, not who wrote it.
+- **A board-log comment's author is what the commenter's tab says.** The entry is written with the
+  author the client sent (its presence name and color), so a Commenter can post a comment under
+  another member's name. The host checks the project, that it is a comment, its shape and its rate,
+  not who wrote it.
 - **Approved devices have no label** in `team.json` and `team status`, and there is no relabel verb.
 - **Device mints are shared by the team.** The backend's free device-mint damper (10 per 24 h) is
   keyed by the **host's** device id, so every joiner of one team draws from one budget. A device
@@ -1351,3 +1466,9 @@ on a Mac and a second desktop as a teammate. Record `team status --json` at each
     it shows the closed-tab notice and opens nothing, and a notification for the shared node now
     shows the SSH project's reopen warning. No `nt-<id>` session appears on this computer's own
     tmux socket at any point.
+26. **Agent status on a teammate's tab.** On a second desktop joined to the team, a Claude node on
+    the team's tab shows RUNNING while it works and NEEDS YOU on a question, and its sessions-sidebar
+    row moves out of Unknown. Join while the node is already working: the tab shows RUNNING at once.
+    With that desktop's window in the background, a finished turn puts an unread dot on the node
+    and on the project tab, with no notification and no sound. Clicking the node clears the dot,
+    and the host's paired phone's Live Activity for that session is not dismissed.

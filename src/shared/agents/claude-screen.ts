@@ -46,8 +46,24 @@ const isFooter = (line: string): boolean => {
 }
 
 /** Non-blank lines allowed under the box's bottom rule — the status lines (a custom statusline can
- *  take several). */
+ *  take several). The agent list below them does not count (`isAgentListLine`). */
 const BOX_TAIL_LINES = 8
+/** At most this many agent-list lines are skipped, so an old box far up the history still is not
+ *  taken for the live one. */
+const AGENT_LIST_MAX_LINES = 40
+
+/**
+ * A line of the agent list Claude Code draws UNDER its status lines while background agents or
+ * teammates run (MEASURED on 2.1.319, field screenshot + binary): one row per agent, starting with its
+ * status dot — `● main` for the one in view, `○ <name>  <task>  <state>` for the rest — and, when the
+ * list is longer than the space it gets, an overflow line `↓ 3 more` (`↑ 2 more · ↓ 3 more` once
+ * scrolled). With a few agents it pushed the input box past `BOX_TAIL_LINES` and the ⌘M view read the
+ * screen as having no input box.
+ */
+const isAgentListLine = (line: string): boolean => {
+  const t = line.trim()
+  return /^[●○] \S/.test(t) || /^(?:↑ \d+ more(?: · ↓ \d+ more)?|↓ \d+ more)$/.test(t)
+}
 /** A footer with no box: a dialog's key hints are its last line (measured: trust prompt, /model). */
 const FOOTER_TAIL_LINES = 3
 /** A footer above a live box: a dialog drawn right on top of the input box. */
@@ -64,7 +80,18 @@ const nonBlankFromBottom = (lines: readonly string[]): number[] =>
 
 /** The live input box: `[top rule, bottom rule]` line indexes, or null. */
 function inputBox(lines: readonly string[]): [number, number] | null {
-  const tail = nonBlankFromBottom(lines).slice(0, BOX_TAIL_LINES + 1)
+  // The bottom lines a box may end on: the first BOX_TAIL_LINES + 1 non-blank lines from the bottom,
+  // not counting the agent list's lines (up to AGENT_LIST_MAX_LINES of them).
+  const tail: number[] = []
+  let listLines = 0
+  for (const i of nonBlankFromBottom(lines)) {
+    if (tail.length > BOX_TAIL_LINES) break
+    if (isAgentListLine(lines[i]) && listLines < AGENT_LIST_MAX_LINES) {
+      listLines++
+      continue
+    }
+    tail.push(i)
+  }
   for (const bottom of tail) {
     if (bottom === 0 || !isRule(lines[bottom])) continue
     for (let top = bottom - 1; top >= 0 && bottom - top <= 40; top--) {
@@ -103,7 +130,161 @@ export function readClaudeScreen(screen: string): ClaudeScreen {
   return box ? { kind: 'prompt' } : { kind: 'no-prompt' }
 }
 
+/** What the ⌘M chat view's screen poll learns from one read of the pane (`pty.readChatScreen`): who
+ *  owns the keyboard, and the suggested next prompt, if any. */
+export interface ChatScreenRead {
+  screen: ClaudeScreen
+  suggestion: string | null
+}
+
 /** Refuse to type: anything but a visible input box, except a screen we could not read at all. */
 export function claudeScreenBlocksInput(s: ClaudeScreen): boolean {
   return s.kind === 'dialog' || s.kind === 'no-prompt'
 }
+
+/**
+ * Is Claude Code's composer EMPTY right now? Read from a STYLED capture (`capture-pane -e`): the one
+ * fact the plain text cannot carry is the placeholder. MEASURED on Claude Code 2.1.301 (fullscreen
+ * TUI, fixtures in `__fixtures__/claude/composer-capture.json`): an empty composer reads
+ * `❯ Try "fix typecheck errors"` with the suggestion drawn SGR 2 (dim); a typed draft is the same
+ * line in the default style. Shell mode (`!`) is a draft even with a dim placeholder after it — the
+ * mode itself was typed, and text sent there runs as a shell command. A multi-line draft fills the
+ * lines under the prompt line.
+ *
+ * Exists for issue #1144: the context-link discovery note was pasted + Enter'd into a composer that
+ * already held the user's half-typed text, and both were submitted as one prompt.
+ *
+ * - `empty` — a live input box whose prompt line holds nothing but dim text (or nothing at all).
+ * - `draft` — anything typed into it.
+ * - `no-prompt` — a dialog owns the keyboard, or no input box is on screen (see `readClaudeScreen`).
+ * - `unknown` — nothing readable (a failed or empty capture).
+ *
+ * The error is asymmetric on purpose: only dim text counts as placeholder, so a capture that lost
+ * its SGR (or a CLI that styles the placeholder differently) reads `draft` and the caller does NOT
+ * type — the safe direction.
+ */
+export type ClaudeComposer = 'empty' | 'draft' | 'no-prompt' | 'unknown'
+
+/** Does any visible, non-blank character of this styled line (from `from`, a plain-text column)
+ *  sit outside SGR dim? */
+function hasUndimmedText(styled: string, from: number): boolean {
+  return undimmedText(styled, from).trim() !== ''
+}
+
+/** The characters of this styled line (from `from`, a plain-text column) drawn outside SGR dim, in
+ *  order. Walks the SGR state; non-SGR escapes are skipped. */
+function undimmedText(styled: string, from: number): string {
+  let dim = false
+  let col = 0
+  let out = ''
+  let i = 0
+  while (i < styled.length) {
+    if (styled[i] === '\x1b') {
+      const csi = /^\x1b\[([0-?]*)([ -/]*)([@-~])/.exec(styled.slice(i))
+      if (csi) {
+        if (csi[3] === 'm') dim = applySgrDim(csi[1], dim)
+        i += csi[0].length
+        continue
+      }
+      // eslint-disable-next-line no-control-regex
+      const osc = /^\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/.exec(styled.slice(i))
+      i += osc ? osc[0].length : 1
+      continue
+    }
+    const ch = String.fromCodePoint(styled.codePointAt(i)!)
+    if (col >= from && !dim) out += ch
+    col += ch.length
+    i += ch.length
+  }
+  return out
+}
+
+/** The dim flag after one SGR sequence's parameters. Extended colours (`38;5;n`, `38;2;r;g;b`, and
+ *  the 48/58 forms) consume their arguments, so the `2` in `38;2;…` is never read as dim. */
+function applySgrDim(params: string, dim: boolean): boolean {
+  const ps = params === '' ? ['0'] : params.split(/[;:]/)
+  for (let k = 0; k < ps.length; k++) {
+    const p = ps[k] === '' ? 0 : Number(ps[k])
+    if (p === 38 || p === 48 || p === 58) {
+      const mode = Number(ps[k + 1])
+      k += mode === 5 ? 2 : mode === 2 ? 4 : 1
+    } else if (p === 0 || p === 22) dim = false
+    else if (p === 2) dim = true
+  }
+  return dim
+}
+
+export function readClaudeComposer(styledScreen: string): ClaudeComposer {
+  const styled = styledScreen.split(/\r?\n/)
+  const lines = styled.map((l) => l.replace(ANSI, '').trimEnd())
+  if (lines.every((l) => l === '')) return 'unknown'
+  if (readClaudeScreen(styledScreen).kind !== 'prompt') return 'no-prompt'
+  const box = inputBox(lines)
+  if (!box) return 'no-prompt'
+  const promptAt = box[0] + 1
+  const prompt = lines[promptAt]
+  if (!prompt.startsWith('❯')) return 'draft'
+  for (let i = promptAt + 1; i < box[1]; i++) if (lines[i].trim() !== '') return 'draft'
+  return hasUndimmedText(styled[promptAt], 1) ? 'draft' : 'empty'
+}
+
+/**
+ * What the user's draft in Claude Code's composer says, read from a STYLED capture, with all
+ * whitespace removed: the undimmed text of every line in the live input box, minus the `❯` prompt
+ * character. Shell mode's `!` is kept, since it was typed. The dim placeholder is not part of it, so
+ * an empty composer reads `''`. null when there is no live input box to read (a dialog, no box, a
+ * draft too tall for the box reader, an empty capture).
+ *
+ * Exists so the typed chat send can see that ITS text reached the composer. Counting the text across
+ * the whole screen fails for a short answer: typing also clears the placeholder and shortens the
+ * status line ("· ? for shortcuts · ← for agents" goes away), so the letter `a` typed in answer to a
+ * multiple-choice question appeared once more in the box and once less elsewhere. The count never
+ * rose, and the Enter was withheld with the text sitting in the box.
+ *
+ * Without SGR (a capture that lost it), the placeholder reads as draft text. Callers compare against
+ * the draft read before typing, so that only costs a match when the placeholder ends the same way.
+ */
+export function readClaudeDraft(styledScreen: string): string | null {
+  const styled = styledScreen.split(/\r?\n/)
+  const lines = styled.map((l) => l.replace(ANSI, '').trimEnd())
+  if (lines.every((l) => l === '')) return null
+  if (readClaudeScreen(styledScreen).kind !== 'prompt') return null
+  const box = inputBox(lines)
+  if (!box) return null
+  let draft = ''
+  for (let i = box[0] + 1; i < box[1]; i++) {
+    const from = i === box[0] + 1 && lines[i].startsWith('❯') ? 1 : 0
+    draft += undimmedText(styled[i], from)
+  }
+  return draft.replace(/\s/g, '')
+}
+
+/**
+ * The next prompt Claude Code suggests after a turn, read from a STYLED capture: the dim text on its
+ * prompt line while the input box holds no draft. null when there is none to offer.
+ *
+ * MEASURED on Claude Code 2.1.318: a few seconds after a turn ends, and only when there is an
+ * obvious next step, Claude draws a suggestion as plain dim text (`❯ run it in the background`);
+ * pressing → in its TUI accepts it. Two other dim texts sit in the same place and are NOT
+ * suggestions: the fresh-session tips, always `Try "…"`, and `Press up to edit queued messages`
+ * while a turn runs with a message queued. Both are refused here.
+ *
+ * Only dim text counts, so a capture that lost its SGR reads as a draft (`readClaudeComposer`) and
+ * offers nothing.
+ */
+export function readClaudeSuggestion(styledScreen: string): string | null {
+  const styled = styledScreen.split(/\r?\n/)
+  const lines = styled.map((l) => l.replace(ANSI, '').trimEnd())
+  if (lines.every((l) => l === '')) return null
+  if (readClaudeScreen(styledScreen).kind !== 'prompt') return null
+  // `empty`: a `❯` prompt line holding only dim text, and nothing on the lines under it.
+  if (readClaudeComposer(styledScreen) !== 'empty') return null
+  const box = inputBox(lines)
+  if (!box) return null
+  const suggestion = lines[box[0] + 1].slice(1).trim()
+  if (suggestion === '' || NOT_SUGGESTIONS.some((re) => re.test(suggestion))) return null
+  return suggestion
+}
+
+/** Dim texts on the prompt line that Claude Code draws but does not suggest (see above). */
+const NOT_SUGGESTIONS: readonly RegExp[] = [/^Try "/, /^Press up to edit queued messages$/]

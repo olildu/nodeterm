@@ -12,9 +12,20 @@ import fs from 'fs'
 import os from 'os'
 import { execFile, execFileSync } from 'child_process'
 import { promisify } from 'util'
-import type { MemInfo, SessionMemoryRow, SessionMemoryReport } from '../shared/types'
+import type {
+  AppProcessKind,
+  AppSelfGroup,
+  AppSelfMemory,
+  MemDisplay,
+  MemInfo,
+  SessionHostOverhead,
+  SessionMemoryRow,
+  SessionMemoryReport
+} from '../shared/types'
 import { TMUX_SOCKET } from './tmux-naming'
 import { RMT_TMUX_SOCKET } from './remote-ssh/control-master'
+import type { SessionHostListing } from './session-host-client'
+import { cimRows, powershellArgs, powershellExe } from './win32-powershell'
 
 export type { MemInfo, SessionMemoryRow, SessionMemoryReport }
 
@@ -26,6 +37,12 @@ export interface ProcEntry {
   pid: number
   ppid: number
   rssKb: number
+  /** Image name, when the reader has one (the Windows CIM table). Only `hostOverhead` reads it. */
+  name?: string
+  /** darwin: `rssKb` is `top`'s phys_footprint, not `ps` rss. Only `appSelfMemory` reads it — a
+   *  pid `top` missed keeps its rss, which is fine for a session row but is exactly the blind number
+   *  the "nodeterm itself" group exists to replace (GPU: rss 96-153 MB vs footprint 1557-1845 MB). */
+  footprint?: true
 }
 
 /** Reads the whole process table at once; null when it could not run. */
@@ -170,11 +187,102 @@ export function parseTopFootprint(stdout: string): Map<number, number> {
  * degrade correctly on null: `planReap` treats it as "no pressure" (absence of evidence never
  * triggers a kill) and the pill pulses instead of printing a number it has not earned.
  */
-export function darwinMemInfo(runVmStat: () => string, totalBytes: number): MemInfo | null {
+/** The oids `darwinMemInfo` reads, in ONE `sysctl` run. Without `-n`, so each answer carries its
+ *  own `name:` prefix and is matched by name rather than by line position. */
+export const DARWIN_DISPLAY_SYSCTLS = ['vm.swapusage', 'kern.memorystatus_vm_pressure_level'] as const
+
+export function darwinMemInfo(
+  runVmStat: () => string,
+  totalBytes: number,
+  runSysctl?: (names: string[]) => string
+): MemInfo | null {
+  let base: MemInfo | null
   try {
-    return parseVmStat(runVmStat(), totalBytes)
+    base = parseVmStat(runVmStat(), totalBytes)
   } catch {
     return null
+  }
+  if (!base || !runSysctl) return base
+  // The pill's display extras. Both oids come from ONE `sysctl` run, and each field is still
+  // optional on its own, the same shape as PSI on Linux: an oid with no line (or a line that does
+  // not parse) omits its one field, and a run that fails outright costs the vm_stat reading
+  // nothing. Never `swapTotalMb`/`swapFreeMb` — see MemInfo.display for why darwin must not fill
+  // those.
+  const display: MemDisplay = {}
+  let out = ''
+  try {
+    out = runSysctl([...DARWIN_DISPLAY_SYSCTLS])
+  } catch {
+    // no swap figure, no pressure tint
+  }
+  for (const line of out.split('\n')) {
+    if (line.startsWith('vm.swapusage:')) Object.assign(display, parseSwapUsage(line))
+    else if (line.startsWith('kern.memorystatus_vm_pressure_level:')) {
+      const level = parsePressureLevel(line)
+      if (level) display.pressureLevel = level
+    }
+  }
+  return Object.keys(display).length > 0 ? { ...base, display } : base
+}
+
+/**
+ * One bounded `sysctl` run for `darwinMemInfo`, by absolute path (a GUI app's PATH is not the
+ * shell's). An oid the kernel does not know makes sysctl exit non-zero while still printing the
+ * others, so a failure hands over whatever stdout it has: each field stays optional on its own.
+ * stderr is discarded rather than inherited into main's.
+ */
+function runDarwinSysctl(names: string[]): string {
+  try {
+    return execFileSync('/usr/sbin/sysctl', names, {
+      encoding: 'utf8',
+      timeout: 5_000,
+      stdio: ['ignore', 'pipe', 'ignore']
+    })
+  } catch (e) {
+    const partial = (e as { stdout?: unknown } | null)?.stdout
+    if (typeof partial === 'string' && partial) return partial
+    throw e
+  }
+}
+
+/**
+ * Parse `sysctl vm.swapusage` (with or without the `vm.swapusage:` prefix). Live shape on a
+ * measured Mac (2026-10-19):
+ *   vm.swapusage: total = 9216.00M  used = 7853.62M  free = 1362.38M  (encrypted)
+ * `K`/`M`/`G` are accepted; an unknown suffix or a missing half yields NOTHING rather than a guessed
+ * scale. `total = 0.00M` is a real answer (no swap file yet) and passes through as 0.
+ */
+export function parseSwapUsage(text: string): Pick<MemDisplay, 'swapUsedMb' | 'swapTotalMb'> {
+  const UNIT: Record<string, number> = { K: 1 / 1024, M: 1, G: 1024 }
+  const mb = (label: string): number | undefined => {
+    const m = new RegExp(`\\b${label}\\s*=\\s*(\\d+(?:\\.\\d+)?)([A-Za-z])`).exec(text)
+    if (!m) return undefined
+    const factor = UNIT[m[2].toUpperCase()]
+    if (factor === undefined) return undefined
+    const n = Number(m[1]) * factor
+    return Number.isFinite(n) ? Math.round(n) : undefined
+  }
+  const total = mb('total')
+  const used = mb('used')
+  // Both or neither, like the Linux swap pair: "used" without a size cannot be read as a fraction.
+  if (total === undefined || used === undefined) return {}
+  return { swapUsedMb: used, swapTotalMb: total }
+}
+
+/** `kern.memorystatus_vm_pressure_level`: 1 NORMAL, 2 WARN, 4 CRITICAL (xnu's
+ *  kVMPressureNormal/Warning/Critical; 2 observed live while a measured Mac had 7.5-8.7 GB
+ *  swapped). Anything else is undefined — never mapped to "normal". */
+export function parsePressureLevel(text: string): MemDisplay['pressureLevel'] {
+  const m = /(?:^|:\s*)(\d+)\s*$/.exec(text.trim())
+  switch (m?.[1]) {
+    case '1':
+      return 'normal'
+    case '2':
+      return 'warn'
+    case '4':
+      return 'critical'
+    default:
+      return undefined
   }
 }
 
@@ -251,6 +359,12 @@ export function parseMemInfoText(text: string): MemInfo | null {
   if (swapTotal !== null && swapFree !== null) {
     out.swapTotalMb = Math.round(swapTotal / 1024)
     out.swapFreeMb = Math.round(swapFree / 1024)
+    // The pill's copy, from the same instant. The reaper keeps reading the pair above; the pill
+    // reads only `display`, so darwin and Linux reach it through one shape.
+    out.display = {
+      swapUsedMb: Math.max(0, out.swapTotalMb - out.swapFreeMb),
+      swapTotalMb: out.swapTotalMb
+    }
   }
   return out
 }
@@ -306,9 +420,13 @@ export function readMemInfo(): MemInfo | null {
   // (the 30 s pill poll and the reaper's 10 min sweep) are far apart, and keeping ONE signature
   // means the reaper's watermark is fixed by the same change.
   if (process.platform === 'darwin') {
+    // The display extras cost one more synchronous process per call (both oids in one `sysctl`),
+    // a fork/exec on main beside `vm_stat`. Their caller is the 30 s pill read: on darwin the
+    // reaper's `hostMemReader` is null, so it never reaches this.
     return darwinMemInfo(
       () => execFileSync('vm_stat', { encoding: 'utf8', timeout: 5_000 }),
-      os.totalmem()
+      os.totalmem(),
+      runDarwinSysctl
     )
   }
   try {
@@ -378,6 +496,8 @@ export interface SessionMemoryDeps {
   exec?: (bin: string, args: string[]) => Promise<string>
   readTable?: ProcessTableReader
   readMem?: () => MemInfo | null
+  /** nodeterm's own processes (desktop only). Absent → the report carries no `app` at all. */
+  appProcesses?: AppProcessReader
 }
 
 /**
@@ -439,6 +559,314 @@ export function isNoServerError(message: string): boolean {
 }
 
 /**
+ * Non-Linux (or an unreadable /proc): `ps` for the whole table, through the injectable exec seam —
+ * nothing in this file may reach a subprocess around it. Null when it could not run.
+ *
+ * On darwin a SECOND call is merged in: `top` carries phys_footprint, which is what Activity
+ * Monitor shows and what the pill's `vm_stat` reading already counts. `ps`'s own `rss` drops an
+ * idle process's compressed pages and understated a six-hour-idle session by about half — exactly
+ * the population this panel exists to describe. See parseTopFootprint.
+ */
+async function psProcessTable(
+  exec: (bin: string, args: string[]) => Promise<string>,
+  platformName: NodeJS.Platform
+): Promise<ProcEntry[] | null> {
+  try {
+    const rows = parseProcessTable(await exec('ps', ['-eo', 'pid,ppid,rss']))
+    if (platformName !== 'darwin') return rows
+    const fp = parseTopFootprint(await exec('top', ['-l', '1', '-stats', 'pid,mem']))
+    // A pid `top` did not list keeps its `rss`. The two snapshots are a moment apart, so a miss is
+    // a process that came or went between them — not a reason to report nothing.
+    return rows.map((e) => {
+      const f = fp.get(e.pid)
+      return f === undefined ? e : { ...e, rssKb: f, footprint: true as const }
+    })
+  } catch {
+    return null
+  }
+}
+
+/** The PowerShell the Windows table comes from: one CIM query, compressed JSON on one line. */
+export const WIN32_PROCESS_TABLE_SCRIPT =
+  'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,WorkingSetSize,Name | ConvertTo-Json -Compress'
+
+/**
+ * Parse `WIN32_PROCESS_TABLE_SCRIPT`'s output. `ConvertTo-Json` prints a bare OBJECT for a
+ * one-element pipeline and an array otherwise; both are accepted. `WorkingSetSize` is BYTES — the
+ * Windows counterpart of RSS (resident pages, shared ones included), and what Task Manager's
+ * "Working set" column shows. Rows without a numeric pid/ppid are skipped; a missing working set
+ * reads as 0 rather than dropping the process, so the tree walk still reaches its children.
+ * Unparseable JSON, or a table with no process at all (a machine always has some), is null.
+ */
+export function parseWin32ProcessTable(json: string): ProcEntry[] | null {
+  const rows = cimRows(json)
+  if (rows === null) return null
+  const out: ProcEntry[] = []
+  for (const r of rows) {
+    const pid = Number(r.ProcessId)
+    const ppid = Number(r.ParentProcessId)
+    if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(ppid)) continue
+    const bytes = Number(r.WorkingSetSize)
+    const entry: ProcEntry = { pid, ppid, rssKb: Number.isFinite(bytes) && bytes > 0 ? bytes / 1024 : 0 }
+    if (typeof r.Name === 'string' && r.Name) entry.name = r.Name
+    out.push(entry)
+  }
+  return out.length > 0 ? out : null
+}
+
+/** The Windows process table through the exec seam, or null when PowerShell could not answer. */
+export async function win32ProcessTable(
+  exec: (bin: string, args: string[]) => Promise<string>
+): Promise<ProcEntry[] | null> {
+  try {
+    return parseWin32ProcessTable(await exec(powershellExe(), powershellArgs(WIN32_PROCESS_TABLE_SCRIPT)))
+  } catch {
+    return null
+  }
+}
+
+/** The ConPTY console hosts: inbox `conhost.exe`, or node-pty's bundled `OpenConsole.exe`. */
+const CONSOLE_HOST_IMAGE = /^(conhost|openconsole)(\.exe)?$/i
+
+/**
+ * The session host's own cost (`SessionMemoryReport.host`): the host process, plus every child of
+ * it that is NOT a session's shell, with their subtrees. ConPTY's conhost/OpenConsole is created by
+ * the host's `CreatePseudoConsole`, so it is the host's child and the shell's SIBLING — no row's
+ * rollup reaches it, and without this it is counted nowhere.
+ *
+ * The shells' subtrees are excluded by pid (they are the rows), so nothing is counted twice; a pane
+ * pid equal to the host pid (it never should be) is still only the host's own working set.
+ * `consoleCount` counts direct children named as a console host — the table carries image names on
+ * Windows; without names the count is 0 while the memory is still included. Undefined when the host
+ * pid is unknown or not in the table: a host we did not find is "could not measure", never 0 MB.
+ */
+export function hostOverhead(
+  entries: readonly ProcEntry[],
+  hostPid: number | undefined,
+  panePids: readonly number[]
+): SessionHostOverhead | undefined {
+  if (hostPid === undefined || !Number.isSafeInteger(hostPid) || hostPid <= 0) return undefined
+  const { table, kids } = indexProcesses(entries)
+  const self = table.get(hostPid)
+  if (!self) return undefined
+  const panes = new Set(panePids)
+  // Pre-seed the walk with the host and every pane so neither a shell subtree nor a cyclic ppid
+  // chain back to the host is ever entered.
+  const seen = new Set<number>([hostPid, ...panes])
+  let childKb = 0
+  let consoleCount = 0
+  const stack: number[] = []
+  for (const k of kids.get(hostPid) ?? []) {
+    if (panes.has(k)) continue
+    const e = table.get(k)
+    if (e?.name && CONSOLE_HOST_IMAGE.test(e.name)) consoleCount++
+    stack.push(k)
+  }
+  while (stack.length > 0) {
+    const pid = stack.pop() as number
+    if (seen.has(pid)) continue
+    seen.add(pid)
+    const e = table.get(pid)
+    if (!e) continue
+    childKb += e.rssKb
+    for (const k of kids.get(pid) ?? []) stack.push(k)
+  }
+  const selfMb = kbToMb(self.rssKb)
+  const consoleMb = kbToMb(childKb)
+  return { pid: hostPid, selfMb, consoleMb, consoleCount, totalMb: selfMb + consoleMb }
+}
+
+/**
+ * One of nodeterm's own processes, as the shell enumerates them. The desktop shell maps
+ * `app.getAppMetrics()` onto this and nothing else reads Electron: `src/core` stays Electron-free.
+ *
+ * Memory is DELIBERATELY not taken from `getAppMetrics()`. On macOS neither field tracks
+ * phys_footprint: `memory.workingSetSize` is resident size, as blind to IOSurfaces as `ps` rss
+ * (the GPU helper's 1557-1845 MB footprint shows as 96-153 MB there), and
+ * `memory.privateBytes` is Windows-only. The pid is looked up in the panel sweep's own process
+ * table instead, so the group uses exactly the accounting the session rows use, with no extra
+ * `top` (~0.5 s per call, measured).
+ */
+export interface AppProcessSample {
+  pid: number
+  /** Electron `ProcessMetric.type`: 'Browser' | 'Tab' | 'GPU' | 'Utility' | … */
+  type: string
+  /** Electron `cpu.cumulativeCPUUsage` — seconds since the process started; optional there too. */
+  cpuSeconds?: number
+}
+
+/** Enumerates this app's processes; null (or a throw) = could not. */
+export type AppProcessReader = () => AppProcessSample[] | null
+
+export function appProcessKind(type: string): AppProcessKind {
+  if (type === 'Browser') return 'main'
+  if (type === 'Tab') return 'renderer'
+  if (type === 'GPU') return 'gpu'
+  return 'helper'
+}
+
+const APP_KIND_ORDER: readonly AppProcessKind[] = ['gpu', 'renderer', 'main', 'helper']
+
+/**
+ * Build the "nodeterm itself" group from the sweep's table. Rules:
+ *  - a null process list or table → `ok:false`, never an empty-but-ok group;
+ *  - darwin: a pid counts as measured only if `top` gave its footprint (`ProcEntry.footprint`).
+ *    The rss fallback the session rows tolerate is the very number this group exists to replace;
+ *  - a group with ANY unmeasured pid has no `mb` (a partial sum understates), and the total exists
+ *    only when every group has one;
+ *  - not one pid measured → `ok:false`.
+ */
+export function appSelfMemory(
+  samples: readonly AppProcessSample[] | null,
+  table: readonly ProcEntry[] | null,
+  platformName: NodeJS.Platform
+): AppSelfMemory {
+  if (!samples || samples.length === 0 || !table) return { ok: false, groups: [] }
+  const byPid = new Map(table.map((e) => [e.pid, e]))
+  /** `whole` / `cpuWhole`: every pid of the group contributed — false means no figure, not a sum. */
+  type Acc = { count: number; kb: number; whole: boolean; cpu: number; cpuWhole: boolean }
+  const acc = new Map<AppProcessKind, Acc>()
+  let anyMeasured = false
+  for (const s of samples) {
+    const kind = appProcessKind(s.type)
+    const g = acc.get(kind) ?? { count: 0, kb: 0, whole: true, cpu: 0, cpuWhole: true }
+    g.count++
+    const e = byPid.get(s.pid)
+    if (e && (platformName !== 'darwin' || e.footprint)) {
+      g.kb += e.rssKb
+      anyMeasured = true
+    } else {
+      g.whole = false
+    }
+    if (typeof s.cpuSeconds === 'number' && Number.isFinite(s.cpuSeconds)) g.cpu += s.cpuSeconds
+    else g.cpuWhole = false
+    acc.set(kind, g)
+  }
+  if (!anyMeasured) return { ok: false, groups: [] }
+  const groups: AppSelfGroup[] = APP_KIND_ORDER.filter((k) => acc.has(k)).map((kind) => {
+    const g = acc.get(kind) as Acc
+    return {
+      kind,
+      count: g.count,
+      ...(g.whole ? { mb: kbToMb(g.kb) } : {}),
+      ...(g.cpuWhole ? { cpuSeconds: Math.round(g.cpu) } : {})
+    }
+  })
+  const out: AppSelfMemory = { ok: true, groups }
+  if (groups.every((g) => g.mb !== undefined)) out.totalMb = groups.reduce((n, g) => n + (g.mb as number), 0)
+  return out
+}
+
+/** Read the shell's process list without letting a throw escape into the sweep. */
+function sampleApp(read: AppProcessReader): AppProcessSample[] | null {
+  try {
+    return read()
+  } catch {
+    return null
+  }
+}
+
+export interface SessionHostMemoryDeps {
+  /** The host's listing (`PtyManager.sessionHostListing()`); null = the read failed. */
+  list: () => Promise<SessionHostListing | null>
+  /** Process-table override for tests. Default: by platform (CIM on Windows, /proc, else ps). */
+  readTable?: () => Promise<ProcEntry[] | null>
+  readMem?: () => MemInfo | null
+  exec?: (bin: string, args: string[]) => Promise<string>
+  platformName?: NodeJS.Platform
+  /** nodeterm's own processes (desktop only). Absent → the report carries no `app` at all. */
+  appProcesses?: AppProcessReader
+}
+
+/**
+ * The session-host leg of the sweep: the host names each session and its pty's pid (the pane's
+ * shell — `PaneRef.panePid`), and the same `buildReport`/`rollupTree` then do what they do for
+ * tmux. Failure rules, mirroring the tmux leg:
+ *  - a failed host read, or an unreadable process table → `ok: false`, no rows;
+ *  - no host running → `ok: true` with no rows — an ANSWER (there are no sessions), not a failure,
+ *    and no process table is read for it;
+ *  - a session the host names but does not describe (a host older than `sessionDetails`, a row
+ *    dropped as malformed) is counted in `unmeasured` — never silently dropped, so the panel cannot
+ *    say "no sessions" over live ones.
+ */
+export async function collectSessionHostMemory(deps: SessionHostMemoryDeps): Promise<SessionMemoryReport> {
+  const mem = (deps.readMem ?? readMemInfo)()
+  const platformName = deps.platformName ?? process.platform
+  // The "nodeterm itself" group rides on whatever table this sweep read. A path that reads none
+  // reports it NOT MEASURED (ok:false) rather than leaving it out — absent means "not available".
+  const withApp = (report: SessionMemoryReport, table: ProcEntry[] | null): SessionMemoryReport =>
+    deps.appProcesses
+      ? { ...report, app: appSelfMemory(sampleApp(deps.appProcesses), table, platformName) }
+      : report
+  let listing: SessionHostListing | null
+  try {
+    listing = await deps.list()
+  } catch {
+    listing = null
+  }
+  if (!listing) return { ok: false, rows: [], mem }
+  if (!listing.running) return withApp({ ok: true, rows: [], mem }, null)
+  const ours = listing.names.filter((n) => n.startsWith('nt-'))
+  const described = new Map((listing.sessions ?? []).map((row) => [row.name, row]))
+  const panes: PaneRef[] = []
+  let unmeasured = 0
+  for (const name of ours) {
+    const row = described.get(name)
+    if (row) panes.push({ session: name, panePid: row.pid, command: '' })
+    else unmeasured++
+  }
+  const withUnmeasured = (report: SessionMemoryReport): SessionMemoryReport =>
+    unmeasured === 0 ? report : { ...report, unmeasured, unmeasuredBackend: 'session-host' }
+  // An idle host still costs memory, so a running host with no described session still reads the
+  // table — but only when there is a host pid to measure. Without one there is nothing to look up,
+  // and "no sessions" stays the no-table answer it always was.
+  const hostPid = listing.hostPid
+  if (panes.length === 0 && hostPid === undefined)
+    return withApp(withUnmeasured({ ok: true, rows: [], mem }), null)
+
+  const exec =
+    deps.exec ??
+    (async (b: string, args: string[]): Promise<string> => {
+      const { stdout } = await runAsync(b, args, {
+        timeout: 15_000,
+        maxBuffer: 16 * 1024 * 1024,
+        windowsHide: true
+      })
+      return stdout
+    })
+  const readTable =
+    deps.readTable ??
+    (async (): Promise<ProcEntry[] | null> => {
+      if (platformName === 'win32') return win32ProcessTable(exec)
+      return defaultProcessTableReader() ?? (await psProcessTable(exec, platformName))
+    })
+  let table: ProcEntry[] | null
+  try {
+    table = await readTable()
+  } catch {
+    table = null
+  }
+  if (table === null) {
+    // No pane to describe: the table was read only for the host's own cost, and failing to read it
+    // says nothing about sessions — the answer stays "none", with the host simply unmeasured.
+    if (panes.length === 0) return withApp(withUnmeasured({ ok: true, rows: [], mem }), null)
+    return { ok: false, rows: [], mem }
+  }
+  const report = withApp(withUnmeasured(buildReport(panes, table, mem)), table)
+  // A session the host named but did not describe has a shell among the host's children that no
+  // row excludes, so its memory would be booked as host overhead. Report nothing rather than that.
+  // The same holds for a session outside the `nt-` namespace (the host accepts any name, and the
+  // rows only cover ours): every session the host NAMED must be described, and every described
+  // shell — whatever its name — is excluded from the overhead walk.
+  const allDescribed = listing.names.every((n) => described.has(n))
+  const host =
+    unmeasured === 0 && allDescribed
+      ? hostOverhead(table, hostPid, (listing.sessions ?? []).map((row) => row.pid))
+      : undefined
+  return host ? { ...report, host } : report
+}
+
+/**
  * One sweep. Failure rules (CLAUDE.md: a failed read is never evidence of absence):
  *  - no tmux binary, or an unreadable process table → `ok: false`, no rows;
  *  - a socket with no tmux server contributes NO panes but is NOT a failure — "no server running"
@@ -465,28 +893,7 @@ export async function collectSessionMemory(
   const readTable = deps.readTable ?? defaultProcessTableReader
 
   let table = readTable()
-  if (table === null && !deps.readTable) {
-    // Non-Linux (or an unreadable /proc): `ps` for the whole table, through the same injectable
-    // seam as tmux — nothing in this file may reach a subprocess around it.
-    //
-    // On darwin a SECOND call is merged in: `top` carries phys_footprint, which is what Activity
-    // Monitor shows and what the pill's `vm_stat` reading already counts. `ps`'s own `rss` drops
-    // an idle process's compressed pages and understated a six-hour-idle session by about half —
-    // exactly the population this panel exists to describe. See parseTopFootprint.
-    try {
-      const rows = parseProcessTable(await exec('ps', ['-eo', 'pid,ppid,rss']))
-      if (process.platform === 'darwin') {
-        const fp = parseTopFootprint(await exec('top', ['-l', '1', '-stats', 'pid,mem']))
-        // A pid `top` did not list keeps its `rss`. The two snapshots are a moment apart, so a miss
-        // is a process that came or went between them — not a reason to report nothing.
-        table = rows.map((e) => ({ ...e, rssKb: fp.get(e.pid) ?? e.rssKb }))
-      } else {
-        table = rows
-      }
-    } catch {
-      table = null
-    }
-  }
+  if (table === null && !deps.readTable) table = await psProcessTable(exec, process.platform)
   if (table === null) return { ok: false, rows: [], mem }
 
   const sockets = deps.sockets ?? [TMUX_SOCKET, RMT_TMUX_SOCKET]
@@ -508,5 +915,9 @@ export async function collectSessionMemory(
   // Nobody answered: broken tmux, an unreadable socket dir, a timeout against a hung server. We did
   // not look, so we cannot claim there is nothing — that would print "no sessions" over 20 live ones.
   if (answered === 0) return { ok: false, rows: [], mem }
-  return buildReport([...bySession.values()], table, mem)
+  const report = buildReport([...bySession.values()], table, mem)
+  // Same table, no second read: on darwin it already carries `top`'s footprint for EVERY pid,
+  // Electron's included (reuse the sweep; the pill never polls `top`).
+  if (!deps.appProcesses) return report
+  return { ...report, app: appSelfMemory(sampleApp(deps.appProcesses), table, process.platform) }
 }

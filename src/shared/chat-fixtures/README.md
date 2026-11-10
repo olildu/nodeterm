@@ -72,7 +72,7 @@ the production paging, not a second implementation of it.
 | fixture | pins |
 |---|---|
 | `plain-turns` | User/assistant text, markdown (headings, lists, a blockquote, code fences), string and array user content, two text blocks in one message, and non-ASCII text. Metadata-only records (`file-history-snapshot`, `system`) yield no message. |
-| `tools-cross-page` | A `tool_use` that lands in the second (older) page while its `tool_result` lands in the tail. The tail carries it in `unmatchedResults`, and the older page carries the tool part with its `id` so the port can attach it. One tool call is matched inside the tail. It also shows the `summarizeResult` rules: three lines joined, capped at 500. |
+| `tools-cross-page` | A `tool_use` that lands in the second (older) page while its `tool_result` lands in the tail. The tail carries it in `unmatchedResults`, and the older page carries the tool part with its `id` so the port can attach it. One tool call is matched inside the tail. It also shows the `summarizeResult` rules: three lines joined, capped at 500. The desktop renderer folds a run of two or more consecutive agent tool calls into one block, except the run at the END of the thread while the agent is working or waiting on a prompt (the live turn; the end is measured before any optimistic "Queued" prompt bubbles drawn after it), and the parser output is unchanged, so a port that renders a thread should fold the same runs. |
 | `plan-mode` | An `ExitPlanMode` tool call with `input:{plan}`. The tool part carries the full plan as `body` and the approval text as `result`. |
 | `ask-question` | `AskUserQuestion` with a single-select and a multi-select question: the rendered `body`, the parsed `questions` (the same reader the answer controls match on) and each result. |
 | `utf8-edge` | Multi-byte characters on the window boundaries. The tail window (EOF − 262144) opens **inside** a 4-byte emoji of one line, which must be dropped as the partial line and never decoded torn. The second page (524288) starts **exactly** on the first byte of a multi-byte line, which is kept only because of the lookbehind `\n`. The straddled line reappears whole in that page. The test asserts both placements. |
@@ -81,13 +81,42 @@ the production paging, not a second implementation of it.
 | `model-effort-no-carry` | ONE record answers both fields. The newest record states no `effort`, so the key is absent, and an older record's value is never carried forward (same rule as `parseLatestUsage`). |
 | `model-effort-synthetic` | A `<synthetic>` record (an API error or interrupt, with no effort) is skipped entirely, so both fields come from the real record before it. |
 | `model-effort-utf16` | The 100-character cap counts **UTF-16 code units** (Swift `utf16.count`), not bytes or scalars. A model of 50 × U+1F9EA (100 units) is kept, and an effort of 101 units is absent. |
-| `thinking` | Thinking blocks (`thinking`, `redacted_thinking`). The current TS reader **drops** them: a thinking-only record yields no message, and a mixed record keeps only its text. The port must match this until the desktop reader changes. |
+| `thinking` | Thinking blocks (`thinking`, `redacted_thinking`). The reader **drops** them by default: a thinking-only record yields no message, and a mixed record keeps only its text. The port must match this. (The desktop ⌘M panel opts in with `page.thinking: true` and then gets a `{kind:"thinking", text, ms?}` part for each block whose `thinking` text is non-blank: `text` is capped at 16384 UTF-16 units, and `ms` is this record's timestamp minus that of the newest `user` record before it (a prompt, a `tool_result` or a hidden meta line), present only when both stamps exist and the gap is ≥ 0 — see the `ChatPart` doc in `src/shared/types.ts`. The phone's `chat.page` never sets it, so these fixtures are unchanged.) |
 | `local-commands` | Slash-command records (see **Local commands** below). An `isMeta` caveat is skipped; `/model` plus its ANSI-coloured `<local-command-stdout>` become ONE assistant tool part `{name:"/model", arg:"", result}`; `/effort` with padded args (trimmed) answered on `<local-command-stderr>`; `/compact` with an arg longer than the 200-unit cap; `/exit` with an empty stdout (no `result`); a skill invocation (`<command-message>` before `<command-name>`) whose `isMeta` array body is skipped; a stdout with no command right before it (its own `command output` tool, capped to three lines); and a user message that only mentions `<command-name>` in prose (stays a user message). |
 | `bash-mode` | `!` bash-mode records: `<bash-input>` becomes a tool part named `!` with the command as `arg`; the ONE following record carrying `<bash-stdout>…</bash-stdout><bash-stderr>…</bash-stderr>` sets its `result` (non-empty parts joined by `\n`, then the `summarizeResult` cap), including an empty stdout with a stderr. |
 | `meta-turns` | `isMeta` rule 1: a peer hand-back (`promptSource` + `origin.kind:"peer"` + `turnOrigin`), a scheduled wakeup (`turnOrigin:"scheduled"` + `scheduledTaskId`), an auto-continuation (`origin.kind:"auto-continuation"`), a `promptSource`-only, an `origin`-only and a `turnOrigin`-only record (the last two with no `promptSource`, so each field is pinned on its own) are all KEPT; the caveat and a skill body (none of the three fields) are skipped. Three of the kept records then render as system chips (see **System-injected records**): BOTH `origin.kind:"peer"` records — the hand-back and the `origin`-only one — as `Agent message`, and the auto-continuation as `System`; the others stay user messages. |
 | `system-records` | Every rule of **System-injected records**: a full agent completion (nested `<usage>`, a result over three lines), a status + summary completion, a monitor `<event>`, a summary alone (the `notified` result), a repeated `<task-id>` with a summary over the 200-unit cap, a whole element with no `origin`, the same whole element sent by a human (`origin.kind:"human"`, and `promptSource:"typed"` with no `origin`; both stay user messages), two malformed notifications (unknown tags only; plain prose), a message that only MENTIONS the element (stays a user message), a subagent `<agent-message>` hand-back with its frame lines, a `<cross-session-message>` (its `from-name` is the arg), a report over the 16384-unit cap, a peer record with no element, an auto-continuation and a multi-line coordinator prompt. |
+| `teammate-messages` | Rule **2b** of **System-injected records**: an idle notification with a report, one with no fields, a failed one (`failureReason`), a plain message whose summary is escaped (`&quot;`) and whose body quotes the close tag, a record holding two elements (a report, then a message), an unverified sender (`verified="false"`), the same text typed by a human (by `origin` and by `promptSource` alone — both stay user messages), the frame line with no element and an element with no `teammate_id` (both stay user messages). |
 | `pasted-content` | **Pasted content**: a span between typed lines, backtick runs inside (a five-backtick fence) and the same id twice, an array text part beside an image, a pasted `<task-notification>` (stays the user's paste), a close tag with a different id inside a span (content), an empty paste, a same-id open nested inside a span (the span ends at the FIRST close), text that is not the CLI's grammar (no id, an upper-case or three- or five-digit id, a missing newline after the open or before the close: all left as typed) and an unclosed span (left as typed). |
 | `queued-prompts` | **Queued prompts**: a typed prompt queued mid-turn (between a tool result and the reply), one with no `origin`, an array prompt with an image (its text block only), a paste inside one (fenced, as in a typed prompt), and six attachments that stay hidden: a task notification, a peer message (`isMeta`), a coordinator message, a non-human `origin`, a blank prompt and a non-`queued_command` attachment. |
+
+**`rich`** is a second desktop-only opt-in, beside `thinking`: the ⌘M panel reads with
+`page.rich: true` (`ChatParseOptions.rich`) to get the parts only it draws. The fixtures never set
+it, and neither does the phone's `chat.page` (the relay host forwards only `before` / `maxBytes`), so
+nothing above changes. What it adds:
+
+- An `{kind:"image", mediaType, data}` part for each `{type:"image", source:{type:"base64",
+  media_type, data}}` block of a user record's content array, in content order, when `media_type` is
+  one of `image/png`, `image/jpeg`, `image/gif`, `image/webp` (`CHAT_IMAGE_TYPES`) and `data` is a
+  non-empty string. Any other type (`image/svg+xml` included) or source yields no part. An image
+  inside a `tool_result` is tool output and never becomes one. An image-only record yields no
+  message without the option and a user message with it.
+- A `diff: {filePath, oldText, newText}` on an `Edit` tool part (`{file_path, old_string,
+  new_string}`) or a `Write` one (`{file_path, content}`, `oldText: ""`), read from the call's input
+  when `file_path` is a non-empty string and the texts are strings (an empty `new_string` is a
+  deletion and still a diff). Each text over 65536 UTF-16 units is cut there (one unit earlier when
+  the cut would split a surrogate pair) and `TOOL_BODY_TRUNCATED` appended — and, unlike a tool
+  `body`, no closing fence line is added for a code block the cut left open: the text is file
+  content, not markdown (`capText`). Any other shape yields no `diff`; `arg` and `result` are
+  unchanged.
+- A `{type:"system", subtype:"compact_boundary", compactMetadata}` record becomes ONE assistant
+  message with ONE tool part `{name:"Compaction", arg, result?}`: `arg` is `compactMetadata.trigger`
+  (`""` when not a string; its first 200 UTF-16 units, `CHAT_TOOL_ARG_MAX`), and `result` is
+  `"<preTokens> → <postTokens> tokens"` (plain digits, U+2192) only when both are finite numbers. It
+  is a system record (a turn boundary, never folded). The `type:"user"` record with
+  `isCompactSummary: true` (the summary the model continues from) is skipped.
+- A `body` on a `TodoWrite` tool part: one line per `todos` item with a non-blank `content` (`- [x] …`
+  completed, `- [ ] **…** _(in progress)_` in progress, else `- [ ] …`), capped like any tool `body`.
 
 Decision cases: plan `restore` / `acceptEdits` / `manual` / `revise` (the revise text is trimmed),
 question single / multi (labels joined with `, `) / free text (trimmed), and three refusals: a
@@ -214,6 +243,31 @@ units, `String.prototype.slice(0, n)`, and may split a surrogate pair exactly as
    is dropped. `fromName` = group 1 of `(?:^|\s)from-name="([^"]*)"` matched on group 2 (`""` when
    group 2 is absent or has no match), trimmed. `arg` = the first 200 units of `fromName` when it is
    non-empty, else `firstLine(body)`; `result` = `full(body)`.
+2b. **Agent message** for an agent team's teammate writing to the lead (measured on CLI 2.1.285–2.1.316:
+   no `origin`, no `promptSource`, no `isMeta`) when there is NO kind (`origin` absent — a present
+   `origin`, even `null`, never matches), `promptSource` is UNSET or `"system"`, the string STARTS
+   with one of `Another Claude session sent a message:\n`, `Another Claude session sent a message
+   while you were working:\n`, `A peer session sent a message while you were working:\n`, and at
+   least one element follows. Elements, from the end of that line: skip `\s`; an element starts with
+   `<teammate-message` followed by one `\s`, its attributes run to the first `>`, and it needs a
+   non-empty (trimmed) `teammate_id`; else stop. Attributes are `name="value"` pairs (the first of a
+   name wins); a value's `&quot;` `&apos;` `&amp;` `&lt;` `&gt;` are decoded in ONE pass. The body
+   starts after the `>` (and one `\n` right after it, if any) and ends at the first
+   `</teammate-message>` after which, skipping `\s`, comes the end of the string or the next
+   `<teammate-message`; if no close qualifies, at the LAST `</teammate-message>` (when that lies at
+   or after the body's start, else stop). Parsing stops after an element ended by the fallback or by
+   the end of the string; what follows (the trailer) is dropped. No element → not this rule (rule 4).
+   Per element: `from` = `firstLine(teammate_id)`, `summary` = `firstLine(summary)` when non-blank,
+   `verified="false"` = unverified. The body (trimmed) is an **idle notification** when it starts
+   with `{`, parses as a JSON object, and has `type:"idle_notification"` and a string `from`; then
+   `outcome` = `failed` / `was interrupted` / `finished` for `idleReason` `failed` / `interrupted` /
+   anything else, `failureReason` = its `firstLine` when a non-blank string, `result` = `full` of a
+   non-blank string `result`. Each element's text: idle = `from + " " + outcome`, then
+   `": " + failureReason` when present, then `"\n" + result` when present; plain = `summary + "\n" +
+   body` when both are non-empty, else whichever is (body capped at 16384 units first).
+   `arg` = the first 200 units of the distinct senders in order (`from`, `+ " (unverified)"` when
+   unverified) joined by `", "`; `result` = `full` of the element texts joined by `"\n\n"`. The
+   desktop's opt-in `rich` read draws a `teammate` part per element instead (not on the wire).
 3. **System** (`name:"System"`) when the kind is `auto-continuation` or `coordinator`: the fallback.
 4. Anything else is not a system record, and the rules above apply unchanged.
 
@@ -273,7 +327,7 @@ and the find-bar index emits the same user line. Every other attachment yields n
 
 - **Turn grouping** (`assistantTurnEnds`, `src/renderer/lib/chatThread.ts`): a message that is an
   assistant message with exactly ONE tool part named `Background task`, `Agent message` or `System`
-  (`isSystemRecordMessage`) is a turn BOUNDARY, like a user message: it gets no action row and it
+  — or, on the desktop's `rich` read, only `teammate` parts — (`isSystemRecordMessage`) is a turn BOUNDARY, like a user message: it gets no action row and it
   splits the assistant runs around it, so answer → notification → reply keeps two Copy rows and two
   times. A local-command chip (#991) is not a boundary. The phone copies per message
   (`ChatScreen.copyText`), not per turn, so it has no grouping to mirror today.

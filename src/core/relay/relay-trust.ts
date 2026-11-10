@@ -2,7 +2,7 @@
 //
 // Stage 4 makes two desktops equal peers, which means a pairing GRANTS THE PEER SHELL ACCESS on this
 // machine. The only thing standing between a relay man-in-the-middle and that shell is mutual
-// approval: BOTH humans compare the same 6-digit SAS out of band and BOTH press Confirm. The pure
+// approval: BOTH humans compare the same SAS out of band and BOTH press Confirm. The pure
 // latch is `mutual-approval-core.ts`; this file is the wiring it says it cannot enforce, and the
 // wiring is where the property can be silently destroyed.
 //
@@ -70,7 +70,7 @@ export interface PinStore {
 }
 
 export interface TrustGate {
-  /** SAS both humans compare ("NNN NNN"), or null before the key is derived. */
+  /** SAS both humans compare ("NNN NNN NNNN", v2), or null before the key is derived. */
   sas(): string | null
   /** This human pressed Confirm. Latches localConfirmed and tells the peer over the tunnel. */
   confirmHere(): void

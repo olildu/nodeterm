@@ -15,7 +15,11 @@ import {
   resetSessionsForTest,
   projectIdsBoundToSession,
   bindProjectToSession,
+  boundSessionForProject,
+  setOfflineRelayApiFactory,
+  OFFLINE_RELAY_SESSION_ID,
 } from './session'
+import { addRelayTab, useProjects } from '../state/projects'
 import { LocalTransport } from '../terminal/local-transport'
 import { planActiveProjectDials } from '../lib/sshAttachments'
 import type { NodeTerminalApi, Project, Workspace } from '@shared/types'
@@ -42,10 +46,15 @@ function fakeRelayClient() {
 
 /** A bridged relay api whose `pty.create` is a spy — this is what `LocalTransport(api)` must hit.
  *  `presenceUnsub` is what the session's held presence teardown calls (onSync's unsubscribe), so a
- *  drop that "runs the presence teardown" is observable in node env. */
+ *  drop that "runs the presence teardown" is observable in node env. `agentStatusUnsub` is the same
+ *  for the session's agent-status subscription (`onAgentStatus`); `agentStatusSnapshot` answers an
+ *  empty snapshot, as a host with nothing running does. */
 function fakeBridgedApi(ws: Workspace = { version: 2, activeProjectId: '', projects: [] }) {
   const ptyCreate = vi.fn().mockResolvedValue({ sessionId: 's1', fresh: false })
   const presenceUnsub = vi.fn()
+  const agentStatusUnsub = vi.fn()
+  const onAgentStatus = vi.fn(() => agentStatusUnsub)
+  const agentStatusSnapshot = vi.fn().mockResolvedValue([])
   const workspaceLoad = vi.fn().mockResolvedValue(ws)
   const api = {
     marker: 'relay-bridged',
@@ -56,8 +65,10 @@ function fakeBridgedApi(ws: Workspace = { version: 2, activeProjectId: '', proje
       onSync: vi.fn(() => presenceUnsub),
       onPeer: vi.fn(() => () => {}),
     },
+    onAgentStatus,
+    agentStatusSnapshot,
   } as unknown as NodeTerminalApi
-  return { api, ptyCreate, presenceUnsub, workspaceLoad }
+  return { api, ptyCreate, presenceUnsub, workspaceLoad, onAgentStatus, agentStatusUnsub }
 }
 
 function makeDeps(over: Partial<RelayTabDeps> & { handle: RelayApiHandle }): {
@@ -113,8 +124,81 @@ describe('openRelayTab (connect → tab → mount)', () => {
     expect(close).not.toHaveBeenCalled()
     tab.dispose()
     expect(close).toHaveBeenCalledTimes(1)
-    expect(sessionForProject(tab.projectId).source).toBe('local') // unbound → local
+    // Unbound → local, because THIS test's projects store does not hold 'proj-1' (addProject is a
+    // spy), so nothing says the tab is remote. A remote tab resolves to the offline relay session
+    // instead — the next test.
+    expect(useProjects.getState().getProject(tab.projectId)).toBeUndefined()
+    expect(sessionForProject(tab.projectId).source).toBe('local')
     expect(sessionCount()).toBe(1) // only local remains
+  })
+
+  it("subscribes its own api's agent status before the workspace load, and a dispose releases it", async () => {
+    const { api, onAgentStatus, agentStatusUnsub, workspaceLoad } = fakeBridgedApi()
+    const handle: RelayApiHandle = { api, ready: () => Promise.resolve(), close: vi.fn() }
+    const { deps } = makeDeps({ handle })
+    const tab = await openRelayTab('conn-1', "Ayşe's Mac", deps)
+    // Subscribed on the session's OWN api, before the first await after the session exists, so the
+    // RpcClient's early frames reach it.
+    expect(onAgentStatus).toHaveBeenCalledTimes(1)
+    expect(onAgentStatus.mock.invocationCallOrder[0]).toBeLessThan(workspaceLoad.mock.invocationCallOrder[0])
+    expect(agentStatusUnsub).not.toHaveBeenCalled()
+    tab.dispose()
+    expect(agentStatusUnsub).toHaveBeenCalledTimes(1)
+  })
+
+  it('a Team Access tab whose host shared nothing is a RELAY tab: never saved, offline (never local) once disposed', async () => {
+    // The host's workspace is empty, so openRelayTab takes the fallback: `deps.addProject(label)`,
+    // which Canvas wires to `addRelayTab` on a first connect.
+    const { api } = fakeBridgedApi()
+    const close = vi.fn()
+    const handle: RelayApiHandle = { api, ready: () => Promise.resolve(), close }
+    const { deps } = makeDeps({ handle, addProject: addRelayTab })
+    const offlineApi = { marker: 'offline-relay' } as unknown as NodeTerminalApi
+    setOfflineRelayApiFactory(() => offlineApi)
+    try {
+      const tab = await openRelayTab('conn-1', "Ayşe's Mac", deps)
+      const project = useProjects.getState().getProject(tab.projectId)
+      expect(project?.remote).toBe(true)
+      expect(sessionForProject(tab.projectId).id).toBe(tab.sessionId)
+      // Never written to THIS machine's workspace: a reload must not bring it back as a LOCAL
+      // project carrying the host's node ids (the disk writer skips `remote` too).
+      expect(useProjects.getState().toWorkspace().projects.map((p) => p.id)).not.toContain(tab.projectId)
+      tab.dispose()
+      expect(close).toHaveBeenCalledTimes(1)
+      const s = sessionForProject(tab.projectId)
+      expect(s.id).toBe(OFFLINE_RELAY_SESSION_ID)
+      expect(s.source).toBe('relay')
+      expect(boundSessionForProject(tab.projectId)).toBeNull()
+    } finally {
+      setOfflineRelayApiFactory(null)
+      useProjects.setState({ projects: [], activeProjectId: '' })
+    }
+  })
+
+  it('a disposed tab whose project is REMOTE in the store resolves to the offline relay session, never local', async () => {
+    const { api } = fakeBridgedApi()
+    const handle: RelayApiHandle = { api, ready: () => Promise.resolve(), close: vi.fn() }
+    const { deps } = makeDeps({ handle })
+    // The relay ingest adopts the host's project with `remote: true` (openRelayTab's adopt path).
+    useProjects.setState({ projects: [{ id: 'proj-1', name: "Ayşe's Mac", remote: true } as unknown as Project] })
+    const offlineApi = { marker: 'offline-relay' } as unknown as NodeTerminalApi
+    setOfflineRelayApiFactory(() => offlineApi)
+    try {
+      const tab = await openRelayTab('conn-1', "Ayşe's Mac", deps)
+      expect(boundSessionForProject(tab.projectId)?.id).toBe(tab.sessionId)
+      tab.dispose()
+      const s = sessionForProject(tab.projectId)
+      expect(s.id).toBe(OFFLINE_RELAY_SESSION_ID)
+      expect(s.source).toBe('relay')
+      expect(s.status).toBe('offline')
+      expect(s.api).toBe(offlineApi)
+      // The lifecycle question — "which relay session is bound to this tab?" — has no answer now.
+      expect(boundSessionForProject(tab.projectId)).toBeNull()
+      expect(sessionCount()).toBe(1) // the sentinel is not a registered session
+    } finally {
+      setOfflineRelayApiFactory(null)
+      useProjects.setState({ projects: [], activeProjectId: '' })
+    }
   })
 
   it('populates the tab by ADOPTING the host\'s scoped project (nodes intact, remote:true)', async () => {
@@ -246,7 +330,7 @@ describe('openRelayTab (connect → tab → mount)', () => {
 
 describe('handleRelayDrop (Stage 4 Task 7 — involuntary drop → greyed reconnectable tab)', () => {
   it('marks the bound project unavailable + runs the presence teardown ONCE, never removes it', async () => {
-    const { api, presenceUnsub } = fakeBridgedApi()
+    const { api, presenceUnsub, agentStatusUnsub } = fakeBridgedApi()
     const close = vi.fn()
     const handle: RelayApiHandle = { api, ready: () => Promise.resolve(), close }
     const { deps } = makeDeps({ handle })
@@ -259,6 +343,7 @@ describe('handleRelayDrop (Stage 4 Task 7 — involuntary drop → greyed reconn
     // dead socket was closed, but the PROJECT is kept and stays bound to a 'relay' source.
     expect(setProjectUnavailable).toHaveBeenCalledWith(tab.projectId, true)
     expect(presenceUnsub).toHaveBeenCalledTimes(1)
+    expect(agentStatusUnsub).toHaveBeenCalledTimes(1) // an offline tab hears no more agent status
     expect(close).toHaveBeenCalledTimes(1)
     expect(sessionForProject(tab.projectId).source).toBe('relay') // still reconnectable in place
     expect(sessionForProject(tab.projectId).status).toBe('offline')
@@ -267,6 +352,7 @@ describe('handleRelayDrop (Stage 4 Task 7 — involuntary drop → greyed reconn
     // Idempotent: a redundant drop (a revoke racing the FIN) re-runs no teardown.
     handleRelayDrop(tab, { setProjectUnavailable })
     expect(presenceUnsub).toHaveBeenCalledTimes(1)
+    expect(agentStatusUnsub).toHaveBeenCalledTimes(1)
     expect(close).toHaveBeenCalledTimes(1)
   })
 })

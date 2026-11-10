@@ -1,4 +1,5 @@
 import { useProjects } from '../state/projects'
+import { KEYBOARD_OWNER_SELECTOR } from './keyContext'
 import { isKanbanOpen } from '../state/viewMode'
 
 /**
@@ -91,7 +92,7 @@ export function zoomShortcutAction(
 }
 
 /** Text surfaces the canvas must never steal a printable chord from. Mirrors the ⌘C branch. */
-const TEXT_SURFACE_SELECTOR = '.monaco-editor, .xterm'
+const TEXT_SURFACE_SELECTOR = `.monaco-editor, .xterm, ${KEYBOARD_OWNER_SELECTOR}`
 
 /** PURE over the element: is `active` somewhere the user is typing? */
 export function hasTextFocus(active: Element | null): boolean {

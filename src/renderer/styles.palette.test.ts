@@ -247,8 +247,10 @@ describe('needs-you under Liquid Glass is an inner light', () => {
 describe('terminal glass blur', () => {
   it('terminal nodes frost 15% less than the chrome, and drop it under Reduce Transparency', () => {
     const glass = blocks(":root[data-nt-glass='on']")
-    expect(glass.get('--glass-blur')).toContain('blur(calc(16px + 12px * var(--glass-t)))')
-    expect(glass.get('--glass-term-blur')).toContain('blur(calc((16px + 12px * var(--glass-t)) * 0.85))')
+    // Both curves drop to 4px (x0.85) at Clear and meet the old 16 + 12t from the Readable tick on.
+    const curve = '16px + 12px * var(--glass-t) - 12px * max(0, 1 - var(--glass-t) / 0.7)'
+    expect(glass.get('--glass-blur')).toContain(`blur(calc(${curve}))`)
+    expect(glass.get('--glass-term-blur')).toContain(`blur(calc((${curve}) * 0.85))`)
     const rule = CSS.slice(CSS.indexOf(":root[data-nt-glass='on'] .term-node {\n"))
     expect(rule.slice(0, rule.indexOf('}'))).toContain('backdrop-filter: var(--glass-term-blur)')
     const reduce = CSS.slice(CSS.indexOf('@media (prefers-reduced-transparency: reduce) {'))
@@ -261,7 +263,17 @@ describe('terminal glass blur', () => {
   it.each(['--glass-blur', '--glass-term-blur'])('%s refracts last, after the blur', (name) => {
     const chain = blocks(":root[data-nt-glass='on']").get(name)!.replace(/\s+/g, ' ')
     expect(chain.indexOf('blur(')).toBe(0)
-    expect(chain.trim().endsWith('var(--glass-refract)')).toBe(true)
+    // Only the colour-matrix squeeze may follow it: it moves no pixels, so it cannot bring back the
+    // sharp rim band a reference filter ahead of blur() caused (visual QA C1).
+    expect(chain.trim().replace(/ var\(--glass-frost,\)$/, '').endsWith('var(--glass-refract,)')).toBe(true)
+  })
+
+  // Refraction is opt-in: App.tsx sets `--glass-refract` inline only left of the Readable tick
+  // (glassRefractionOn). A stylesheet default would switch the costliest filter back on at every
+  // slider position, Tinted included, where it bends nothing.
+  it('the stylesheet never turns refraction on by itself', () => {
+    expect(CSS).not.toMatch(/--glass-refract\s*:/)
+    expect(CSS).not.toMatch(/var\(--glass-refract\)/)
   })
 
   it('terminal glass flattens the backdrop luminance toward Tinted, and not at Clear', () => {

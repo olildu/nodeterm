@@ -1,4 +1,4 @@
-import { hasEditContext } from './keyContext'
+import { hasEditContext, isKeyboardOwnerTarget } from './keyContext'
 
 /**
  * Should a click on the EMPTY canvas take the keyboard away from `active`?
@@ -23,5 +23,5 @@ export function shouldReleasePaneFocus(active: Element | null): boolean {
   if (!active) return false
   const tag = active.tagName
   if (tag === 'TEXTAREA' || tag === 'INPUT') return true
-  return (active as HTMLElement).isContentEditable === true || hasEditContext(active)
+  return (active as HTMLElement).isContentEditable === true || hasEditContext(active) || isKeyboardOwnerTarget(active)
 }

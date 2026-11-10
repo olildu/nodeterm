@@ -11,6 +11,13 @@
  *  - `mac:<path under /System/Library/Desktop Pictures>` presets are the stock macOS stills, read
  *    from disk at runtime and NEVER bundled (they are Apple's). Converted to JPEG by `sips` in
  *    core, since Chromium cannot decode HEIC.
+ *  - `win:<path under %WINDIR%\\Web\\Wallpaper>` presets are the stock Windows stills, read and
+ *    converted the same way through Electron's `nativeImage` (desktop only).
+ *  - `aerial:<asset UUID>` / `aerial-shuffle:<category UUID>` presets are the macOS Aerial videos
+ *    macOS itself has downloaded (one clip looped, or a category shuffled), read from
+ *    `~/Library/Application Support/com.apple.wallpaper/aerials` at runtime and never bundled or
+ *    downloaded by us. Core resolves the UUID against a fresh manifest scan; the still behind the
+ *    video (and the fallback when nothing can play) is the asset's thumbnail.
  *  - `image` is a picture the user chose, COPIED into `<userData>/wallpapers/` on import so moving
  *    the original does not break it. `path` names that copy; core refuses to read anything else.
  */
@@ -82,9 +89,51 @@ export interface WallpaperApi {
   load(wallpaper: DesktopWallpaper): Promise<string | null>
   /** Copy (converting HEIC) a picked image into the wallpaper cache; resolves the value to store. */
   importImage(sourcePath: string): Promise<DesktopWallpaper>
+  /** The aerial tiles: one shuffle per category, then each downloaded aerial. Empty off macOS and in
+   *  the Server Edition. `thumb` is an nt-media: URL. */
+  listAerials(): Promise<WallpaperStill[]>
+  /** nt-media: URLs of the downloaded clips an aerial wallpaper plays, re-scanned on every call
+   *  (macOS downloads more over time); empty when none can play — the still then shows. */
+  aerialClips(wallpaper: DesktopWallpaper): Promise<string[]>
 }
 
 const MAX_FIELD = 4096
+
+export const AERIAL_PREFIX = 'aerial:'
+export const AERIAL_SHUFFLE_PREFIX = 'aerial-shuffle:'
+/** Apple's asset and category ids are upper-case UUIDs; accept either case, nothing else. */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+export function isAerialUuid(s: string): boolean {
+  return UUID.test(s)
+}
+
+/** Does this (hand-editable) setting name an aerial wallpaper? */
+export function isAerialWallpaper(raw: unknown): boolean {
+  const w = normalizeWallpaper(raw)
+  return w.kind === 'preset' && parseAerialId(w.id) !== null
+}
+
+/** The UUID an aerial id names and whether it is a shuffle, or null for any other id. */
+export function parseAerialId(id: string): { uuid: string; shuffle: boolean } | null {
+  const shuffle = id.startsWith(AERIAL_SHUFFLE_PREFIX)
+  if (!shuffle && !id.startsWith(AERIAL_PREFIX)) return null
+  const uuid = id.slice(shuffle ? AERIAL_SHUFFLE_PREFIX.length : AERIAL_PREFIX.length)
+  return isAerialUuid(uuid) ? { uuid, shuffle } : null
+}
+
+/**
+ * The shuffle's next clip: a random one, never `current` again while there is any other. A single
+ * clip (or none) is simply itself.
+ */
+export function nextShuffleClip(
+  clips: readonly string[],
+  current: string | null,
+  random: () => number = Math.random
+): string | null {
+  const pool = clips.length > 1 ? clips.filter((c) => c !== current) : clips
+  return pool.length ? pool[Math.floor(random() * pool.length) % pool.length] : null
+}
 
 /** Re-validate a hand-editable value. Anything unrecognised is `none`. */
 export function normalizeWallpaper(v: unknown): DesktopWallpaper {
@@ -92,7 +141,14 @@ export function normalizeWallpaper(v: unknown): DesktopWallpaper {
   const o = v as Record<string, unknown>
   if (o.kind === 'preset' && typeof o.id === 'string' && o.id.length > 0 && o.id.length < MAX_FIELD) {
     if (o.id.startsWith('gradient:') && !gradientCss(o.id)) return NO_WALLPAPER
-    if (!o.id.startsWith('gradient:') && !o.id.startsWith('mac:')) return NO_WALLPAPER
+    // `mac:` / `win:` name a system still; core re-resolves it against its OWN fresh scan, so an id
+    // from the other OS (a settings.json synced across machines) simply loads nothing there.
+    // `aerial:` / `aerial-shuffle:` likewise, and only with a UUID after the prefix.
+    const aerial = o.id.startsWith(AERIAL_PREFIX) || o.id.startsWith(AERIAL_SHUFFLE_PREFIX)
+    if (aerial && !parseAerialId(o.id)) return NO_WALLPAPER
+    if (!aerial && !o.id.startsWith('gradient:') && !o.id.startsWith('mac:') && !o.id.startsWith('win:')) {
+      return NO_WALLPAPER
+    }
     return { kind: 'preset', id: o.id }
   }
   if (o.kind === 'image' && typeof o.path === 'string' && o.path.length > 0 && o.path.length < MAX_FIELD) {
@@ -103,8 +159,9 @@ export function normalizeWallpaper(v: unknown): DesktopWallpaper {
 
 /**
  * What Liquid Glass picks when it is chosen with no wallpaper, so glass never sits over plain
- * black: the first macOS still (the scan already orders Sonoma Horizon first), else the first
- * gradient — the answer on Linux, Windows and the Server Edition, where the list is empty.
+ * black: the first system still (the macOS scan already orders Sonoma Horizon first; Windows lists
+ * its stock stills when the desktop shell can convert them), else the first gradient — the answer
+ * on Linux and the Server Edition, where the list is empty.
  */
 export function defaultWallpaper(stills: readonly { id: string }[]): DesktopWallpaper {
   return stills[0] ? { kind: 'preset', id: stills[0].id } : { kind: 'preset', id: GRADIENT_WALLPAPERS[0].id }

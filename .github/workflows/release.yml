@@ -30,6 +30,16 @@ jobs:
           # network blip — after every asset had uploaded — which skipped the publish gate and
           # stranded v0.2.23 as a prerelease. The ephemeral Linux runner below keeps its cache.
 
+      # The free-tier project limit's embedded deadline (PROJECT_LIMIT_DEADLINE_MS) must be bumped
+      # in every release before the flip, or DO_NOT_TRACK users are gated before anyone else. This
+      # refuses a tag whose deadline is under 30 days away (until it is frozen at the flip). Plain
+      # node, no npm ci, so a refused release fails in seconds. It is the FIRST step that runs in
+      # every build job (mac, linux, win): those jobs do not wait for each other and each creates
+      # the release on its first upload, so a refused tag must stop all three before they build.
+      # See docs/project-limit.md.
+      - name: Project-limit deadline guard
+        run: node scripts/check-project-limit-deadline.mjs
+
       # caffeinate on EVERY long-running step in this job, not just build+upload: the Air
       # sleeping during npm ci or the tmux compile cancels the step just the same (the
       # v0.3.1 attempt died mid tmux build). -dims only blocks idle sleep — a closed lid
@@ -172,7 +182,11 @@ jobs:
   # Publishes AppImage + deb + rpm + latest-linux.yml to the SAME tag's GitHub Release; the
   # nodeterm.dev update feed serves latest-linux.yml alongside the mac files.
   release-linux:
-    runs-on: ubuntu-latest
+    # PINNED, and for a different reason than ci.yml's: this job builds the AppImage, deb and rpm,
+    # so the build host sets the glibc floor every Linux user is held to. v0.4.4 and v0.4.5 were
+    # built on 24.04; letting `ubuntu-latest` carry this to 26.04 would raise that floor silently,
+    # in a release whose notes promise nothing of the kind. Raise it on purpose, in its own change.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -180,6 +194,10 @@ jobs:
         with:
           node-version: 22
           cache: npm
+
+      # Same guard as release-mac (see the comment there): first, so a refused tag uploads nothing.
+      - name: Project-limit deadline guard
+        run: node scripts/check-project-limit-deadline.mjs
 
       # electron-builder ships its own fpm, but the rpm target shells out to the system
       # rpmbuild ("Need executable 'rpmbuild' to convert dir to rpm"). Installed explicitly
@@ -212,11 +230,14 @@ jobs:
             dist/latest-linux.yml
 
   # Windows build: UNSIGNED BETA (#454), on a plain GitHub runner. Publishes the NSIS
-  # installer + zip as assets on the same tag's GitHub Release — and NOTHING to the update
-  # feed: `dist:win` stamps the package `nodeTermUpdates=disabled` (see src/main/updater.ts),
-  # so the shipped app's updater is cleanly off — no latest.yml is uploaded anywhere, no 404
-  # polling in the field. Auto-update arrives with code signing; an unsigned auto-update is a
-  # trust downgrade. Users update by downloading the next installer.
+  # installer + zip + latest.yml as assets on the same tag's GitHub Release. latest.yml is a
+  # PASSIVE notice feed only: `dist:win:release` stamps the package `nodeTermUpdates=manual`
+  # (see src/shared/update-platform.ts), so the shipped app checks the feed and shows a
+  # "new version available — Download" card linking the releases page, but never downloads or
+  # installs (quitAndInstall is refused in main). Self-install arrives with code signing; an
+  # unsigned auto-update is a trust downgrade. The nodeterm.dev/updates mirror must serve
+  # latest.yml the way it serves latest-mac.yml / latest-linux.yml (hosted outside this repo);
+  # the `verify-feed` job below reports whether it does.
   #
   # BEST-EFFORT by design: the `publish` promote gate below deliberately does NOT wait on
   # this job, so a Windows failure never strands the mac+linux release as a prerelease. A
@@ -233,15 +254,20 @@ jobs:
           node-version: '22'
           cache: 'npm'
 
+      # Same guard as release-mac (see the comment there): first, so a refused tag uploads nothing.
+      - name: Project-limit deadline guard
+        run: node scripts/check-project-limit-deadline.mjs
+
       # postinstall patches node-pty and rebuilds node-pty + smart-whisper against Electron's
       # ABI — the same install win-package-smoke.yml and the quality-windows CI job prove green.
       - name: Install dependencies
         run: npm ci
 
-      # make-icon + electron-vite build + electron-builder --win --x64 --publish never.
-      # Unsigned: no signing secrets exist for Windows yet; SmartScreen will warn.
+      # make-icon + electron-vite build + electron-builder --win --x64 --publish never, stamped
+      # nodeTermUpdates=manual (plain `dist:win` stays `disabled` for local packages that must
+      # never poll). Unsigned: no signing secrets exist for Windows yet; SmartScreen will warn.
       - name: Build Windows packages (NSIS installer + zip, unsigned)
-        run: npm run dist:win
+        run: npm run dist:win:release
 
       # The artifact names are the contract (same check as win-package-smoke.yml): a silent
       # target/artifactName regression must fail here, before the upload step lies about it.
@@ -252,10 +278,12 @@ jobs:
           version=$(node -p "require('./package.json').version")
           test -f "dist/nodeterm-Setup-${version}.exe" || { echo "::error::NSIS installer missing"; exit 1; }
           ls dist/nodeterm-*-win.zip >/dev/null 2>&1 || { echo "::error::win zip missing"; exit 1; }
+          test -f dist/latest.yml || { echo "::error::latest.yml (update notice feed) missing"; exit 1; }
 
-      # Deliberately narrow globs: only the installer + zip. No *.yml (that would be the
-      # update-feed leg this job must not have) and no *.blockmap (differential updates are
-      # part of the same auto-update story that waits on signing).
+      # Deliberately narrow globs: the installer + zip + latest.yml (the passive notice feed).
+      # No *.blockmap: differential downloads belong to the self-install story that waits on
+      # signing. The feed may briefly name this version before `publish` promotes it — harmless,
+      # the card only links the releases page and never downloads a file.
       - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -268,7 +296,7 @@ jobs:
           gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" --verify-tag --prerelease --notes "" || true
           n=1
-          until gh release upload "$tag" dist/nodeterm-Setup-*.exe dist/nodeterm-*-win.zip --clobber --repo "$GITHUB_REPOSITORY"; do
+          until gh release upload "$tag" dist/nodeterm-Setup-*.exe dist/nodeterm-*-win.zip dist/latest.yml --clobber --repo "$GITHUB_REPOSITORY"; do
             if [ "$n" -ge 5 ]; then
               echo "::error::asset upload failed after $n attempts"
               exit 1
@@ -283,11 +311,17 @@ jobs:
   # feeds) keeps serving the previous complete release — a mac-runner sleep or an upload
   # failure can no longer put a partial release in front of users. If one platform job
   # fails, fix/rerun it; this job then runs on the rerun and publishes.
-  # release-win is deliberately NOT in `needs`: the Windows asset is an unsigned beta with no
-  # update feed behind it, and its failure must never hold the mac+linux release hostage.
+  # release-win is deliberately NOT in `needs`: the Windows asset is an unsigned beta whose feed
+  # is a passive notice only, and its failure must never hold the mac+linux release hostage.
   publish:
     runs-on: ubuntu-latest
     needs: [release-mac, release-linux]
+    # A job-level block replaces the workflow's, so contents: write is restated. issues: read lets
+    # the release-notes generator look up the PRs labelled `no-release-notes` (labels live on the
+    # issues API); without it that lookup fails and the notes fall back to the plain commit list.
+    permissions:
+      contents: write
+      issues: read
     steps:
       - uses: actions/checkout@v7
         with:
@@ -299,15 +333,17 @@ jobs:
       #   Layer 1  scripts/release-notes.mjs asks GitHub's own generator for the PR-resolved
       #            list (PR number, PR title, author) and regroups it into New / Improved /
       #            Fixed, with test/refactor/chore/ci/build collapsed at the bottom — kept, not
-      #            deleted. Every entry links its PR, and any issue its title names.
+      #            deleted. Every entry links its PR, and any issue its title names. A PR
+      #            labelled `no-release-notes` is left out entirely (docs/release-notes/README.md).
       #   Layer 2  docs/release-notes/<TAG>.md, a hand-written Highlights block reviewed in the
       #            release PR, placed at the top. ABSENT FILE ⇒ THE GROUPED LIST ALONE. No
       #            release is ever blocked waiting for prose, and nobody has to be in the loop.
       #
       # DEGRADES, NEVER FAILS: if the generator throws for any reason (gh api down, a body
-      # shape we do not parse, a missing node), the step falls back to EXACTLY the plain
-      # `git log` list this release used to publish. A release that cannot publish because
-      # prose generation broke would be strictly worse than the list we are replacing.
+      # shape we do not parse, a missing node), the step falls back to the plain `git log` list
+      # this release used to publish — or to the compare link alone when a `no-release-notes` PR
+      # is in the range or the label lookup does not answer. A release that cannot publish
+      # because prose generation broke would be strictly worse than the list we are replacing.
       - name: Generate release notes
         env:
           GH_TOKEN: ${{ github.token }}
@@ -330,11 +366,31 @@ jobs:
           if ! node scripts/release-notes.mjs --tag "$tag" --prev "$prev" \
                  --repo "$GITHUB_REPOSITORY" --out notes.md; then
             echo "::warning::structured release notes failed; falling back to the plain commit list"
+            # The plain list is commit subjects, and git knows nothing about the `no-release-notes`
+            # label — the fallback would publish exactly what the label keeps out. So the list is
+            # printed only when the label lookup ANSWERS and no labelled PR was merged in this
+            # range; otherwise the notes are the compare link alone. A failed lookup is not "no
+            # labelled PRs".
+            withheld=yes
+            if labelled=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues?labels=no-release-notes&state=all&per_page=100" \
+                            --jq '.[] | select(.pull_request) | .number' 2>/dev/null); then
+              withheld=no
+              subjects=$(git log --format='%s' "$range")
+              for n in $labelled; do
+                if grep -qE "^Merge pull request #${n} |\(#${n}\)\$" <<<"$subjects"; then withheld=yes; break; fi
+              done
+            fi
+            if [ -n "$prev" ]; then link="https://github.com/${GITHUB_REPOSITORY}/compare/${prev}...${tag}"
+            else link="https://github.com/${GITHUB_REPOSITORY}/commits/${tag}"; fi
             {
               echo "## Changes${prev:+ since ${prev}}"
-              git log --no-merges --format='- %s' "$range" | grep -vE '^- chore\(release\)' | head -60
-              total=$(git log --no-merges --format='- %s' "$range" | grep -cvE '^- chore\(release\)' || true)
-              if [ "${total:-0}" -gt 60 ]; then echo "- …and $((total - 60)) more commits"; fi
+              if [ "$withheld" = yes ]; then
+                echo "Full list of changes: ${link}"
+              else
+                git log --no-merges --format='- %s' "$range" | grep -vE '^- chore\(release\)' | head -60
+                total=$(git log --no-merges --format='- %s' "$range" | grep -cvE '^- chore\(release\)' || true)
+                if [ "${total:-0}" -gt 60 ]; then echo "- …and $((total - 60)) more commits"; fi
+              fi
             } > notes.md
           fi
           gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
@@ -347,3 +403,81 @@ jobs:
       # Homebrew: the cask is NOT updated from here. It lives in the official homebrew/cask,
       # whose autobump follows /releases/latest — which excludes prereleases, so it only ever
       # picks up a release this publish job has promoted. (nodeterm/homebrew-tap is retired.)
+
+  # The update FEED is what installed apps actually read, and it is not the GitHub Release: the
+  # apps poll https://nodeterm.dev/updates (package.json build.publish), a mirror hosted OUTSIDE
+  # this repo. Nothing used to check it, which is how latest.yml 404'd there while every job here
+  # was green — and a check-only Windows build reports a failed automatic check only in its log, so
+  # the passive update notice was dead with no signal anywhere (U2). This job turns that hidden
+  # dependency into a visible result, AFTER the release is already promoted: it never holds a
+  # release back, a red run is the alarm.
+  #
+  # STRICT files fail the job when the mirror does not serve this tag's version within the retry
+  # window (mirror sync / CDN delay); ADVISORY files only warn. latest.yml is advisory until the
+  # mirror is confirmed to serve it — move it to STRICT then. It is checked only when release-win
+  # itself succeeded (that job is best-effort and may finish later or need a rerun).
+  #
+  # The budget is ONE deadline for the whole job, not a retry count per file, and that is the
+  # v0.4.4 lesson. Measured on run 39079366383: publish promoted at 00:25:02, this job started at
+  # 00:25:03 — one second later — and the mirror did not serve 0.4.4 until somewhere inside
+  # 00:29:43…00:30:14, i.e. ~5 minutes behind the promote, for every file AT ONCE. Under a per-file
+  # count the first STRICT file absorbs that entire wait alone, and it ran out ~30 s short: the job
+  # failed on latest-mac.yml and then passed latest-linux.yml and latest.yml seconds later, which
+  # reads as a mac-specific cache problem and is nothing of the kind. A shared deadline charges the
+  # one lag once — the first file waits, the rest are free — and it bounds a genuinely dead mirror
+  # to BUDGET_MINUTES instead of BUDGET_MINUTES × files. If STRICT spends the whole budget then
+  # ADVISORY gets exactly one attempt, deliberately: the mirror is demonstrably behind and a second
+  # full wait buys a warning nobody is waiting for. Do NOT "fix" a red run here by reordering the
+  # file list — the lag is global, so whichever file is checked first is the one that fails.
+  verify-feed:
+    runs-on: ubuntu-latest
+    needs: [publish, release-win]
+    if: ${{ always() && needs.publish.result == 'success' }}
+    steps:
+      - name: Verify the update feed serves this release
+        env:
+          FEED: https://nodeterm.dev/updates
+          STRICT: latest-mac.yml latest-linux.yml
+          ADVISORY: latest.yml
+          WIN_RESULT: ${{ needs.release-win.result }}
+          # ~2.4× the 5 min lag measured on v0.4.4, and a cap on the JOB, not on each file.
+          BUDGET_MINUTES: 12
+          INTERVAL: 30
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          # One deadline for every file, taken once up front — see the comment above the job.
+          deadline=$(( $(date +%s) + ${BUDGET_MINUTES:-12} * 60 ))
+          fail=0
+          check() {
+            f="$1"; level="$2"; got=""
+            while :; do
+              # `|| true` is load-bearing: GitHub runs this step under `bash -eo pipefail`, so a
+              # mirror that 404s makes `curl -f` exit non-zero, pipefail hands that to the
+              # assignment and `-e` kills the whole step on the FIRST attempt — no retry, no
+              # ::error::, no ::warning::, exit 22 and an empty log. A MISSING file is the case this
+              # job was written for (latest.yml 404'd on the mirror for v0.4.3) and the one the
+              # '<missing>' default below was always meant to report; advisory also has to mean
+              # advisory when the file is absent, not just when it is stale. It covers the EPIPE
+              # from `head -n 1` closing the pipe early for the same reason.
+              got=$(curl -fsSL --max-time 20 "$FEED/$f" 2>/dev/null \
+                | sed -n 's/^version:[[:space:]]*//p' | head -n 1 | tr -d "\"' \r" || true)
+              if [ "$got" = "$want" ]; then
+                echo "$FEED/$f serves $got"
+                return 0
+              fi
+              # Every file gets at least one attempt, however little budget is left.
+              left=$(( deadline - $(date +%s) ))
+              if [ "$left" -le 0 ]; then break; fi
+              echo "$FEED/$f serves '${got:-<missing>}', want $want; retrying in ${INTERVAL}s (${left}s of budget left)…"
+              sleep "$INTERVAL"
+            done
+            echo "::$level::$FEED/$f serves version '${got:-<missing>}', expected $want"
+            if [ "$level" = error ]; then fail=1; fi
+          }
+          for f in $STRICT; do check "$f" error; done
+          if [ "$WIN_RESULT" = success ]; then
+            for f in $ADVISORY; do check "$f" warning; done
+          else
+            echo "::warning::release-win result is '$WIN_RESULT'; latest.yml was not checked"
+          fi
+          exit "$fail"

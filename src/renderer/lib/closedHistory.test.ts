@@ -55,6 +55,15 @@ describe('buildClosedSessionEntries', () => {
 })
 
 describe('stateToReopenSnapshot', () => {
+  it('a persisted closed whiteboard is reopened reading its board by the old id', () => {
+    const entry: ClosedSessionEntry = {
+      id: 'e2', closedAt: 1,
+      node: { id: 'whiteboard-9', kind: 'whiteboard', position: { x: 0, y: 0 }, size: { width: 900, height: 600 }, title: 'Board', color: '#64d2ff', group: null },
+      absolutePosition: { x: 0, y: 0 }
+    }
+    expect(stateToReopenSnapshot(entry).data.whiteboardSource).toBe('whiteboard-9')
+  })
+
   it('carries position/parent/size/data through for recreateNodeFromSnapshot', () => {
     const entry: ClosedSessionEntry = {
       id: 'e1', closedAt: 1,

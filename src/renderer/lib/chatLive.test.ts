@@ -4,8 +4,10 @@ import {
   CHAT_OPTIMISTIC_WORKING_MS,
   chatActivity,
   planLiveReload,
+  screenPollTickAllowed,
   shouldPollScreen,
-  turnEndReloadCarries
+  turnEndReloadCarries,
+  windowFocusHint
 } from './chatLive'
 
 describe('chatActivity — the status row at the end of the ⌘M thread', () => {
@@ -96,5 +98,43 @@ describe('shouldPollScreen — reading the pane for the agent\'s own dialogs', (
     for (const refusal of ['dialog', 'asleep', 'paused', 'dropped', 'exited'] as const) {
       expect(shouldPollScreen({ ...base, refusal })).toBe(false)
     }
+  })
+})
+
+describe('screenPollTickAllowed — one tick of the screen poll', () => {
+  it('runs while the window is visible and focused', () => {
+    expect(screenPollTickAllowed({ hidden: false, focused: true })).toBe(true)
+  })
+
+  it('skips while the window is unfocused: ~30 tmux spawns a minute per chat view nobody can type into', () => {
+    expect(screenPollTickAllowed({ hidden: false, focused: false })).toBe(false)
+  })
+
+  it('skips while the page is hidden, focused or not (the original gate)', () => {
+    expect(screenPollTickAllowed({ hidden: true, focused: true })).toBe(false)
+    expect(screenPollTickAllowed({ hidden: true, focused: null })).toBe(false)
+  })
+
+  it('unknown focus polls: the hint fails toward the old behaviour', () => {
+    expect(screenPollTickAllowed({ hidden: false, focused: null })).toBe(true)
+  })
+})
+
+describe('windowFocusHint — reading focus without guessing', () => {
+  it('reports what the document says', () => {
+    expect(windowFocusHint({ hasFocus: () => true })).toBe(true)
+    expect(windowFocusHint({ hasFocus: () => false })).toBe(false)
+  })
+
+  it('is unknown, never false, when the document cannot answer', () => {
+    expect(windowFocusHint(undefined)).toBeNull()
+    expect(windowFocusHint({})).toBeNull()
+    expect(
+      windowFocusHint({
+        hasFocus: () => {
+          throw new Error('no window')
+        }
+      })
+    ).toBeNull()
   })
 })

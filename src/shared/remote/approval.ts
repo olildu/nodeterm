@@ -4,6 +4,8 @@
 // (`relayHost.confirm(id)`). Pure + shared so it is unit-testable without a jsdom harness — Canvas
 // has none — and so the SAS copy lives in one place.
 
+import { SAS_COMPARE_HINT } from './sas'
+
 /** The pending-peer fields this view needs (a superset-friendly shape of `RelayPeerPending`). */
 export interface PeerApprovalInput {
   id: string
@@ -29,6 +31,7 @@ export function peerApprovalView(peer: PeerApprovalInput): PeerApprovalView {
       `A device wants to access this machine.\n\n` +
       `Approve ONLY if you started this connection. The other device shows the same code:\n\n` +
       `        ${peer.sas ?? '— — —'}\n\n` +
+      `${SAS_COMPARE_HINT}\n\n` +
       `If the codes don't match, deny it.`
   }
 }

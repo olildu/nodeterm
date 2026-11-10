@@ -5,7 +5,7 @@
  * decisions live here because the failure modes are all about WHEN it may engage, and every one of
  * them is testable without a DOM.
  */
-import { hasEditContext } from './keyContext'
+import { hasEditContext, isKeyboardOwnerTarget } from './keyContext'
 
 /** What a space keydown should do. */
 export type SpacePanAction = 'engage' | 'ignore'
@@ -26,7 +26,7 @@ export function typingTarget(active: Element | null): boolean {
   if (!active) return false
   const tag = active.tagName
   if (tag === 'TEXTAREA' || tag === 'INPUT') return true
-  return (active as HTMLElement).isContentEditable === true || hasEditContext(active)
+  return (active as HTMLElement).isContentEditable === true || hasEditContext(active) || isKeyboardOwnerTarget(active)
 }
 
 /** The event shape this reads — a `KeyboardEvent` satisfies it, and so does a test literal. */

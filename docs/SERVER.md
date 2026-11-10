@@ -16,6 +16,11 @@ unchanged. It boots the same Electron-free core services (`src/core/`) through a
 
 ## Quickstart
 
+Host requirements: Linux, or macOS 12 Monterey or newer. Building the server runs the same
+`esbuild` binary Vite uses, and that binary needs macOS 12+ (see **Build from source** in the
+README) — a Big Sur Mac cannot build or run the Server Edition, but any browser on it can open
+one hosted elsewhere.
+
 ```bash
 npm run server:dev
 ```
@@ -50,6 +55,9 @@ NODETERM_SERVER_PASSWORD='choose-a-strong-one' npm run server:start
 When `NODETERM_SERVER_PASSWORD` is set **and** no password is configured yet, the
 server writes the scrypt hash on boot and skips the setup URL entirely — go straight
 to `/login`. It is ignored once a password already exists (it never overwrites).
+Use at least 8 characters, the same rule the setup form enforces. A shorter value is
+still used (an existing deployment must keep booting), but the boot prints a loud
+`✖ NODETERM_SERVER_PASSWORD is shorter than 8 characters` line.
 
 ### Manual build + run
 
@@ -73,6 +81,8 @@ Precedence: **CLI flag > environment variable > default.**
 | — | `NODETERM_SERVER_PASSWORD` | — | Seed the password headlessly on first boot (see above). |
 | `--trust-proxy-header <name>` | `NODETERM_TRUST_PROXY_HEADER` | — (off) | Reverse-proxy SSO trust: identity header asserted by your proxy (see [Reverse-proxy SSO](#reverse-proxy-sso-header-trust)). |
 | `--trust-proxy-nets <list>` | `NODETERM_TRUST_PROXY_NETS` | `127.0.0.0/8, ::1/128` | Comma-separated IPs/CIDRs (IPv4+IPv6) whose requests may use the trust header. Only meaningful with the header set. |
+| — | `NODETERM_TRUST_PROXY_SECRET` | — | Shared secret your proxy sends as `X-Nodeterm-Proxy-Secret` (at least 32 printable characters). **Required** when the trusted nets include loopback. Environment only: a command-line flag is refused, because argv is readable by every local user. |
+| `--public-origin <url>` | `NODETERM_PUBLIC_ORIGIN` | — | The https origin you open in the browser, e.g. `https://term.example.com`. Forces the `Secure` cookie flag, sends HSTS, and lets that `Origin` pass the same-origin checks when the proxy rewrites `Host`. See [TLS](#tls-reverse-proxy). |
 
 Binding a **non-loopback** host (anything other than `127.0.0.1` / `localhost` /
 `::1`) **without** `--insecure-http` is refused at startup — plain HTTP on a public
@@ -250,18 +260,53 @@ Single-user auth. There is one password; sessions are per-browser.
 - **Password hashing:** scrypt (`N=16384, r=8, p=1`, 32-byte key, per-password random
   salt), stored as `auth.json` (mode `0600`) in the data dir. Login comparison is
   constant-time (`crypto.timingSafeEqual`). The app never stores the plaintext.
+- **Password verification** runs the asynchronous scrypt, at most two at a time (a FIFO
+  gate), so a burst of login attempts never stalls the event loop that carries every
+  terminal's WebSocket.
 - **Session cookie:** on successful login the server sets `nt_session=<random>` with
-  `HttpOnly; SameSite=Strict; Path=/` (and `Secure` when served over HTTPS). Sessions
+  `HttpOnly; SameSite=Strict; Path=/`, plus `Secure` when `NODETERM_PUBLIC_ORIGIN` is set
+  or the proxy sends `X-Forwarded-Proto: https` (see [TLS](#tls-reverse-proxy)). Sessions
   are persisted (`sessions.json`, mode `0600`) with a 30-day TTL and swept lazily.
-  `revokeAll()` exists to drop every session but is only wired programmatically in
-  Phase 2 (no logout-everywhere UI yet; `/auth/logout` clears the current cookie).
-- **Origin check on WS upgrade:** the WebSocket endpoint requires a valid session
-  cookie **and**, when the browser sends an `Origin` header, that its host matches the
-  request `Host`. A malformed Origin is rejected (never throws). This blocks
-  cross-site WebSocket hijacking. (Non-browser clients without an Origin still must
-  present a valid cookie.)
-- **Login rate limit / lockout:** 5 failed password attempts trip a 60-second lockout
-  (further attempts get `429 too_many_attempts`); a success resets the counter.
+- **Signing out:** `POST /auth/logout` deletes the presented session on the server, so a
+  copy of the cookie stops working too (it used to clear only the browser's cookie and
+  leave the session valid for 30 days). `POST /auth/logout-all` ("Sign out everywhere")
+  deletes every session; it needs a signed-in caller. Both are in the browser UI under
+  **Settings → Application → Sign-in** (Server Edition only). An open WebSocket remembers
+  the session it was opened with and is closed (code `4401`) the moment that session is
+  signed out, and on the next heartbeat (≤ 30 s) after it expires. A socket opened through
+  proxy header trust is bound to the proxy's identity, not to a cookie, and stays open.
+- **Same-origin checks:** the WebSocket upgrade and every `POST /auth/*` (login, logout,
+  logout-all, setup) refuse a request whose `Origin` is not this server: its host must
+  equal the request `Host`, or the `Origin` must equal `NODETERM_PUBLIC_ORIGIN`.
+  `Origin: null` and a malformed Origin are refused. A request with no `Origin` is a
+  non-browser client (browsers always send one on a POST and on a WebSocket handshake)
+  and is allowed — unless it says `Sec-Fetch-Site: cross-site` or `same-site`. A refused
+  auth POST is answered `403 cross_origin` and is not charged to the lockout. So a page
+  the owner visits can neither post the login form (to lock them out) nor sign them out.
+- **Login rate limit / lockout**, per client:
+  - A login attempt reserves a slot **before** its body is read, and the budget counts
+    attempts in flight as well as failures. (It used to be checked before the body and
+    charged after verification, so requests whose bodies were held back all passed it: 60
+    of 60 were verified in the audit's repro.) A body that does not arrive within 10 s is
+    abandoned and its slot released without a charge.
+  - 5 failures (or attempts still in flight) lock **that client** for 1 minute; each
+    further lock doubles, up to 1 hour. A success resets the client; a client quiet for an
+    hour after its last lock is forgotten. Refusals are `429 too_many_attempts` with a
+    `Retry-After` header (a browser gets the sign-in page with the wait in minutes).
+  - A **global ceiling** of 50 failures plus attempts in flight per 5-minute sliding window,
+    across all clients, is the backstop against a guesser with many addresses. Its cost:
+    under a sustained distributed attack it refuses the owner too, until the window drains.
+  - **Who is a client:** the TCP peer, except when the peer is a forwarder — loopback, a
+    private, CGNAT, link-local or ULA address, or inside `NODETERM_TRUST_PROXY_NETS` — in which
+    case it is the **last** `X-Forwarded-For` entry (the one your proxy appended; the entries
+    to its left were written by whoever called the proxy). IPv6 clients are grouped by their
+    /64. Consequences: a process that reaches the server from a forwarder address (a local
+    user, another container on the network) can pick the bucket it is charged to — the
+    global ceiling still applies to it; and behind two proxies (a CDN in front of your
+    proxy) clients are grouped by the CDN's edge address.
+- **No framing:** every response carries `X-Frame-Options: DENY` and
+  `Content-Security-Policy: frame-ancestors 'none'` (the app's own CSP is a `<meta>` tag, where
+  `frame-ancestors` is ignored), plus `X-Content-Type-Options: nosniff`.
 - **Auth gate:** every route except the login/setup pages and their POST handlers
   requires a valid session — HTML navigations redirect to `/login`, API/WS get `401`.
 
@@ -282,35 +327,91 @@ NODETERM_TRUST_PROXY_HEADER=Tailscale-User-Login node out/server/main.cjs
 NODETERM_TRUST_PROXY_HEADER=X-Forwarded-User node out/server/main.cjs
 ```
 
-A request is trusted only when **both** hold:
+A request is trusted only when **all** of these hold:
 
 1. its **TCP peer address** is inside `NODETERM_TRUST_PROXY_NETS` (default:
    loopback only — the same-host proxy deployment). If your proxy reaches the
    container over a private network, list it explicitly, e.g.
-   `NODETERM_TRUST_PROXY_NETS=127.0.0.1,10.0.0.0/8`;
-2. it carries the configured header with a **non-empty value**.
+   `NODETERM_TRUST_PROXY_NETS=10.0.0.0/8`;
+2. it carries the configured header with a **non-empty value**;
+3. when `NODETERM_TRUST_PROXY_SECRET` is set, it carries
+   `X-Nodeterm-Proxy-Secret` equal to it (compared in constant time; never logged).
 
 The header **content is not validated** (no JWT verification) — the trusted-network
-boundary is the trust statement. That makes two things non-negotiable: only the
-proxy may be reachable from the trusted networks, and the proxy must
-**strip/overwrite** the header on incoming client requests (Cloudflare Access,
-Tailscale and oauth2-proxy all do). A typo'd nets entry fails the boot rather than
-silently changing who is trusted; setting nets without a header is likewise refused.
+boundary is the trust statement, and on **loopback that boundary holds every local
+process**: every Unix account on the host, every container on the host network, every
+sandboxed agent is "from the trusted networks". So:
+
+- **Loopback nets need the secret.** If the trusted nets include loopback (127.0.0.0/8 or
+  `::1`, including the default and anything wider such as `0.0.0.0/0`) and no secret is set,
+  header trust stays **OFF**: the server still boots with password sign-in, and the boot
+  prints a `✖ Proxy header trust is OFF` error naming what to set. A loopback peer is never
+  header-trusted without the secret, whatever the configuration.
+- **Other nets work without it, but get a warning:** every host that can reach the server
+  from those networks — other containers on the same network, the Docker host's bridge
+  address — counts as your proxy. Set the secret there too.
+
+To turn it on, generate a secret (`openssl rand -hex 32`), give it to the server through the
+environment (a `--trust-proxy-secret` flag is refused: argv is readable by every local user),
+and have the proxy send it on **every** request, WebSocket upgrades included:
+
+```nginx
+# nginx
+proxy_set_header X-Nodeterm-Proxy-Secret "<secret>";
+```
+
+```caddy
+# Caddy (inside reverse_proxy)
+header_up X-Nodeterm-Proxy-Secret "<secret>"
+```
+
+```yaml
+# Traefik (a headers middleware attached to the router)
+http:
+  middlewares:
+    nodeterm-secret:
+      headers:
+        customRequestHeaders:
+          X-Nodeterm-Proxy-Secret: "<secret>"
+```
+
+The proxy must also **strip/overwrite** the identity header on incoming client requests
+(Cloudflare Access, Tailscale and oauth2-proxy all do). A request that comes from a trusted
+address with the identity header but without the right secret is treated as signed out,
+and the server logs (at most once a minute, without any header value) that the secret was
+missing. A typo'd nets entry, a secret shorter than 32 characters, a secret with spaces, or
+a secret without a header all fail the boot rather than silently changing who is trusted;
+setting nets without a header is likewise refused.
+
+> **Upgrading a deployment that already uses header trust on loopback** (the default nets):
+> after this change header trust is off until you set `NODETERM_TRUST_PROXY_SECRET` and the
+> proxy header. Users then see the password page; sign in with the password, or set the
+> secret.
 
 Everything else stays intact: password/cookie auth keeps working beside it (e.g.
 for loopback ops access), the WS upgrade still enforces the same-host Origin check,
 and a proxy-authed visit to `/login` or `/setup` just redirects home. The boot log
-prints a `⚠️ Proxy header trust ENABLED` line naming the header and networks —
-verify it matches what you meant to trust.
+prints a `⚠️ Proxy header trust ENABLED` line naming the header, the networks and
+whether a secret is required — verify it matches what you meant to trust.
 
 ### TLS (reverse proxy)
 
 The server speaks **plain HTTP** by design. For anything beyond `localhost`, run it
 bound to loopback and put a TLS-terminating reverse proxy (nginx, Caddy, Cloudflare
-Tunnel, a VPN, etc.) in front. The `Secure` cookie flag is set automatically when the
-proxy forwards HTTPS (detected via `X-Forwarded-Proto` / the request being TLS).
-`--insecure-http` only exists as an explicit, eyes-open escape hatch for trusted
-private networks — prefer the proxy.
+Tunnel, a VPN, etc.) in front, and tell the server the address you open in the browser:
+
+```bash
+NODETERM_PUBLIC_ORIGIN=https://term.example.com node out/server/main.cjs
+```
+
+With it, the session cookie is **always** `Secure` and every response carries
+`Strict-Transport-Security: max-age=31536000`; an `Origin` equal to it also passes the
+same-origin checks when the proxy rewrites `Host`. It must be an `https` origin with no path
+(anything else fails the boot). Without it the server behaves as before — `Secure` is set only
+when the proxy sends `X-Forwarded-Proto: https`, and no HSTS is sent — and it logs one warning
+the first time a request arrives for a non-loopback `Host`, because a proxy that does not send
+that header silently loses `Secure`. `--insecure-http` only exists as an explicit, eyes-open
+escape hatch for trusted private networks — prefer the proxy.
 
 ### Docker / Dokploy
 
@@ -327,9 +428,10 @@ docker run -d -p 8443:8443 \
 ```
 
 On Dokploy specifically: create an app from this repo (Dockerfile build), attach a volume at
-`/data`, set `NODETERM_SERVER_PASSWORD`, and point a domain at container port `8443` — Traefik
-terminates TLS and forwards `X-Forwarded-Proto`, so the session cookie gets its `Secure` flag
-and the clipboard runs in a secure context.
+`/data`, set `NODETERM_SERVER_PASSWORD` and `NODETERM_PUBLIC_ORIGIN=https://<your domain>`, and
+point a domain at container port `8443` — Traefik terminates TLS (and forwards
+`X-Forwarded-Proto`), so the session cookie gets its `Secure` flag and the clipboard runs in a
+secure context.
 
 Things the image decides for you (see the Dockerfile comments for the full why):
 
@@ -353,9 +455,16 @@ under the container user's home, so consider a volume there too if you rely on t
 
 The inline login/setup pages carry a strict CSP. The built `index.html` ships with a
 `default-src 'self'` marker that the server **rewrites** at serve time to
-`default-src 'self'; connect-src 'self' ws: wss:;` so the browser can open the
-WebSocket. If that marker is ever missing, the server logs a loud warning (the WS
-would otherwise be blocked) — rebuild the renderer or update the rewrite.
+`default-src 'self'; connect-src 'self';` so the browser can open the WebSocket: CSP3
+matches a same-origin `ws:`/`wss:` URL against `'self'`, and the bridge only ever opens
+`/ws` on the page's own host. (It used to be `connect-src 'self' ws: wss:`, i.e. a socket to
+any host — harmless without an XSS, an exfiltration channel with one.) Verified with headless
+Chrome 153 against `http`/`ws` and `https`/`wss`: the same-origin socket opens, a
+cross-origin one is blocked. Firefox and Safari follow the same CSP3 rule but were not run;
+a browser too old to apply it would block the WebSocket and show the reconnect overlay. If
+that marker is ever missing, the server logs a loud warning (the WS would otherwise be
+blocked) — rebuild the renderer or update the rewrite. Framing is refused by HTTP header on
+every response (see [Security model](#security-model)).
 
 ### Dictation
 
@@ -526,7 +635,7 @@ Consequences worth knowing:
   browser driving here at all. See `src/server/control-unsupported.ts`.
   The agent-messaging verbs (`send`/`reply`/`notify`) are verified-only. When Server control is
   enabled they additionally require process-local proof that the caller spawned the target in this
-  run; with control disabled they receive `control-unsupported-on-this-edition`.
+  run (a `reply` may also go to the node that spawned the caller); with control disabled they receive `control-unsupported-on-this-edition`.
 - The **`ptyDestroy` tail-teardown** — *resolved in Phase 3c.* Phase 3b left this skipped
   (agent tails self-cleared only on `SessionEnd`, so a node closed *without* one left an
   idle file-tail); the server now untracks agent tails on node close, at desktop parity.
@@ -569,7 +678,8 @@ opens is the host, not the canvas. Enable it on a host where you would be conten
 agents a shell.
 
 Ownership is intentionally narrower than the desktop confirmation UI: an agent may mutate, message,
-or close only a node it opened during the current Server process run. Link, group, rename, color,
+or close only a node it opened during the current Server process run (one exception: a `reply` to
+the node that opened it). Link, group, rename, color,
 sticky updates, dependency targets, message delivery, and close validate their complete target set
 before any write or PTY kill; an unowned member refuses the whole operation. Queued messages repeat
 the creator check at flush time in addition to the existing verified and per-project switch gates.

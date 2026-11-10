@@ -89,6 +89,9 @@ export interface NodeRootLike {
 export interface FocusLossEvent {
   /** The node's root (`.term-node`), or null if it is gone. */
   nodeRoot: NodeRootLike | null
+  /** The node's React Flow wrapper (`.react-flow__node`), which also holds the root's SIBLINGS —
+   *  the 💬 comments flyout sits outside the root (overflow:hidden would clip it) but inside this. */
+  nodeChrome: NodeRootLike | null
   /** The element that lost focus (`focusout`'s target). */
   lost: unknown
   /** Where focus went (`focusout`'s `relatedTarget`); null for "nowhere" AND for a window blur. */
@@ -100,6 +103,10 @@ export interface FocusLossEvent {
   /** A press landed on THIS node (its React Flow wrapper, header included) in the same task — the
    *  focus change is that press's default action, not a click somewhere else. */
   pressedInOwnNode: boolean
+  /** That press landed on text the user READS and may select — the ⌘M chat's message list. The
+   *  press is the start of a drag-selection, and handing focus back to the composer in the same
+   *  moment moves the document selection into the textarea and cancels the drag. */
+  pressedInReadableText: boolean
   /** The element that lost focus is this node's xterm while its ⌘M view is open: the only way that
    *  happens is `useMdModeFocus` blurring it as the view opens (every other "take the keyboard"
    *  path goes through `focusXtermUnlessCovered`, which never focuses a covered xterm). */
@@ -112,6 +119,9 @@ export type FocusLossOutcome =
   | 'keep'
   /** The user clicked this node's own chrome: hand the keyboard straight back to its terminal. */
   | 'reclaim'
+  /** The user pressed text they may be selecting: hand the keyboard back only when the press
+   *  ends WITHOUT a selection (a plain click), so a drag-selection survives to be copied. */
+  | 'reclaim-on-release'
   /** The keyboard really went somewhere else: release the node. */
   | 'release'
 
@@ -122,7 +132,7 @@ export type FocusLossOutcome =
  * a real move from its look-alikes:
  *
  * - **Focus stayed inside the node** (the header's rename field, a header button, the ⌘M view's
- *   composer). The user is still working HERE → `keep`.
+ *   composer, the 💬 comments flyout beside the root). The user is still working HERE → `keep`.
  * - **The window lost focus** (Cmd+Tab, a click on another app). Chromium fires `blur`/`focusout`
  *   on the focused element, but that element remains `document.activeElement` and is focused
  *   again on return — the terminal never stopped owning the keyboard → `keep`.
@@ -135,6 +145,10 @@ export type FocusLossOutcome =
  *   way the keystroke after it would land on the canvas — where a bare Backspace is
  *   `canvas.deleteSelection`. #757 asks that the terminal keep the keyboard until the user clicks a
  *   DIFFERENT card, so this hands it back → `reclaim`.
+ * - **A press on text the user may select** (`pressedInReadableText`, the ⌘M chat's messages). The
+ *   same press as above, but reclaiming NOW moves the selection into the composer and kills the
+ *   drag — nothing could be highlighted or copied. So the reclaim waits for the press to end, and
+ *   only happens if it ended without a selection → `reclaim-on-release` (see `reclaimOnRelease`).
  *
  * Everything else — focus on another node's xterm or a text field, or on `<body>` because a click
  * landed on the empty canvas — is the user clicking elsewhere, which is exactly what #757 wants to
@@ -146,7 +160,12 @@ export function focusLossOutcome(e: FocusLossEvent): FocusLossOutcome {
   if (e.lostIsCoveredXterm) return 'keep'
   if (e.activeElement === e.lost) return 'keep'
   if (e.gained && e.nodeRoot.contains(e.gained)) return 'keep'
-  if (e.pressedInOwnNode) return 'reclaim'
+  // Focus went to a field this node renders beside its root (the comments composer). The wrapper
+  // ITSELF is excluded: that is where a header/border press sends focus, and it must still reclaim.
+  // Without this the press read as "own chrome" and `reclaim` put the keyboard back in the xterm
+  // a tick later — the composer's caret blinked once and nothing could be typed.
+  if (e.gained && e.nodeChrome && e.gained !== e.nodeChrome && e.nodeChrome.contains(e.gained)) return 'keep'
+  if (e.pressedInOwnNode) return e.pressedInReadableText ? 'reclaim-on-release' : 'reclaim'
   return 'release'
 }
 
@@ -203,4 +222,14 @@ export function reclaimTarget(p: { lostIsXterm: boolean; lostStillInNode: boolea
  */
 export function bodyPressAcknowledges(p: { primary: boolean; inBody: boolean; onGuard: boolean }): boolean {
   return p.primary && p.inBody && !p.onGuard
+}
+
+/**
+ * `reclaim-on-release`, decided when the press ends: give the keyboard back to the element that
+ * lost it only for a plain click (nothing selected) and only if that element is still in the node.
+ * A press that selected text keeps the selection — and the keyboard off the composer, so Cmd/Ctrl+C
+ * copies it; clicking the composer (or anywhere) afterwards behaves as usual.
+ */
+export function reclaimOnRelease(p: { selectionEmpty: boolean; lostStillInNode: boolean }): boolean {
+  return p.selectionEmpty && p.lostStillInNode
 }

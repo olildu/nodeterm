@@ -121,9 +121,29 @@ export interface MessagingStoredNode {
  * Every side effect and every store read, injected — same reasoning as `DeliveryDeps`: the suite
  * tests the SERVICE (scope→switch→flow→deps→reply) without a pty, a workspace file or a window.
  */
+/**
+ * The pane-identity half of `AgentMessagingDeps`, bound to the PtyManager that owns the panes: the
+ * owner read AND the budget that read gets, as one unit. Both shells spread this rather than each
+ * wiring the two methods by hand — `paneProbeTimeoutMs` is optional, so a shell that forwarded the
+ * read but not its budget would typecheck, pass every other test, and quietly put every Windows
+ * target back behind the 2 s bound that refuses it as `targetPaneUnreadable`.
+ */
+export function ptyPaneProbeDeps(pty: {
+  paneOwner(nodeId: string): Promise<PaneOwner | null>
+  paneProbeTimeoutMs(nodeId: string): number
+}): Pick<AgentMessagingDeps, 'paneOwner' | 'paneProbeTimeoutMs'> {
+  return {
+    paneOwner: (nodeId) => pty.paneOwner(nodeId),
+    paneProbeTimeoutMs: (nodeId) => pty.paneProbeTimeoutMs(nodeId)
+  }
+}
+
 export interface AgentMessagingDeps {
   paneOwner(nodeId: string): Promise<PaneOwner | null>
-  sendEnvelope(nodeId: string, envelope: string, expected?: PaneOwner): Promise<boolean>
+  /** Per-target pane-read budget; see `DeliveryDeps.paneProbeTimeoutMs`. Optional — absent keeps
+   *  the 2s default for every target, i.e. exactly the pre-existing behaviour. */
+  paneProbeTimeoutMs?(nodeId: string): number
+  sendEnvelope(nodeId: string, envelope: string, expected?: PaneOwner): Promise<boolean | 'dialog'>
   envelopePasteReady?(nodeId: string): Promise<boolean>
   /**
    * Does a session exist for this node at all — attached in this process OR held by a backend
@@ -619,10 +639,12 @@ export function renderMessageOutcome(o: AgentMessageOutcome): AgentMessageReply 
       return {
         ok: false,
         error:
-          `targetPaneUnreadable: the target's pane could not be read in time (the ssh/tmux probe ` +
-          `failed or timed out) — this says nothing about what is running in it. On an SSH project ` +
-          `this usually means the host link is saturated or reconnecting; the message was refused ` +
-          `rather than sent blind. ${advice}`,
+          `targetPaneUnreadable: the target's pane could not be read — this says nothing about ` +
+          `what is running in it, and the message was refused rather than sent blind. On an SSH ` +
+          `project this usually means the host link is saturated or reconnecting. On Windows it ` +
+          `can also mean the session host predates the pane-identity verb (messageOwnerV1), in ` +
+          `which case it resolves when that process next restarts and retrying now will not help. ` +
+          `${advice}`,
         result: o
       }
     case 'targetNotAgentPane':
@@ -710,13 +732,16 @@ export async function runDelivery(
   // A shell with a creator ledger (the Server Edition) authorizes control by which AGENT spawned
   // the target. A person's board comment is no agent's, and that shell serves no board-comment
   // delivery at all — refused by edition rather than squeezed through a ledger it was not built for.
-  // A station notice asks the ledger the other way round (see `stationNotice` above).
+  // A station notice asks the ledger the other way round (see `stationNotice` above). So may a
+  // `reply` (#1357): a station answering the agent that opened it reaches no node the opener does
+  // not already control.
   if (!notPermitted && deps.callerOwnsTarget) {
     if (board) notPermitted = 'unsupported-edition'
     else if (
       !(stationNotice
         ? deps.callerOwnsTarget(req.targetNodeId, ident.sourceNodeId)
-        : deps.callerOwnsTarget(ident.sourceNodeId, req.targetNodeId))
+        : deps.callerOwnsTarget(ident.sourceNodeId, req.targetNodeId) ||
+          (req.verb === 'reply' && deps.callerOwnsTarget(req.targetNodeId, ident.sourceNodeId)))
     )
       notPermitted = 'caller-not-owner'
   }
@@ -783,6 +808,9 @@ export async function runDelivery(
 
   const delivery: DeliveryDeps = {
     paneOwner: (id) => deps.paneOwner(id),
+    paneProbeTimeoutMs: deps.paneProbeTimeoutMs
+      ? (id) => deps.paneProbeTimeoutMs!(id)
+      : undefined,
     // #210 retired the `#{bracket_paste_flag}` probe with a "do not reintroduce" note
     // (pty-manager.ts): pre-3.7 tmux cannot distinguish "the app did not ask" from "I cannot
     // ask". So the dep answers true and the gate never refuses on it. Since #453 the delivery

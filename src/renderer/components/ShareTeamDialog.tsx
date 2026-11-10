@@ -9,6 +9,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { useDialogStack } from './dialog-stack'
 import type { ShareConfirmSummary, ShareNode, ShareOutcome, SharePhase } from '../lib/shareSshTeam'
+import { errorText } from '../../shared/error-text'
 
 export type ShareDialogState =
   | { phase: 'running'; step: SharePhase; log: string }
@@ -45,8 +46,6 @@ const RESTORE_FAILED_TEXT = 'The SSH project could not be restored automatically
 /** The installer's output is shown (and kept) only this far back: a build prints far more than
  *  anyone reads, and the tail is where a failure is. */
 export const SHARE_LOG_TAIL = 4000
-
-const errorText = (e: unknown): string => (e instanceof Error ? e.message : String(e))
 
 function TitleList({ heading, items }: { heading?: string; items: string[] }): React.JSX.Element | null {
   if (!items.length) return null

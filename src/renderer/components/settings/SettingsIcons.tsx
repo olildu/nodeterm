@@ -148,6 +148,8 @@ const PATHS: Record<StaticSettingsSectionId, React.JSX.Element> = {
   ),
   updates: <path d="M8 2.6v7M5 6.6 8 9.6l3-3M3.6 12.6h8.8" />,
   privacy: <path d="M8 2.4 12.4 4.2V8c0 3-2 4.8-4.4 5.6C5.6 12.8 3.6 11 3.6 8V4.2Z" />,
+  // A door with an arrow leaving it (sign out).
+  'sign-in': <path d="M9.5 3H4a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h5.5M7.5 8h6M11.5 6l2 2-2 2" />,
   // A tiny bug (the debug section).
   debug: (
     <>

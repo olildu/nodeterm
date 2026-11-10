@@ -1,9 +1,11 @@
 import { useContextEnsure } from '../../terminal/useContextEnsure'
 import { transcriptSessionFor } from '../../lib/transcriptSession'
 import { FIND_DECORATIONS } from '../../lib/palette'
+import { isLocalOnSshCanvas } from '../../lib/localOnSshCanvas'
 import { ptyRefusal } from '@shared/pty-refusal'
 
 import { patchImeModeSwitch } from '../../terminal/ime-mode-switch'
+import { patchShrinkTrim } from '../../terminal/shrink-trim'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
@@ -17,9 +19,10 @@ import { liveProjectJumpTarget } from '../../lib/projectJump'
 import { terminalChordBubbles, terminalShortcutPolicy } from '../../lib/keybindingOverrides'
 import { focusXtermUnlessCovered, useMdModeFocus } from '../../terminal/useMdModeFocus'
 import { FindBar } from '../FindBar'
-import { useAgentStatus } from '../../state/agentStatus'
 import { useProjects } from '../../state/projects'
-import { useSession } from '../../session/session'
+import { isRemoteProjectId, useSession, useSessionStores } from '../../session/session'
+import { relayStatusGates } from '../../terminal/relay-status-gates'
+import { REMOTE_PROJECT_SPAWN_REFUSAL, spawnBelongsElsewhere, useOwningProjectId } from '../../session/owning-project'
 import { isHostedReadOnly } from '../../state/hostedTeams'
 import { useSettings } from '../../state/settings'
 import { isMacPlatform, isWindowsPlatform } from '@shared/platform-utils'
@@ -31,7 +34,13 @@ import {
 import { useTerminalSearch } from '../../terminal/useTerminalSearch'
 import { useTerminalGlass } from '../../lib/useTerminalGlass'
 import { LocalTransport } from '../../terminal/local-transport'
-import { clipboardImages, droppedPaths, pasteHasText, pastedFiles } from '../../terminal/file-drop'
+import {
+  clipboardImages,
+  dropDialect,
+  droppedPaths,
+  pasteHasText,
+  pastedFiles
+} from '../../terminal/file-drop'
 import { guardMiddleClickPaste } from '../../terminal/middle-click'
 import { attachCopyOnSelect } from '../../terminal/copy-on-select'
 import {
@@ -151,9 +160,21 @@ export function ModalTerminal({
 }: ModalTerminalProps) {
   const session = useSession()
   const { api } = session
+  // MIRROR TerminalNode: which status-driven readers this viewer may run (relay-status-gates.ts) —
+  // all of them on the local session, none on a relay / team tab, whose status is its host's.
+  const gates = relayStatusGates(session.source)
+  // The agent status of the session this card's project runs under (mounted through
+  // `ProjectSessionScope`), never the default store: a team tab's node shares its id with the
+  // handed-off SSH project, whose entry is the default store's.
+  const agentStatusStore = useSessionStores().agentStatus.store
   // Read at click time from the lifecycle effect, which runs once per mount.
   const projectIdRef = useRef(projectId)
   projectIdRef.current = projectId
+  // MIRROR TerminalNode: the project this viewer's node belongs to, as the board's
+  // `ProjectSessionScope` provides it — read by the create path below, which runs once per mount.
+  const owningProject = useOwningProjectId()
+  const owningProjectRef = useRef(owningProject)
+  owningProjectRef.current = owningProject
   const onOpenFileRef = useRef(onOpenFile)
   onOpenFileRef.current = onOpenFile
   // MIRROR TerminalNode: the path dialect belongs to the core that owns the filesystem, never this
@@ -192,12 +213,12 @@ export function ModalTerminal({
   const sessionIdRef = useRef<string | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
   const transportRef = useRef<LocalTransport | null>(null)
-  const agentSessionId = useAgentStatus((s) => s.byId[nodeId]?.sessionId)
-  const observedAgentId = useAgentStatus((s) => s.byId[nodeId]?.agentId)
+  const agentSessionId = agentStatusStore((s) => s.byId[nodeId]?.sessionId)
+  const observedAgentId = agentStatusStore((s) => s.byId[nodeId]?.agentId)
   // MIRROR TerminalNode: transcript READS go to the account the session is actually running as,
   // which for a plain terminal is only ever the observed one. The spawn below keeps
   // `spawn.accountId` — launch identity stays creation-time.
-  const observedAccount = useAgentStatus((s) => s.byId[nodeId]?.account)
+  const observedAccount = agentStatusStore((s) => s.byId[nodeId]?.account)
   // …resolved against the live account list, so linking the dir repoints the reader at once.
   const claudeAccounts = useSettings((s) => s.settings.claudeAccounts)
   // MIRROR TerminalNode: the meter's rehydration reads the same session the ⌘M view does.
@@ -216,7 +237,7 @@ export function ModalTerminal({
   visualRef.current = visual
   // Liquid Glass: the same glass as the canvas node (a second view of one session must look like
   // it). The DOM renderer keeps app-painted cell backgrounds opaque (see CLAUDE.md).
-  const { glass, vars: glassVars } = useTerminalGlass(visual.terminalTheme)
+  const { glass, vars: glassVars } = useTerminalGlass(visual.terminalTheme, true)
   const glassRef = useRef(glass)
   glassRef.current = glass
   const [dropping, setDropping] = useState(false)
@@ -248,8 +269,10 @@ export function ModalTerminal({
     accountId: effectiveAccountId(spawn.accountId, observedAccount, claudeAccounts),
     // MIRROR TerminalNode: the transcript index reads claude's JSONL through claude's resolver, so
     // it is gated on the claude-transcript fact, NOT on the context meter's `hasUsage` (which now
-    // spans codex and gemini too) — see lib/transcriptGates.ts.
-    searchTranscript: readsClaudeTranscript(spawn.agentId),
+    // spans codex and gemini too) — see lib/transcriptGates.ts. And on `gates.transcriptSearch`: it
+    // reads THIS machine's transcripts (`window.nodeTerminal.claude`), never a relay host's, and a
+    // team tab's card holds the HOST's session id.
+    searchTranscript: gates.transcriptSearch && readsClaudeTranscript(spawn.agentId),
     open: searchOpen,
     readBuffer
   })
@@ -302,6 +325,8 @@ export function ModalTerminal({
     // Renderer-parity with the canvas terminals (see char-size-quantize): the modal co-views
     // the same session, so its column math must match what the canvas draws.
     quantizeCharSize(term)
+    // The card's find bar crashes on an untrimmed alternate buffer, same as the canvas node.
+    patchShrinkTrim(term)
     fit.fit()
 
     let sessionId: string | null = null
@@ -484,18 +509,35 @@ export function ModalTerminal({
       return false
     })
 
+    // MIRROR TerminalNode's `dialsSsh`: a RELAY card's SSH-project node lives on the HOST's side,
+    // so this machine never dials for it (session/relay-ssh.ts). Its create goes to the host's
+    // core with `requireRemote`, which joins the session when the host holds it live and refuses
+    // otherwise. This machine has no master to resolve for it and must not refuse it for lacking one.
+    const dialsSsh = !!spawn.sshRemoteTmux && session.source !== 'relay'
     void (async () => {
-      // Read here, not at click time: a modal only ever opens over the ACTIVE project, and the
-      // reconnect coordinator is keyed by CONNECTION SCOPE (same choice resolveSshRemote makes) —
-      // the project's own id, or the host attachment when this card's session is on a machine the
-      // project isn't.
+      // MIRROR TerminalNode: a node of a REMOTE project (a relay / hosted team tab) under a session
+      // that is not a relay session would create the host's node id on THIS desktop's core. The
+      // board mounts the modal under the card's project session (`ProjectSessionScope`), so this
+      // is the defensive half: start nothing, before any SSH resolve. `isRemoteProjectId` is
+      // sessionForProject's own rule, so a tab the store deleted still counts.
+      const owner = owningProjectRef.current
+      if (spawnBelongsElsewhere(isRemoteProjectId(owner ?? ''), session.source)) {
+        term.write(
+          `\r\n\x1b[90m${REMOTE_PROJECT_SPAWN_REFUSAL}\x1b[0m\r\n`
+        )
+        return
+      }
+      // Read here, not at click time. A dialing node's reconnect coordinator is keyed by CONNECTION
+      // SCOPE (same choice resolveSshRemote makes) — the project's own id, or the host attachment
+      // when this card's session is on a machine the project isn't. Any other node's pane is owned
+      // by the CARD's project (the Omni board opens cards of every project), else the active one.
       const projectId =
-        spawn.sshRemoteTmux && spawn.ssh
+        dialsSsh && spawn.ssh
           ? sshConnectionScope(spawn.ssh)
-          : useProjects.getState().activeProjectId
+          : (owner ?? useProjects.getState().activeProjectId)
       // SSH-project node: resolve the live ControlMaster (may not be up yet on a cold load).
       const sshRemote =
-        spawn.sshRemoteTmux && spawn.ssh
+        dialsSsh && spawn.ssh
           ? await resolveSshRemote(spawn.ssh, spawn.cwd, { nodeId, pty: api.pty })
           : undefined
       if (dead) return
@@ -503,7 +545,7 @@ export function ModalTerminal({
       // core's LOCAL tmux branch, and opening a card for a remote session would silently start a
       // local shell under that node's id — see PtyCreateOptions.requireRemote. The card says so
       // and the node is queued for the reconnect coordinator, exactly like the canvas node.
-      if (spawn.sshRemoteTmux && !sshRemote) {
+      if (dialsSsh && !sshRemote) {
         term.write(
           `\r\n\x1b[90m[not connected — this session lives on ${spawn.ssh ? `${spawn.ssh.user}@${spawn.ssh.host}` : 'the remote host'}; nothing was started locally]\x1b[0m\r\n`
         )
@@ -529,13 +571,27 @@ export function ModalTerminal({
         agentId: spawn.agentId,
         accountId: spawn.accountId,
         sshRemote,
-        requireRemote: spawn.sshRemoteTmux
-      })
+        requireRemote: spawn.sshRemoteTmux,
+        // Same local-login exemption as the canvas node (issue #1186).
+        ...(isLocalOnSshCanvas(nodeId) ? { localOnSshCanvas: true } : {})
+      }).catch((err: unknown): Error => (err instanceof Error ? err : new Error(String(err))))
+      // A create that REJECTS started nothing — the core could not be asked (a relay tab whose
+      // connection is gone, e.g. the offline relay session, answers every call with E_DISCONNECTED).
+      // Say so, like TerminalNode's spawn-error overlay, instead of a blank viewer and an unhandled
+      // rejection out of this effect.
+      if (res instanceof Error) {
+        if (!dead) {
+          // eslint-disable-next-line no-control-regex -- the message is written INTO the terminal
+          const why = res.message.replace(/[\x00-\x1f\x7f]/g, ' ')
+          term.write(`\r\n\x1b[90m[this terminal could not be started: ${why}]\x1b[0m\r\n`)
+        }
+        return
+      }
       // Refused core-side (the master died inside our round-trip, or `ssh` is missing).
       if (res.unavailable) {
         const refusal = ptyRefusal(res.unavailable)
         term.write(`\r\n\x1b[90m[${refusal.message}]\x1b[0m\r\n`)
-        if (refusal.connectionLost && projectId) reportSshDrop(projectId, nodeId)
+        if (refusal.connectionLost && projectId && dialsSsh) reportSshDrop(projectId, nodeId)
         return
       }
       // Another client permanently deleted this node's session — never resurrect it (no live session
@@ -666,6 +722,18 @@ export function ModalTerminal({
     if (!term || !files.length) return
     // Clipboard bytes must be written before they have a path, which is not instant either.
     const needsWrite = files.some((f) => !window.nodeTerminal.getPathForFile(f))
+    const st = agentStatusStore.getState().byId[nodeId]
+    const paneAgent = spawn.agentId ?? st?.agentId
+    const agentPane = agentProcessInPane(paneAgent, st)
+    // MIRROR TerminalNode.dropDialectFor: spelled for the core that owns the pane, not this window.
+    const dialect = dropDialect({
+      corePlatform: corePlatformRef.current,
+      remote: !!spawn.sshRemoteTmux || !!spawn.ssh,
+      shell: spawn.shell || useSettings.getState().settings.defaultShell || undefined,
+      agentPane,
+      localDesktop: session.source === 'local' && !isBrowserRuntime(),
+      viewerWindows: isWindowsPlatform()
+    })
     let paths: string[]
     if (spawn.sshRemoteTmux) {
       // Uploads go over the master this card's PTY runs on — its scope, not the project's.
@@ -679,12 +747,12 @@ export function ModalTerminal({
     } else if (needsWrite) {
       setUploading(true)
       try {
-        paths = await droppedPaths(files, { sshRemoteTmux: false, projectId: '' })
+        paths = await droppedPaths(files, { sshRemoteTmux: false, projectId: '', dialect })
       } finally {
         setUploading(false)
       }
     } else {
-      paths = await droppedPaths(files, { sshRemoteTmux: false, projectId: '' })
+      paths = await droppedPaths(files, { sshRemoteTmux: false, projectId: '', dialect })
     }
     if (!paths.length) return
     // A drag-drop from another OS app doesn't bring our window forward (esp. macOS), so the
@@ -695,13 +763,11 @@ export function ModalTerminal({
     term.focus()
     // Same receipt as the canvas node (TerminalNode.insertFiles): attached only once the pane
     // shows it.
-    const st = useAgentStatus.getState().byId[nodeId]
-    const paneAgent = spawn.agentId ?? st?.agentId
     pasteWithImageReceipt(
       term,
       paths.join(' ') + ' ',
       paths,
-      agentProcessInPane(paneAgent, st) ? paneAgent : undefined,
+      agentPane ? paneAgent : undefined,
       pasteReceipt.report
     )
   }

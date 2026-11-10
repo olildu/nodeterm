@@ -3,6 +3,7 @@ import type {
   CanvasMutation,
   CanvasNodeState,
   ClaudeAccount,
+  HeldLaunchIntent,
   NodeKind,
   PendingLaunch,
   Project,
@@ -19,11 +20,12 @@ import {
   supportsSessionIdFlag
 } from '@shared/agents/config'
 import { assembleLaunchCommand, assembleResumeCommand } from '@shared/agents/launch'
+import { heldLaunchIntentFor } from '@shared/agents/launch-intent'
 import { agentAccountColor } from '@shared/agents/account-color'
 import { boundAccountId } from '@shared/agents/account-binding'
 import { agentEnvSnapshot } from '../lib/agentEnv'
 import { uuid } from '@renderer/lib/uuid'
-import { expandRectToGrid, NODE_MIN_SIZES, snapNodeToGrid, type Rect } from '../lib/nodeSizing'
+import { COLLAPSED_HEIGHT, expandRectToGrid, NODE_MIN_SIZES, snapNodeToGrid, type Rect } from '../lib/nodeSizing'
 import { claudeCliCapsNow, grokCliCapsNow } from './permissionMode'
 import { ensureGrokTakenIds, grokTakenIdsNow } from './grokSessionIds'
 import { mintFreeGrokSessionId } from '@shared/agents/grok-session-mint'
@@ -40,7 +42,9 @@ import { isSafeNodeId } from '@shared/safe-id'
 import { openerByTarget, recordedOpenerOf } from '../lib/teamProgress'
 import { normalizePendingLaunch } from '@shared/pending-launch-shape'
 import { normalizeTerminalFontSize } from '../terminal/terminal-font-zoom'
-import { normalizeRunConfig, runNodeTitle, type RunNodeConfig } from '@shared/run-config'
+import { RUN_NODE_ID, normalizeRunConfig, runNodeTitle, type RunNodeConfig } from '@shared/run-config'
+import { normalizeRunBrowserConfig } from '@shared/run-preview'
+import { normalizeInlineSimulatorConfig, normalizeSimulatorConfig, type SimulatorNodeConfig } from '@shared/simulator'
 import { useSettings } from './settings'
 
 // Re-exported so Canvas (and anything else in the renderer) keeps importing it from here, while the
@@ -51,13 +55,22 @@ export { accountNodeColor, agentAccountColor } from '@shared/agents/account-colo
 import { mutationTrustsLaunch, sanitizeInboundNode } from '@shared/node-exec'
 import { SYSTEM_NODE_COLORS } from '@shared/node-colors'
 import { groupsFirstBy } from '@shared/node-order'
+import {
+  NODE_SIZE_MAX,
+  STICKY_NODE_SIZE,
+  TERMINAL_NODE_SIZE_MIN,
+  resolveDefaultNodeSize,
+  type NodeSize,
+  type SizableNodeKind
+} from '@shared/default-node-size'
+import { rootPositionWith } from '@shared/root-position'
 
 // Preserve the renderer's long-standing import surface; validation and the palette now live in
 // shared so Server Edition and canvas-control accept exactly what these pickers display.
 export { NODE_COLORS, SYSTEM_NODE_COLORS } from '@shared/node-colors'
 
 const TERMINAL_SIZE = { width: 640, height: 440 }
-const STICKY_SIZE = { width: 240, height: 200 }
+const STICKY_SIZE = STICKY_NODE_SIZE
 const GROUP_SIZE = { width: 520, height: 360 }
 /** A fresh worktree group starts empty but exists to HOLD terminals/agents, and the default
  *  GROUP_SIZE (520×360) is smaller than a single terminal (600×400) — a dropped-in terminal would
@@ -76,9 +89,14 @@ const FILES_SIZE = { width: 340, height: 460 }
 // Phone-shaped: an iPhone's screen is ~0.46 wide-to-tall, plus a header and a button row. Narrow on
 // purpose — the canvas is zoomable, and the node is a handheld, not a window.
 const AGENTSIM_SIZE = { width: 400, height: 780 }
+/** A phone held upright, with room for the toolbar. The screen keeps its own aspect inside. */
+const SIMULATOR_SIZE = { width: 360, height: 760 }
+/** Landscape and roomy: a whiteboard is for sketching, and the board pans and zooms inside itself. */
+const WHITEBOARD_SIZE = { width: 900, height: 600 }
 
-/** Height of a node when collapsed (header only). */
-export const COLLAPSED_HEIGHT = 40
+// Height of a node when collapsed (header only). Defined in lib/nodeSizing (a light module, so the
+// control listing can report a collapsed node's size without importing this one) and re-exported.
+export { COLLAPSED_HEIGHT }
 
 /** The node kinds that render a header-only collapsed state. Any other kind squashed to
  *  COLLAPSED_HEIGHT crushes its content (a group frame strands its children outside it), so
@@ -134,6 +152,8 @@ export interface NodeData {
   collapsed?: boolean
   /** Agent nodes only: when true, this node's subagent/loop fan-out cards are hidden. */
   hideFanout?: boolean
+  /** Terminal nodes: the ⌘M view is open — see CanvasNodeState.mdMode. */
+  mdMode?: boolean
   /** Terminal nodes: own font size (issue #915) — see CanvasNodeState.terminalFontSize. */
   terminalFontSize?: number
   /** Expanded height to restore when un-collapsing (kept out of the persisted size). */
@@ -145,6 +165,13 @@ export interface NodeData {
   premaxRect?: { x: number; y: number; width: number; height: number }
   /** One-shot command run once when the terminal first opens (not persisted). */
   initialCommand?: string
+  /**
+   * The semantic twin of a prompt-bearing agent `initialCommand` (shared/agents/launch-intent.ts),
+   * bound to that exact line. A local Windows session-host pane executes THIS instead of typing the
+   * POSIX line (`pty:execute-launch`); every other surface ignores it. Not persisted — absent from
+   * flowToNodeStates, like initialCommand.
+   */
+  launchIntent?: HeldLaunchIntent
   /**
    * Terminal nodes armed with canvas-control's `--after`: the launch is held until every node
    * in `after` reports idle. Unlike `initialCommand` this IS persisted — the wait is durable
@@ -164,6 +191,18 @@ export interface NodeData {
    *  hand edit — the stamp means "an agent synced this", not "last touched". */
   textUpdatedAt?: number
   textUpdatedBy?: string
+  /**
+   * whiteboard-only: the board this node shows until it saves its own — set on a duplicate or a
+   * reopen (which get a NEW id) so the copy needs no file copy and no board file is ever deleted.
+   * A node id, never a path: the core resolves it inside this project (core/whiteboards.ts).
+   */
+  whiteboardSource?: string
+  /** whiteboard-only: epoch ms of the last editing session that changed the board. Written once
+   *  per session (never per stroke) — what a linked agent's "the board changed" keys on. */
+  boardRev?: number
+  /** whiteboard-only, renderer-only (never serialized): open the editor as soon as the board has
+   *  loaded. Set by `createWhiteboardNode` so a new board opens ready to draw; cleared on use. */
+  autoEdit?: boolean
   filePath?: string
   /**
    * editor/diff-only: true once this node's `filePath` was confirmed gone — e.g. a worktree
@@ -184,6 +223,10 @@ export interface NodeData {
    * through persistence untouched on Server Edition / mobile, where a browser node has no <webview>.
    */
   partition?: string
+  /** browser-only: popped out of a run node's browser panel — that run node's id, to dock back. */
+  dockTo?: string
+  /** Run nodes only: the browser panel inside the node (present = shown). See @shared/run-preview. */
+  runBrowser?: import('@shared/run-preview').RunBrowserConfig
   /**
    * browser/web-only, NEVER persisted: this node object is a background KEEP-ALIVE GHOST — a
    * `display:none` stand-in merged into the `<ReactFlow>` prop so the `<webview>` of a project the
@@ -249,8 +292,12 @@ export interface NodeData {
   trigger?: import('@shared/trigger').TriggerSpec
   /** Run nodes only: which launch.json configuration runs, where. See @shared/run-config. Persisted. */
   runConfig?: import('@shared/run-config').RunNodeConfig
+  /** Run nodes only: a simulator shown inside the node (present = shown). See @shared/simulator. */
+  runSimulator?: import('@shared/simulator').InlineSimulatorConfig
   /** Run nodes only, transient: start the run on mount (a compound's sibling). Never persisted. */
   runAutoStart?: boolean
+  /** simulator-only: which iOS simulator the node shows. See @shared/simulator. Persisted. */
+  simulator?: import('@shared/simulator').SimulatorNodeConfig
   [key: string]: unknown
 }
 
@@ -344,15 +391,15 @@ export function terminalNodeSize(): { width: number; height: number } {
     return Math.min(hi, Math.max(lo, n))
   }
   const fallback = {
-    width: clamp(s.defaultNodeWidth, 280, 2400, TERMINAL_SIZE.width),
-    height: clamp(s.defaultNodeHeight, 160, 1600, TERMINAL_SIZE.height)
+    width: clamp(s.defaultNodeWidth, TERMINAL_NODE_SIZE_MIN.width, NODE_SIZE_MAX.width, TERMINAL_SIZE.width),
+    height: clamp(s.defaultNodeHeight, TERMINAL_NODE_SIZE_MIN.height, NODE_SIZE_MAX.height, TERMINAL_SIZE.height)
   }
   if (resolveNewNodeSize(s.newNodeSize) !== 'matchLargest') return fallback
   const largest = largestTerminalSize(((nodeSizeSourceOverride ?? liveCanvasNodes)?.() ?? []).map(sizedFlowNode))
   if (!largest) return fallback
   return {
-    width: clamp(largest.width, 280, 2400, fallback.width),
-    height: clamp(largest.height, 160, 1600, fallback.height)
+    width: clamp(largest.width, TERMINAL_NODE_SIZE_MIN.width, NODE_SIZE_MAX.width, fallback.width),
+    height: clamp(largest.height, TERMINAL_NODE_SIZE_MIN.height, NODE_SIZE_MAX.height, fallback.height)
   }
 }
 
@@ -398,6 +445,40 @@ function sizedFlowNode(n: CanvasNode): SizedNode {
     ? n.data.expandedHeight ?? NaN
     : n.measured?.height ?? n.height ?? NaN
   return { kind, size: { width, height } }
+}
+
+export const BUILTIN_NODE_SIZES: Readonly<Record<SizableNodeKind, NodeSize>> = {
+  sticky: STICKY_SIZE,
+  editor: EDITOR_SIZE,
+  diff: DIFF_SIZE,
+  video: VIDEO_SIZE,
+  web: WEB_SIZE,
+  browser: BROWSER_SIZE,
+  files: FILES_SIZE,
+  dino: DINO_SIZE,
+  trigger: TRIGGER_SIZE,
+  simulator: SIMULATOR_SIZE,
+  whiteboard: WHITEBOARD_SIZE
+}
+
+/**
+ * Default size for NEW nodes of a non-terminal kind: the user's per-kind setting (Settings →
+ * Behavior → Default node size), else the kind's built-in size, clamped between its resizer
+ * minimum and the canvas maximum. Read at creation time, never at mount (settings hydrate late).
+ */
+export function defaultNodeSize(kind: SizableNodeKind): NodeSize {
+  const stored = useSettings.getState().settings.defaultNodeSizes?.[kind]
+  return resolveDefaultNodeSize(stored, BUILTIN_NODE_SIZES[kind], NODE_MIN_SIZES[kind])
+}
+
+/** `placeNode` at the kind's default size. */
+function placeSized(
+  kind: SizableNodeKind,
+  center: { x: number; y: number } | undefined,
+  index: number
+): Pick<CanvasNode, 'position' | 'width' | 'height' | 'style'> {
+  const { width, height } = defaultNodeSize(kind)
+  return placeNode(kind, center, index, width, height)
 }
 
 /**
@@ -474,6 +555,30 @@ export function createRunNode(
       cwd: config.projectDir,
       runConfig: normalizeRunConfig(config),
       ...(opts.autoStart ? { runAutoStart: true } : {})
+    }
+  }
+}
+
+/**
+ * A Simulator node: a live iOS simulator screen (see @shared/simulator, nodes/SimulatorNode). The
+ * device is chosen in the node; `config` pre-selects one (a run node opening its simulator).
+ */
+export function createSimulatorNode(
+  index: number,
+  config: SimulatorNodeConfig = {},
+  center?: { x: number; y: number }
+): CanvasNode {
+  const c = normalizeSimulatorConfig(config)
+  return {
+    id: nextId('sim'),
+    type: 'simulator',
+    ...placeSized('simulator', center, index),
+    data: {
+      title: c.name ?? 'Simulator',
+      color: RUN_NODE_COLOR,
+      group: null,
+      tags: [],
+      simulator: c
     }
   }
 }
@@ -904,6 +1009,20 @@ export function createAgentNode(
       `[custom-agent] ${label}: ${missingEnv.map((m) => '${env:' + m + '}').join(', ')} unset in launch command — expanded to empty.`
     )
   }
+  // The same launch as a semantic request, for a Windows pane whose shell is not POSIX. Only where
+  // it describes this exact line faithfully — see heldLaunchIntentFor for every exclusion.
+  const launchIntent = heldLaunchIntentFor({
+    agentId,
+    command: initialCommand,
+    launchCmdOverride,
+    model,
+    remote: !!ssh,
+    resume: resumeSessionId !== undefined,
+    initialPrompt,
+    promptFile,
+    permissionMode,
+    mintedSessionId
+  })
   const size = terminalNodeSize()
   return {
     id: nextId('term'),
@@ -929,6 +1048,7 @@ export function createAgentNode(
       ...(model ? { agentModel: model } : {}),
       cwd: ssh ? ssh.remoteCwd : cwd,
       initialCommand,
+      ...(launchIntent ? { launchIntent } : {}),
       ...(ssh ? { ssh: ssh.server, sshRemoteTmux: true } : {})
     }
   }
@@ -1109,7 +1229,7 @@ export function createEditorNode(
   return {
     id: nextId('editor'),
     type: 'editor',
-    ...placeNode('editor', center, index, EDITOR_SIZE.width, EDITOR_SIZE.height),
+    ...placeSized('editor', center, index),
     data: {
       title: filePath.split('/').pop() || 'untitled',
       color: '#6ac4dc',
@@ -1173,7 +1293,7 @@ export function createVideoNode(
   return {
     id: nextId('video'),
     type: 'video',
-    ...placeNode('video', center, index, VIDEO_SIZE.width, VIDEO_SIZE.height),
+    ...placeSized('video', center, index),
     data: {
       title: filePath.split('/').pop() || 'video',
       color: '#bf5af2',
@@ -1196,7 +1316,7 @@ export function createWebNode(
   return {
     id: nextId('web'),
     type: 'web',
-    ...placeNode('web', center, index, WEB_SIZE.width, WEB_SIZE.height),
+    ...placeSized('web', center, index),
     data: {
       title,
       color: '#6ac4dc',
@@ -1226,7 +1346,7 @@ export function createBrowserNode(
   return {
     id: nextId('browser'),
     type: 'browser',
-    ...placeNode('browser', center, index, BROWSER_SIZE.width, BROWSER_SIZE.height),
+    ...placeSized('browser', center, index),
     data: {
       title,
       color: '#0a84ff',
@@ -1259,7 +1379,7 @@ export function createFilesNode(
     // manager sitting off-grid beside snapped neighbours, and off-grid in SIZE too — React Flow
     // resizes by adding a grid multiple to the start size, so an unsnapped box can never be
     // dragged onto the grid afterwards.
-    ...placeNode('files', center, index, FILES_SIZE.width, FILES_SIZE.height),
+    ...placeSized('files', center, index),
     data: {
       title: folderTitle(cwd),
       color: '#ffd60a',
@@ -1311,7 +1431,7 @@ export function createDiffNode(
   return {
     id: nextId('diff'),
     type: 'diff',
-    ...placeNode('diff', center, index, DIFF_SIZE.width, DIFF_SIZE.height),
+    ...placeSized('diff', center, index),
     data: {
       title: `${relPath.split('/').pop() || relPath} (${commitOid ? commitOid.slice(0, 7) : 'diff'})`,
       color: '#e0af68',
@@ -1329,12 +1449,27 @@ export function createStickyNode(index: number, center?: { x: number; y: number 
   return {
     id: nextId('sticky'),
     type: 'sticky',
-    ...placeNode('sticky', center, index, STICKY_SIZE.width, STICKY_SIZE.height),
+    ...placeSized('sticky', center, index),
     data: {
       title: 'Note',
       color: '#ffd60a',
       group: null,
       text: ''
+    }
+  }
+}
+
+/** Creates a new whiteboard: an Excalidraw sketching surface (nodes/WhiteboardNode.tsx). */
+export function createWhiteboardNode(index: number, center?: { x: number; y: number }): CanvasNode {
+  return {
+    id: nextId('whiteboard'),
+    type: 'whiteboard',
+    ...placeSized('whiteboard', center, index),
+    data: {
+      title: 'Whiteboard',
+      color: '#64d2ff',
+      group: null,
+      autoEdit: true
     }
   }
 }
@@ -1345,13 +1480,14 @@ export function createStickyNode(index: number, center?: { x: number; y: number 
  * invalid/absent spec schedules nothing and cannot be armed).
  */
 export function createTriggerNode(index: number, center?: { x: number; y: number }): CanvasNode {
+  const size = defaultNodeSize('trigger')
   return {
     id: nextId('trigger'),
     type: 'trigger',
-    position: placeAt(center, index, TRIGGER_SIZE.width, TRIGGER_SIZE.height),
-    width: TRIGGER_SIZE.width,
-    height: TRIGGER_SIZE.height,
-    style: { width: TRIGGER_SIZE.width, height: TRIGGER_SIZE.height },
+    position: placeAt(center, index, size.width, size.height),
+    width: size.width,
+    height: size.height,
+    style: { width: size.width, height: size.height },
     data: {
       title: 'Trigger',
       color: '#e6a23c',
@@ -1369,7 +1505,7 @@ export function createDinoNode(
   return {
     id: nextId('dino'),
     type: 'dino',
-    ...placeNode('dino', center, index, DINO_SIZE.width, DINO_SIZE.height),
+    ...placeSized('dino', center, index),
     data: {
       title: 'Dino',
       color: '#a2a2a2',
@@ -1475,6 +1611,7 @@ function groupBox(
 }
 
 import type { ArrangeLayout, GroupArrangeLayout } from '@shared/arrange-verb'
+import { ARRANGE_GAP_DEFAULT } from '@shared/arrange-verb'
 export type { ArrangeLayout, GroupArrangeLayout }
 export { GROUP_ARRANGE_LAYOUTS } from '@shared/arrange-verb'
 
@@ -1520,7 +1657,7 @@ export function arrangeNodes(
   byId = new Map(nodes.map((nd) => [nd.id, nd]))
   members = [...memberIds].flatMap((id) => byId.get(id) ?? [])
   const layout = opts?.layout ?? 'grid'
-  const gap = opts?.gap ?? 40
+  const gap = opts?.gap ?? ARRANGE_GAP_DEFAULT
   const origin = opts?.origin ?? {
     x: Math.min(...members.map((m) => m.position.x)),
     y: Math.min(...members.map((m) => m.position.y))
@@ -1735,7 +1872,7 @@ export function arrangeByLineage(
   nodes = restoreMaximizedWhere(nodes, (nd) => (nd.parentId ?? null) === containerId)
   const topLevel = nodes.filter((nd) => (nd.parentId ?? null) === containerId)
 
-  const gap = opts?.gap ?? 40
+  const gap = opts?.gap ?? ARRANGE_GAP_DEFAULT
   const origin = opts?.origin ?? {
     x: Math.min(...topLevel.map((nd) => nd.position.x)),
     y: Math.min(...topLevel.map((nd) => nd.position.y))
@@ -1827,7 +1964,7 @@ export function tidyCanvas(
   // Every unit moves, and a frame is packed at the size its (maximized) child inflated it to.
   nodes = restoreMaximizedWhere(nodes, () => true)
   const units = nodes.filter((nd) => !nd.parentId).sort(byReadingPosition)
-  const gap = opts?.gap ?? 40
+  const gap = opts?.gap ?? ARRANGE_GAP_DEFAULT
   const order = new Map(units.map((u, i) => [u.id, i]))
   const unitOf = containerAncestors(nodes, null)
 
@@ -2237,19 +2374,7 @@ function groupsFirst(nodes: CanvasNode[]): CanvasNode[] {
 /** A node's position in ROOT space: its own position plus every ancestor frame's origin. */
 export function rootPosition(node: CanvasNode, nodes: CanvasNode[]): { x: number; y: number } {
   const byId = new Map(nodes.map((candidate) => [candidate.id, candidate]))
-  const seen = new Set<string>([node.id])
-  let x = node.position.x
-  let y = node.position.y
-  let parentId = node.parentId
-  while (parentId && !seen.has(parentId)) {
-    seen.add(parentId)
-    const parent = byId.get(parentId)
-    if (!parent) break
-    x += parent.position.x
-    y += parent.position.y
-    parentId = parent.parentId
-  }
-  return { x, y }
+  return rootPositionWith(node, (id) => byId.get(id))
 }
 
 /**
@@ -2383,6 +2508,206 @@ export function placeNodeInRect(
 function clampToMinSize(node: CanvasNode, rect: { width: number; height: number }) {
   const min = NODE_MIN_SIZES[node.type ?? 'terminal'] ?? { width: 0, height: 0 }
   return { width: Math.max(rect.width, min.width), height: Math.max(rect.height, min.height) }
+}
+
+/** What `resizeNodes` did to one node: the size it now has, and what the reply must say about it. */
+export interface ResizeApplied {
+  id: string
+  width: number
+  /** For a COLLAPSED node this is the height it will expand to — it still draws header-only. */
+  height: number
+  /** A requested axis was outside [kind minimum, NODE_SIZE_MAX] and was held to the bound. */
+  clamped: boolean
+  /** Header-only: the width applied now, the height was recorded for when it is expanded. */
+  collapsed: boolean
+  /** It was maximized, and went back to its own rect before the new size was applied. */
+  restored: boolean
+}
+
+export type ResizeOutcome =
+  | { ok: false; error: string }
+  | {
+      ok: true
+      /** The SAME array when nothing changed — the caller's signal to skip the write. */
+      nodes: CanvasNode[]
+      applied: ResizeApplied[]
+      /** Ids that name no node, skipped (the rest still applied, like `group`). */
+      unknown: string[]
+    }
+
+/**
+ * `resize` (issue #1288): give existing nodes an explicit size, one axis or both. Pure.
+ *
+ * - **Clamped, never refused, on size**: each REQUESTED axis is held between the kind's resizer
+ *   minimum (`NODE_MIN_SIZES` — the smallest the user can drag it to; a programmatic resize bypasses
+ *   the resizer, lib/nodeSizing.ts) and `NODE_SIZE_MAX` (the ceiling of the default-size setting,
+ *   `terminalNodeSize`). An axis the caller did not name is kept as it is. `clamped` tells the reply
+ *   to say what was actually applied.
+ * - **Exact, no grid snapping.** The caller named the pixels; a snapped size is one it did not ask
+ *   for. (Align-to-grid is there for whoever wants it.)
+ * - **A group frame refuses the WHOLE call**, naming the frame: a frame is sized by what it holds
+ *   (`fitGroupToChildren`), so any size given to it is undone by the next fit. Refusing beats
+ *   resizing the rest — a refusal means nothing happened.
+ * - **Collapsed** (header-only): the width applies now; the height becomes `expandedHeight`, which
+ *   is what the expand gives back and what `flowToNodeStates` persists for a collapsed node. The
+ *   node keeps its collapsed look — expanding it is the user's call, not a side effect of sizing.
+ * - **Maximized**: restored to its own rect first, then sized. Left maximized, the explicit size
+ *   would be undone by the next panel-pin refit (`refitMaximizedNode` re-claims the viewport for
+ *   any node holding `premaxRect`), and the restore button would later teleport it back to the
+ *   old rect. Same rule every layout pass follows (`restoreMaximizedWhere`).
+ * - The stale `measured` is dropped in the same tick (as `withNodeRect` does): `flowToNodeStates`
+ *   prefers it, and a save racing the re-measure would persist the OLD size. A terminal's cols/rows
+ *   follow through its own ResizeObserver — there is no second path to tmux here.
+ * - A framed node's frame — and every frame around it — re-fits (`fitAncestorChain`), or
+ *   `extent:'parent'` clamps a child that outgrew its frame into an inverted range.
+ */
+export function resizeNodes(
+  nodes: CanvasNode[],
+  ids: readonly string[],
+  size: { width?: number; height?: number },
+  grid = 0
+): ResizeOutcome {
+  const wanted = [...new Set(ids)]
+  const byId = new Map(nodes.map((n) => [n.id, n]))
+  const unknown = wanted.filter((id) => !byId.has(id))
+  const known = wanted.filter((id) => byId.has(id))
+  if (known.length === 0) return { ok: false, error: 'resize: none of the given node ids exist' }
+  const frame = known.find((id) => byId.get(id)!.type === 'group')
+  if (frame) {
+    return {
+      ok: false,
+      error: `resize: ${frame} is a group frame — a frame sizes itself to what it holds; resize the nodes inside it, or \`arrange --group ${frame}\``
+    }
+  }
+  const set = new Set(known)
+  const wasMaximized = new Set(known.filter((id) => !!byId.get(id)!.data.premaxRect))
+  let next = restoreMaximizedWhere(nodes, (n) => set.has(n.id))
+  const applied: ResizeApplied[] = []
+  const touchedParents = new Set<string>()
+  let changed = wasMaximized.size > 0
+  next = next.map((n) => {
+    if (!set.has(n.id)) return n
+    const kind = n.type ?? 'terminal'
+    const min = NODE_MIN_SIZES[kind] ?? { width: 0, height: 0 }
+    const collapsed = !!n.data.collapsed
+    const curW = nodeW(n) || (n.style?.width as number) || 0
+    const curH = collapsed
+      ? ((n.data.expandedHeight as number | undefined) ?? COLLAPSED_FALLBACK_HEIGHT[kind] ?? 300)
+      : nodeH(n) || (n.style?.height as number) || 0
+    const hold = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v))
+    const width = size.width === undefined ? curW : hold(size.width, min.width, NODE_SIZE_MAX.width)
+    const height = size.height === undefined ? curH : hold(size.height, min.height, NODE_SIZE_MAX.height)
+    const clamped =
+      (size.width !== undefined && width !== size.width) || (size.height !== undefined && height !== size.height)
+    const restored = wasMaximized.has(n.id)
+    applied.push({ id: n.id, width, height, clamped, collapsed, restored })
+    if (samePx(curW, width) && samePx(curH, height)) return n
+    changed = true
+    if (n.parentId) touchedParents.add(n.parentId)
+    // Collapsed: it keeps drawing header-only, so only the width and the recorded expand height move.
+    const drawnH = collapsed ? ((n.height as number | undefined) ?? COLLAPSED_HEIGHT) : height
+    return {
+      ...n,
+      width,
+      height: drawnH,
+      style: { ...n.style, width, height: drawnH },
+      measured: undefined,
+      data: { ...n.data, expandedHeight: height }
+    }
+  })
+  if (!changed) return { ok: true, nodes, applied, unknown }
+  for (const parentId of touchedParents) next = fitAncestorChain(next, parentId, grid)
+  return { ok: true, nodes: next, applied, unknown }
+}
+
+/** Where `placeNodes` put one of the nodes it was asked to move, in ROOT (canvas) space. */
+export interface PlaceApplied {
+  id: string
+  x: number
+  y: number
+  /** It was maximized, and went back to its own size before it was placed. */
+  restored: boolean
+}
+
+export type PlaceOutcome =
+  | { ok: false; error: string }
+  | {
+      ok: true
+      /** The SAME array when nothing moved — the caller's signal to skip the write. */
+      nodes: CanvasNode[]
+      placed: PlaceApplied[]
+      unknown: string[]
+      /** Listed ids that rode along inside a listed frame instead of being moved twice. */
+      carried: string[]
+    }
+
+/**
+ * `place` (issue #1288): put nodes at canvas coordinates, or shift them by an offset. Pure.
+ *
+ * - **Root space in, parent kept.** `x`/`y` are canvas coordinates — the numbers `list` reports —
+ *   and a framed node STAYS in its frame: the root-space delta is applied to its parent-relative
+ *   position (the two differ by the parent chain's origin, which is not moving), and its frame plus
+ *   every frame around it re-fit to hold it (`fitAncestorChain`, which keeps root positions fixed —
+ *   so the node ends exactly where it was put). That is why this is not `move --x`: `move` without
+ *   `--group` means "to the top level".
+ * - **Several ids with `x`/`y` move as ONE block**: the set keeps its own shape and its bounding
+ *   box's top-left lands on (x, y). It is the only reading in which the call is a placement rather
+ *   than a collision — every node at the same point is not a layout — and it makes "pin this
+ *   arranged block to the corner" one call. With `dx`/`dy` each node simply shifts.
+ * - **A frame carries its subtree**: a listed frame moves with everything in it, and a listed
+ *   descendant of a listed frame is NOT moved a second time (`selectedRootIds`) — it is reported as
+ *   `carried`.
+ * - **Maximized** nodes in what moves are restored first (same reason as `resizeNodes`: left
+ *   maximized, the next panel-pin refit would put them back over the viewport). Collapsed nodes need
+ *   nothing: placement does not touch a size.
+ * - **Exact, no grid snapping** — only a frame's own re-fit snaps (to the grid, as every frame does),
+ *   and that never moves what it holds.
+ */
+export function placeNodes(
+  nodes: CanvasNode[],
+  ids: readonly string[],
+  to: { x?: number; y?: number; dx?: number; dy?: number },
+  grid = 0
+): PlaceOutcome {
+  const wanted = [...new Set(ids)]
+  const known = wanted.filter((id) => nodes.some((n) => n.id === id))
+  const unknown = wanted.filter((id) => !known.includes(id))
+  if (known.length === 0) return { ok: false, error: 'place: none of the given node ids exist' }
+  const roots = selectedRootIds(nodes, known)
+  const rootSet = new Set(roots)
+  const carried = known.filter((id) => !rootSet.has(id))
+  const moves = (n: CanvasNode): boolean => rootSet.has(n.id) || roots.some((r) => isDescendant(nodes, n.id, r))
+  const wasMaximized = new Set(roots.filter((id) => !!nodes.find((n) => n.id === id)!.data.premaxRect))
+  const restoredAny = nodes.some((n) => !!n.data.premaxRect && moves(n))
+  let next = restoreMaximizedWhere(nodes, moves)
+  const at = new Map(roots.map((id) => [id, rootPosition(next.find((n) => n.id === id)!, next)]))
+  let dx = to.dx ?? 0
+  let dy = to.dy ?? 0
+  if (to.x !== undefined || to.y !== undefined) {
+    const xs = [...at.values()].map((p) => p.x)
+    const ys = [...at.values()].map((p) => p.y)
+    dx = to.x === undefined ? 0 : to.x - Math.min(...xs)
+    dy = to.y === undefined ? 0 : to.y - Math.min(...ys)
+  }
+  const placedAt = (out: CanvasNode[]): PlaceApplied[] =>
+    roots.map((id) => {
+      const p = rootPosition(out.find((n) => n.id === id)!, out)
+      return { id, x: p.x, y: p.y, restored: wasMaximized.has(id) }
+    })
+  if (dx === 0 && dy === 0) {
+    return restoredAny
+      ? { ok: true, nodes: next, placed: placedAt(next), unknown, carried }
+      : { ok: true, nodes, placed: placedAt(nodes), unknown, carried }
+  }
+  const parents = new Set<string>()
+  next = next.map((n) => {
+    if (!rootSet.has(n.id)) return n
+    if (n.parentId) parents.add(n.parentId)
+    // `+ 0` normalizes a -0 that would otherwise ride out to project.json.
+    return { ...n, position: { x: n.position.x + dx + 0, y: n.position.y + dy + 0 } }
+  })
+  for (const parentId of parents) next = fitAncestorChain(next, parentId, grid)
+  return { ok: true, nodes: next, placed: placedAt(next), unknown, carried }
 }
 
 /**
@@ -2591,8 +2916,12 @@ export function groupSelectedNodes(
 
 /** Returns a copy of a node with a fresh id, offset position, and top-level placement. */
 export function duplicateNode(node: CanvasNode, offset = 28): CanvasNode {
-  const kind: NodeKind = node.type === 'sticky' ? 'sticky' : node.type === 'group' ? 'group' : 'terminal'
+  const kind: NodeKind =
+    node.type === 'sticky' || node.type === 'group' || node.type === 'whiteboard' ? node.type : 'terminal'
   const prefix = kind === 'terminal' ? 'term' : kind
+  // A whiteboard copy starts from the original's drawing: it reads that board (by id) until it
+  // saves its own, so no file is copied and the original is never written by the copy.
+  const whiteboardSource = node.type === 'whiteboard' ? (node.data.whiteboardSource ?? node.id) : undefined
   return {
     ...node,
     id: nextId(prefix),
@@ -2604,7 +2933,14 @@ export function duplicateNode(node: CanvasNode, offset = 28): CanvasNode {
     // the binding would put a phantom run on the issue card (a chip and `#N` with no run-started,
     // then a run-ended when it closes). `openedBy` likewise: nobody's open verb made the copy, and
     // an orchestrator told about it would be told about a station it never opened.
-    data: { ...node.data, initialCommand: undefined, issueRef: undefined, openedBy: undefined }
+    data: {
+      ...node.data,
+      initialCommand: undefined,
+      launchIntent: undefined,
+      issueRef: undefined,
+      openedBy: undefined,
+      ...(whiteboardSource ? { whiteboardSource } : {})
+    }
   }
 }
 
@@ -2869,6 +3205,7 @@ export function nodeStatesToFlow(states: CanvasNodeState[]): CanvasNode[] {
         tags: n.tags,
         collapsed,
         hideFanout: n.hideFanout,
+        mdMode: n.mdMode,
         // Validated at the same seam as the icon below: project.json is hand-editable and shared,
         // and xterm must never be handed a font size outside the Settings range (issue #915).
         terminalFontSize: normalizeTerminalFontSize(n.terminalFontSize),
@@ -2885,8 +3222,15 @@ export function nodeStatesToFlow(states: CanvasNodeState[]): CanvasNode[] {
         textUpdatedBy: n.textUpdatedBy,
         filePath: n.filePath,
         fileMissing: n.fileMissing,
+        // Re-validated: project.json is git-shared and hand-editable, and the core resolves this id
+        // to a file. Anything that is not a plain node id is dropped (the copy shows a blank board).
+        whiteboardSource:
+          typeof n.whiteboardSource === 'string' && isSafeNodeId(n.whiteboardSource) ? n.whiteboardSource : undefined,
+        boardRev: typeof n.boardRev === 'number' && Number.isFinite(n.boardRev) ? n.boardRev : undefined,
         url: n.url,
         partition: n.partition,
+        dockTo: n.kind === 'browser' && typeof n.dockTo === 'string' && RUN_NODE_ID.test(n.dockTo) ? n.dockTo : undefined,
+        runBrowser: n.runConfig ? normalizeRunBrowserConfig(n.runBrowser) : undefined,
         diffStaged: n.diffStaged,
         commitOid: n.commitOid,
         highScore: n.highScore,
@@ -2912,7 +3256,9 @@ export function nodeStatesToFlow(states: CanvasNodeState[]): CanvasNode[] {
         worktree: n.worktree,
         trigger: n.trigger,
         // Hostile-input seam (git-shared file → live data), like `icon` above.
-        runConfig: normalizeRunConfig(n.runConfig)
+        runConfig: normalizeRunConfig(n.runConfig),
+        runSimulator: n.runConfig ? normalizeInlineSimulatorConfig(n.runSimulator) : undefined,
+        simulator: n.kind === 'simulator' ? normalizeSimulatorConfig(n.simulator) : undefined
       }
     }
   })
@@ -2944,7 +3290,11 @@ export function flowToNodeStates(nodes: CanvasNode[], retainInitialCommand = tru
                         ? FILES_SIZE
                         : kind === 'agentsim'
                           ? AGENTSIM_SIZE
-                          : TERMINAL_SIZE
+                          : kind === 'simulator'
+                            ? SIMULATOR_SIZE
+                            : kind === 'whiteboard'
+                              ? WHITEBOARD_SIZE
+                              : TERMINAL_SIZE
   return nodes
     .map((n) => {
       const kind: NodeKind = (n.type as NodeKind) ?? 'terminal'
@@ -2967,6 +3317,8 @@ export function flowToNodeStates(nodes: CanvasNode[], retainInitialCommand = tru
         tags: n.data.tags,
         collapsed: n.data.collapsed,
         hideFanout: n.data.hideFanout,
+        // Closed is written as absent, so every node that never opened the view saves as before.
+        mdMode: n.data.mdMode || undefined,
         // Re-validated on the way OUT, same reasoning as the icon below (issue #915).
         terminalFontSize: normalizeTerminalFontSize(n.data.terminalFontSize),
         // React Flow's node `data` is `Record<string, unknown>`, so the icon comes back out
@@ -2982,8 +3334,12 @@ export function flowToNodeStates(nodes: CanvasNode[], retainInitialCommand = tru
         textUpdatedBy: n.data.textUpdatedBy,
         filePath: n.data.filePath,
         fileMissing: n.data.fileMissing,
+        whiteboardSource: n.data.whiteboardSource,
+        boardRev: n.data.boardRev,
         url: n.data.url,
         partition: n.data.partition,
+        dockTo: kind === 'browser' && typeof n.data.dockTo === 'string' && RUN_NODE_ID.test(n.data.dockTo) ? n.data.dockTo : undefined,
+        runBrowser: n.data.runConfig ? normalizeRunBrowserConfig(n.data.runBrowser) : undefined,
         diffStaged: n.data.diffStaged,
         commitOid: n.data.commitOid,
         highScore: n.data.highScore,
@@ -3009,6 +3365,8 @@ export function flowToNodeStates(nodes: CanvasNode[], retainInitialCommand = tru
         trigger: n.data.trigger,
         // Re-validated on the way OUT too — the shared file is only as good as its last writer.
         runConfig: normalizeRunConfig(n.data.runConfig),
+        runSimulator: n.data.runConfig ? normalizeInlineSimulatorConfig(n.data.runSimulator) : undefined,
+        simulator: kind === 'simulator' ? normalizeSimulatorConfig(n.data.simulator) : undefined,
         premaxRect: n.data.premaxRect
       }
     })

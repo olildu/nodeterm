@@ -38,6 +38,7 @@ import { isPremium as licenseIsPremium, getStoredEntitlement, licensedSeats as l
 import { RELAY_URL, relayAllowed as hostRelayAllowed, mintPairingToken } from './host-service'
 import { canAcceptSeat } from './seat-cap'
 import type { ScopedGuestDeps } from '../../core/relay/scoped-guest-policy'
+import { shareRootProblem } from '../../core/relay/share-root'
 import { revokePeerKey } from './peer-revoke'
 
 /** Thrown (as an Error message) when a new invite would exceed the licensed seat cap. The renderer
@@ -120,7 +121,21 @@ export function initRelayHost(
    * await, then filled in once the listener is wired. Returns the offer to hand to the invited device
    * plus the seat's renderer `id`.
    */
+  /** Why this project may not be the scope of an invite, or null (share-root.ts): a folder that is the
+   *  disk root, the home directory or an ancestor of either (or of userData) would hand the guest every
+   *  file under it. The UI greys such a project out; this is the gate. */
+  function scopeRefusal(projectId: string | undefined): string | null {
+    if (!projectId || !deps.scope) return null
+    return shareRootProblem(deps.scope.projectCwd(projectId), {
+      home: deps.scope.homeDir,
+      dataDir: deps.scope.hostDataDir,
+      realpath: deps.scope.realpath
+    })
+  }
+
   async function addSeat({ projectId, email }: AddSeatOptions): Promise<{ offer: string; id: string }> {
+    const refusal = scopeRefusal(projectId)
+    if (refusal) throw new Error(refusal)
     if (!isPremium()) {
       throw new Error('Remote access requires nodeterm Pro.')
     }
@@ -223,6 +238,19 @@ export function initRelayHost(
     (_e, opts: AddSeatOptions = {}): Promise<{ offer: string; id: string }> =>
       addSeat({ projectId: opts?.projectId, email: opts?.email })
   )
+
+  // Which of these projects may NOT be shared, and why (the invite UI disables them with the reason).
+  // Host-only (`relay:host:` prefix): a relay peer can never ask it.
+  ipcMain.handle(IPC.relayHostScopeProblems, (_e, projectIds: unknown): Record<string, string> => {
+    const out: Record<string, string> = {}
+    if (!Array.isArray(projectIds)) return out
+    for (const id of projectIds.slice(0, 1000)) {
+      if (typeof id !== 'string') continue
+      const problem = scopeRefusal(id)
+      if (problem) out[id] = problem
+    }
+    return out
+  })
 
   // The human compared the SAS and pressed Confirm → advance the trust gate for THAT peer. Only the
   // session named by the id is touched; an unknown id (stale event) or a reserved-not-yet-open seat is

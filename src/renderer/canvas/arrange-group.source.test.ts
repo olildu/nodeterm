@@ -132,7 +132,7 @@ describe('arrange inside a group (source pins)', () => {
   it('arrange --group top runs the same Tidy canvas (or its bands) and writes only on a change', () => {
     const top = groupBranch.slice(groupBranch.indexOf('if (isTopLevelGroupArg(gid))'), groupBranch.indexOf('const groupLayout'))
     expect(top).toContain("TOP_ARRANGE_LAYOUTS.find((l) => l === args.layout) ?? 'tidy'")
-    expect(top).toContain("topLayout === 'lineage' ? arrangeByLineage(live, edges) : tidyCanvas(live, edges)")
+    expect(top).toContain("topLayout === 'lineage' ? arrangeByLineage(live, edges, { gap }) : tidyCanvas(live, edges, { gap })")
     expect(top).toContain('if (next !== live) commitCtlNodes(next)')
     expect(top).not.toMatch(/\barrangeNodes\(/)
   })

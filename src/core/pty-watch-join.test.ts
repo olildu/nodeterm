@@ -270,9 +270,28 @@ describe('joinAsWatcher', () => {
   it('reads the window size only to SPAWN a client — never to join a held session', async () => {
     const m = await tmuxManager(['nt-n1'], { window: { cols: 132, rows: 43 } })
     const read = (m as unknown as { readWindowSize: ReturnType<typeof vi.fn> }).readWindowSize
-    const a = await create(OWNER, { cols: 120, rows: 40 })
+    // The held session is a REMOTE node's (an SSH project's), the case R64/M4 is about: a
+    // `requireRemote` watcher may join it, where a held LOCAL session would be refused
+    // (`held-elsewhere`) and the size rule below would never run. No host is asked anything: the
+    // freshness read answers "absent" so the owner's (mocked) ssh client spawns.
+    const internals = m as unknown as {
+      remoteSessionVerdict: () => Promise<string>
+      captureForResync: (s: string) => Promise<string>
+      paneCursor: (s: string) => Promise<unknown>
+    }
+    vi.spyOn(internals, 'remoteSessionVerdict').mockResolvedValue('absent')
+    vi.spyOn(internals, 'captureForResync').mockResolvedValue('')
+    vi.spyOn(internals, 'paneCursor').mockResolvedValue(undefined)
+    const sshRemote = { controlPath: '/tmp/nt-test-cm-watch-size', conn: { host: 'h', user: 'u' }, remoteCwd: '/srv/app' }
+    const a = await create(OWNER, { cols: 120, rows: 40, requireRemote: true, sshRemote })
+    expect(a.unavailable).toBeUndefined()
+    expect(spawned[0].file).toBe('/usr/bin/ssh')
     await m.joinAsWatcher(WATCHER, WATCH) // a live Session is held and the caller gave a size
-    await m.joinAsWatcher(WATCHER + 1, { persistKey: 'n1', viewerId: 'watch-s2', requireRemote: true }) // no size
+    // No size, and no master (it is down): joins the held remote session.
+    const w = await m.joinAsWatcher(WATCHER + 1, { persistKey: 'n1', viewerId: 'watch-s2', requireRemote: true })
+    expect(w.unavailable).toBeUndefined()
+    expect(w.sessionId).toBe(a.sessionId)
+    expect(spawned).toHaveLength(1)
     expect(read).not.toHaveBeenCalled()
     // The view is shown the held session's own size (nothing to correct, so nothing more is sent).
     expect(fake.sent.filter((x) => x.channel === IPC.ptySize(a.sessionId) && x.to === WATCHER + 1)).toEqual([])
@@ -458,6 +477,24 @@ describe('joinAsWatcher over SSH', () => {
     expect(w.sessionId).toBe('')
     expect(w.unavailable).toBe('ssh')
     expect(spawned).toHaveLength(0)
+  })
+})
+
+describe('spawnRefusal with no ssh binary (Windows without the OpenSSH Client feature)', () => {
+  const SSH_REMOTE = { controlPath: '/tmp/nt-test-cm', conn: { host: 'h', user: 'u' }, remoteCwd: '/srv/app' }
+  const opts = { cols: 80, rows: 24, persistKey: 'n-native', sshRemote: SSH_REMOTE, requireRemote: true } as PtyCreateOptions
+  afterEach(() => vi.unstubAllEnvs())
+
+  it('refused as ssh where ssh is a process; served where the native transport carries it', async () => {
+    ssh.path = null
+    const m = await manager()
+    const refusal = (o: PtyCreateOptions): string | undefined =>
+      (m as unknown as { spawnRefusal(o: PtyCreateOptions): string | undefined }).spawnRefusal(o)
+    vi.stubEnv('NODETERM_NATIVE_SSH', '0')
+    expect(refusal(opts)).toBe('ssh')
+    // The `ssh` sentinel every runner routes to NativeMux: nothing is spawned from it.
+    vi.stubEnv('NODETERM_NATIVE_SSH', '1')
+    expect(refusal(opts)).toBeUndefined()
   })
 })
 

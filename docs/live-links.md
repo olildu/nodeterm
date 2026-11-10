@@ -53,6 +53,7 @@ link"**, the code says **`watchLink`** (owner IPC, `src/core/watch-link/`), the 
 | Output filter | `src/core/watch-link/stream-filter.ts` | Strips string-type escape sequences from the viewer's stream. |
 | Token bucket | `src/core/watch-link/token-bucket.ts` | Per viewer, 256 KB/s sustained, 1 MB burst, for the stream. A controller's input has its own: 64 KiB/s, 256 KiB burst. |
 | Visible capture | `src/core/watch-link/capture-route.ts` + `PtyManager.captureVisible` | The keyframe. Never history. |
+| Read-back | `src/core/watch-link/history.ts` + the desktop's `history` dep (host-chat's `page`) | An agent's CONVERSATION since the link was created, as text (`watch:history`). Never the terminal's history. See "Read-back". |
 | Watcher's own tmux client | `src/core/watch-link/watcher-client.ts` + `PtyManager.joinAsWatcher` / `syncWatcherClientSize` | Only when no owner `Session` is held for the node. |
 | Pty seam | `src/core/watch-link/pty-seam.ts` (`createWatchPty`) | ONE definition of the join rules, both shells wire it. |
 | Store | `src/core/watch-link/store.ts` | `<userData>/watch-links.json`; the secret is sealed, a Control link's password hash is not. |
@@ -72,7 +73,14 @@ hosted scheduler and the REAL browser client `connectWatchClient` over an in-pro
 `linkId` is 16 random bytes chosen by the **server** (base64url, 22 chars): it names a link and
 unlocks nothing. `S` is 32 random bytes chosen by the **host** (base64url, 43 chars), carried in the
 **fragment**, so it never reaches an HTTP request, a server log or a referrer. `1.` versions the
-fragment format. The fragment is not removed from the address bar (the link must stay copyable).
+fragment format. **The viewer page takes the fragment out of the address bar** once it has read it
+(finding L1): it keeps the fragment in `sessionStorage` under `nodeterm.watchLink.<linkId>` and
+`history.replaceState`s the URL to the bare path, so a browser's history (and the history it syncs to
+other devices) holds `/s/<linkId>`, which unlocks nothing. A reload in that tab restores the link from
+`sessionStorage`; a **Copy link** button rebuilds the full link from memory, because the address bar no
+longer holds it. Where `sessionStorage` cannot be written (blocked storage), the fragment stays in the
+address bar as before: a reload must keep working. A bare `/s/<linkId>` opened in a new tab says the
+link is incomplete and how to get the whole one.
 
 Everything is derived from `S` (`keys.ts`), hash-based and synchronous so Node and the browser compute
 identical bytes:
@@ -105,17 +113,25 @@ The viewer protocol's namespace is **`watch:`**, never `watchLink:`. The owner's
 which `relay-host` refuses from every peer as host-only BEFORE any policy runs, so a viewer cast in that
 namespace could never arrive.
 
-Host → viewer: `ev watch:meta {v, role, label, title, expiresAt, cols, rows, control?}` (after EVERY
-join, not only the first: the page leaves "waiting" on a meta; `expiresAt` is `null` for an Unlimited
-link; `control`, this viewer's control state, only on a Control link), pty output as binary
+Host → viewer: `ev watch:meta {v, role, label, title, expiresAt, cols, rows, control?, history?,
+unlockKey?}` (after EVERY join, not only the first: the page leaves "waiting" on a meta; `expiresAt` is
+`null` for an Unlimited link; `control`, this viewer's control state, and `unlockKey`, the connection's
+unlock key (see "The password"), only on a Control link), pty output as binary
 `encodePtyData` frames, `ev pty:size:<sid>`, `ev watch:keyframe {sessionId, screen, altScreen,
 cursor?}`, `ev watch:chat`, `ev watch:waiting {}`, `ev watch:end {reason}`, and on a Control link
-`ev watch:control {state, reason?}` (to ONE viewer: the answer to its unlock, or a change under it)
+`ev watch:control {state, reason?, lockedForMs?}` (to ONE viewer: the answer to its unlock, or a change
+under it; `lockedForMs` beside `locked` says when a timed lock lifts)
 and `ev watch:typing {names}` (to every joined viewer). Viewer → host: `cast watch:chat {name, text}`
 (Commenter and Control; `sanitizeChatText` / `sanitizeChatName` bound the raw value by code point
 before cleaning, drop C0/C1 controls and the bidi controls, and cap at 500 / 32 UTF-16 units without
-splitting a surrogate pair — the same functions the viewer page runs), and on a Control link only
-`cast watch:unlock {name, password}`, `cast watch:input {data}` and `cast watch:release`, plus
+splitting a surrogate pair — the same functions the viewer page runs. A NAME also loses every other
+invisible character, all of Unicode's format characters (Cf: zero-width space and joiners, word joiner,
+soft hyphen, tag characters) and the letters that draw as blank space (the Hangul fillers, the Braille
+blank, the combining grapheme joiner), so two names that look alike are alike (finding L4). Chat TEXT
+loses the same format characters but the two joiners writing needs: U+200D holds emoji sequences
+together and U+200C spells Persian and the Indic scripts), and on a Control link only
+`cast watch:unlock {sealed: {key, nonce, box}}` (or, from a page older than sealing,
+`{name, password}`), `cast watch:input {data}` and `cast watch:release`, plus
 `trust:confirm` and keepalives. **There is no resize, mouse or flow message in the protocol, and
 input is accepted only from a viewer that unlocked a Control link** (the paste-framing contract is
 written beside `WATCH_INPUT_CAST` in `protocol.ts`). Every addition is additive, so
@@ -130,8 +146,8 @@ A viewer is a core client, so the risk of this design is that some existing outb
 Two independent layers close that, plus deny-by-default in both directions.
 
 **Inbound** (`watcherAccess`): every request and every cast is refused, except these **casts** (never
-requests): `watch:chat` on a Commenter or Control link, and `watch:unlock`, `watch:input` and
-`watch:release` on a Control link. The policy knows only the role. Whether THIS viewer may type is
+requests): `watch:history` on every link (see "Read-back"), `watch:chat` on a Commenter or Control link,
+and `watch:unlock`, `watch:input` and `watch:release` on a Control link. The policy knows only the role. Whether THIS viewer may type is
 the link host's state for this connection (`controlling`, set by a right password), and the link host
 treats input from a viewer that is not controlling as a breach (except within 5 s of losing control,
 see "The Control role"). Host-only channels are refused `E_FORBIDDEN` by relay-host before the hook
@@ -244,9 +260,14 @@ A keyframe is `PtyManager.captureVisible(sessionId)`: **the visible screen, neve
   what makes it visible-only);
 - **SSH:** the same over the project's ControlMaster (`remoteCaptureVisibleArgs`), again without the
   `-S -200` the existing remote builder always adds; proven under a real `/bin/sh`;
-- **Windows session host and the direct Windows pty: none.** `sessionHostCapture` returns ~200 lines of
-  scrollback, not the visible screen; a visible-only read needs an additive, negotiated session-host
-  command (a follow-up). Never history instead. **A plain shell with no tmux: none.**
+- **Windows session host:** the host's negotiated `captureVisible` (`sessionHostCaptureVisible`) — the
+  visible rows of its headless emulator's ACTIVE buffer, the viewport cursor, and `altScreen` from that
+  buffer (no tmux client sits between the pane and the stream, so the pane's buffer IS the stream's;
+  this is the one route whose capture sets `VisibleCapture.altScreen`, and the link host prefers it over
+  the join's). It keeps the private-mode tail (bracketed paste, application cursor keys, mouse) a
+  mid-stream viewer never saw. A host from a build before the feature answers nothing, so `unavailable`;
+  never the ~200-line scrollback `capture` in its place.
+- **The direct Windows pty: none.** **A plain shell with no tmux: none.**
 - **A Zellij node (the optional local backend, `settings.sessionBackend`): none.** Its Session is marked
   `tmuxBacked` like a tmux one, but there is no tmux session to capture, so `visibleCaptureRoute` routes
   it to none rather than aiming the tmux socket at it. A viewer still co-attaches to a Zellij painter
@@ -280,6 +301,44 @@ share a capture already running, any other keyframe needs one started after it a
 sequence makes sure an older result is never painted after a newer one. A session found gone after a
 join or a capture (`alive()`, R30) takes the lifecycle path, not a keyframe. Split panes: a keyframe
 captures the ACTIVE pane only; the stream repairs the rest as tmux redraws.
+
+## Read-back (`watch:history`)
+
+A viewer could not scroll at all, and that is structural, not a missing scrollbar: the stream is a tmux
+CLIENT, which paints on the alternate screen, so the page's emulator never holds a line above the
+screen, and a keyframe is the visible screen only. On an agent node even tmux has nothing: Claude's
+fullscreen TUI keeps its conversation on the pane's own alternate screen, where tmux records no history.
+And letting a viewer drive tmux copy-mode is not an option: copy-mode belongs to the PANE, so the
+viewer would scroll the owner's screen too.
+
+So a viewer reads back the agent's CONVERSATION instead, as text, in a panel laid over the live terminal.
+
+- **The cutoff is the link's creation, enforced on the host.** `historyPageFrom` (`history.ts`) keeps a
+  message only when its time is at or after `record.createdAt`; a message with no time is never sent
+  (nothing proves it came after), and paging stops at the first window that reaches back past the link.
+  `readHistoryPage` (protocol.ts, vendored) applies the same cutoff again on BOTH ends. An agent whose
+  reader records no times (grok) answers `untimed` rather than an empty "nothing yet".
+- **What travels:** user prompts and assistant text, tool NAMES and their short argument (the chip's
+  200-char `arg`), and a plan/question body (the screen shows it in full). Never a tool RESULT and never
+  thinking. Every string is cleaned (controls, ESC, bidi), capped per part (20,000 units), per page (200
+  messages, 400,000 units, newest kept). Measured on a real 3.8 MB transcript: a 512 KB window held 44
+  messages, the cut at its middle sent 22, 9.6 KB of JSON, and none of the window's 22 tool results.
+- **The read is the phone Chat screen's** (`host-chat.ts` → `readChatTranscript`): the node from this
+  machine's records, the renderer's session id first, an SSH node read on its host and never here (a
+  remote read that cannot happen is an `error` page). The service binds it to the link's own node: a
+  viewer sends only a cursor (`{ before }`, the previous page's `olderCursor`). `watch:meta` carries
+  `history: true` when the node's agent is `canChat`.
+- **Bounded per viewer:** one read at a time, at most one every 500 ms (`HISTORY_MIN_INTERVAL_MS`); a
+  request that arrives meanwhile waits and the newest one wins, so a viewer asking in a loop never
+  becomes a read loop. A malformed request is ignored (the cast is admitted, like a malformed chat line).
+  A failed read is an `error` page, never an empty one.
+- **Clock skew:** `createdAt` is this machine's clock and a remote agent's timestamps are its host's. A
+  host clock ahead of ours can show a message from just before the link; one behind can hide one from
+  just after. The skew between two NTP-synced machines is milliseconds.
+- **Surfaces:** Desktop wires it (`main/index.ts`, late-bound to `hostBridge.chat`, pinned by
+  `watch-link-wiring.test.ts`). The Server Edition hosts no links. A plain terminal has no read-back
+  (no `history` in its meta; the viewer page offers nothing). Mobile: N/A (the phone does not view
+  links).
 
 ## The watcher's own tmux client and sizing
 
@@ -362,6 +421,25 @@ Control is per CONNECTION, never per session or per person: a reconnect unlocks 
   ~82 ms on libuv's 4-thread pool (Node's default `maxmem` refuses these parameters; it is raised to
   64 MiB). A run waits for a slot; it is never refused.
 - **The password never leaves the E2E tunnel**: the relay and the API never see it.
+- **It is sealed to the connection, not only to the tunnel** (finding L3, `unlock-seal.ts`). The
+  tunnel's keys are not secret from a link holder: both key pairs derive from `S`, and the session key
+  from those and two nonces sent in the clear, so a holder of the link AND a recording of the relay
+  traffic could read every connection of it. So the host makes a fresh X25519 key pair for each viewer
+  connection of a Control link (`nacl.box.keyPair()`, derived from nothing, zeroed when the connection
+  ends) and offers its public half in that connection's every meta (`unlockKey`); the page seals
+  `{name, password}` with `nacl.box` from a fresh key pair of its own and sends that pair's public key,
+  the nonce and the box (`{sealed: {key, nonce, box}}`). Neither secret key leaves its end, so a
+  recording opens nothing. The vendored client does it by itself: once a meta on the connection offered
+  a key it seals every unlock, and never sends one in the clear on that connection again, even if a
+  later meta offers none. **Compatibility**: a page from before sealing sends `{name, password}` in the
+  clear, and the host still accepts it (an old cached page keeps working); a new page facing a host
+  from before sealing (no `unlockKey`) sends it in the clear as before. A connection that sent a sealed
+  unlock is latched: a plain one after it is refused as malformed (counted, never verified). A sealed
+  unlock that does not open with the connection's key (sealed to another connection's, malformed, over
+  4096 base64 characters) is malformed too. **What it does not cover**: an ACTIVE attacker holding the
+  link who sits on the relay can still answer the page as the host (the host's key pair derives from
+  `S`) and offer a key of its own; and what a controller TYPES after unlocking rides the tunnel as
+  before, readable to a link holder with a recording.
 
 ### Unlocking
 
@@ -384,8 +462,21 @@ reason?}`. In order:
    on the record and writes — at most 10 writes per link, the 10th riding the lock's own write — so an
    app restart resets neither (a file written before the count existed reads as 0). The lock demotes
    every controller and tells every viewer; the 11th attempt is answered `locked` unverified. The link
-   keeps working as a Commenter link. Only the owner's **Allow control again** clears the lock, and it
-   resets the count; a **new password** resets the count too.
+   keeps working as a Commenter link. **The lock lifts by itself** (finding L2: any link holder could
+   otherwise lock control for everyone, for good): 15 minutes for the first lock since the owner last
+   allowed control, doubling with each later one (30 min, 1 h, … 16 h), never past 24 h
+   (`controlLockMs`, `CONTROL_LOCK_MAX_MS`). When it lifts the count starts over and every viewer is
+   told `available`; the backoff (`control.lockStep`) does not reset, so a griefer who keeps locking it
+   gets 10 guesses per 24 h at most. When it lifts is persisted (`control.lockedUntil`, this machine's
+   clock), so a restart neither lifts it early nor makes it permanent: a lift time that passed while
+   nodeterm was closed is lifted at launch BEFORE the host is built (it starts from a count of 0), and
+   one further off than 24 h (the clock went back, a hand edit) is brought in to 24 h from now. A lock
+   written before timed locks (`locked` with no `lockedUntil`) keeps its meaning: it waits for the
+   owner. The owner's **Allow control again** lifts it at once and resets the count AND the backoff; a
+   **new password** resets the count (not the lock, not the backoff). Every viewer is told how long a
+   timed lock lasts (`lockedForMs`, from when the host sent it, in the lock event, in an unlock refused
+   `locked`, and in a later meta); the page says when control can be asked for again. The owner's notice
+   names who tipped it (see "The owner's controls").
 6. A check is re-checked after its await. An ended viewer, a stopped host, or any change to control
    meanwhile (typing off, a new password, the lock: the control epoch) voids it, uncounted (`too-soon`,
    or the new state).
@@ -612,9 +703,14 @@ everything.
   password** was pressed (it holds the only copy of the password); Escape and Done still close it.
 - A password save in flight holds the popover open (an outside click and Escape do nothing) for up to
   30 s; after that the owner sees "Couldn't confirm the new password. Check the link before sharing it."
-- The lock is set on the record synchronously when the host asks for it, written, and never undone by
-  a failed write. The owner gets the sticky `control-locked` notice ("Control of api-server was locked
-  after 10 wrong passwords. Allow it again from the LIVE chip.").
+- The lock is set on the record synchronously when the host asks for it, with its lift time, written,
+  and never undone by a failed write (it still lifts at its time). The owner gets the sticky
+  `control-locked` notice, which says until when and who tipped it — the name the 10th attempt gave
+  itself, else the chat name of the connection that sent it, as a claim, else "a viewer" — so a kick and
+  a new password are obvious: "Control of api-server is locked until 14:47 after 10 wrong passwords; the
+  last came from a viewer using the name “Mert”. Allow it again from the LIVE chip." The popover's and
+  the drawer's locked line reads "Control locked after 10 wrong passwords, until 14:47." (a lock from
+  before timed locks keeps the old sentences).
 
 ### The create dialog
 
@@ -666,14 +762,24 @@ A **Take control** button opens a small form: a name (prefilled from the chat na
 On a grant the terminal takes the keyboard, the header says "You can type" with **Release**, and input
 goes out batched per animation frame. Errors say what happened (wrong password; too many wrong
 passwords, the sharer has to allow control again; the sharer turned typing off; wait a moment and try
-again; this terminal can't be typed in from a link). A password change shows "Control ended. Take
-control again to type.". While typing:
+again; this terminal can't be typed in from a link). A timed lock says when control can be asked for
+again: "Too many wrong passwords. You can ask for control again at 14:47, or sooner if the sharer allows
+it." (a lock from a host older than timed locks keeps "The sharer has to allow control again."). A
+password change shows "Control ended. Take control again to type.". While typing:
 
 - **The keyboard exit chord**: Ctrl+Shift+. (⇧⌘. on a Mac), matched on the physical Period key, moves
   focus from the terminal to Release. It is never sent to the pane. Without it, the terminal would be a
   keyboard trap.
 - The wheel does nothing on the alternate screen (xterm would turn it into arrow keys, which would
   recall prompt history into the input line).
+
+**Scroll back** (every role, when the meta says `history: true`): a header button, and scrolling UP over
+the terminal on the alternate screen while NOT typing, open a reading panel over the terminal: "Since
+the link was shared", prompts and the agent's replies with times, tool chips, older pages loaded when
+the viewer reaches the top, and a line saying where it starts ("The link was shared at 14:02. Nothing
+before that is shared." / "Start of the conversation."). **Back to live** or Escape closes it; the
+stream keeps running underneath. A request lost with a dropped connection is sent again on the next
+one. While typing, the wheel never opens it (the button still does).
 - Mouse tracking stays swallowed: no mouse input is ever sent, and selection stays local.
 - On a phone, a grant after a script moved the focus opens no keyboard, so the page asks for a tap
   ("Tap the terminal to type.").
@@ -853,7 +959,7 @@ launch); never in the Server Edition. This machine's links stop at once; then th
 **awaited** and its answer reported (`RevokeAllOutcome`: `stopped`; `no-entitlement`, the server was not
 asked; `failed`; `unsupported`), a success included. The confirm names the timing: this machine's
 viewers at once, other machines' links within a few minutes (their next mint, ≤ ~90 s, or a full link's
-status poll, ≤ 5 min).
+status poll, ≤ 1 min).
 
 **The listener pool.** One hosted scheduler per link with `maxBridged: 10`: at 10 bridged viewers no
 replacement listener opens, so the broker closes an 11th client ("no host waiting"). The scheduler's
@@ -864,7 +970,8 @@ the broker's exp + 30 s close of an unbridged listener), backoff reset only on p
 
 **Server 410.** The relay checks a token only at join and cannot cut a bridge; the host does. A
 server-side revoke reaches the host through its next mint (≤ ~90 s) — or, while the link is FULL (no
-idle listener, so no mint), through a status poll every 5 min (`FULL_STATUS_POLL_MS`). A 410 from either
+idle listener, so no mint), through a status poll every 60 s (`FULL_STATUS_POLL_MS`; it was 5 min,
+finding L6 — it runs only while the link is full, one request per minute). A 410 from either
 ends the link locally with the reason it names and tells the owner.
 
 **Entitlement re-arm** (R41). A host never mints with an empty entitlement (the API would answer 400,
@@ -911,16 +1018,24 @@ carry it to teammates and the canvas authority would write it into the git-share
   untouched. **Availability is
   checked before the Pro gate** (`liveLinkUnavailable` then `requireProOr`), so a Server Edition or relay
   tab never sees an Upgrade dialog; an unavailable row is disabled with its reason, never hidden.
-- **Desktop where local terminals are not tmux** (Windows' session host; tmux switched off or missing;
-  the Zellij backend): there is no watcher client of its own, so a viewer can co-attach only to a
-  terminal this app has OPEN (mounted, or parked) — after a restart, for a background project or an
+- **Windows' session host** has its own read-only client: a join-only create (a watcher, or a hosted-relay
+  viewer) for a node this app does not hold asks the host STRICTLY (`hasSession`; an unanswered probe
+  refuses) and joins through `watch-attach` — an attachment with no geometry claim and no pause ticket,
+  whose writes and resizes the host refuses and which never spawns. It is never indexed as the node's
+  session, so an owner opening the node gets its own typing attachment. A host from an older build
+  lacks the feature: refused (`join-only`), never an ordinary attach that would cast the viewer's size.
+  The create dialog's note follows `tmuxStatus().persistence.watchJoin` (the CONNECTED host's answer).
+  Control typing needs the node open WHEN THE VIEWER JOINS: a viewer that joined through `watch-attach`
+  keeps that read-only attachment (its input route is decided at join, `none`) even after the owner
+  opens the node, until it rejoins (the session ends, or the link reconnects).
+- **Desktop where local terminals are neither tmux nor such a session host** (tmux switched off or
+  missing; the Zellij backend; an older host): there is no watcher client of its own, so a viewer can
+  co-attach only to a terminal this app has OPEN (mounted, or parked) — after a restart, for a background project or an
   offscreen-released node, viewers wait. This is said, never silent (R63): the create dialog states it
   before the link exists (`watchableOnlyWhileOpen`, from the local core's `tmuxStatus().persistence`; an
   SSH project's node is served by the host's tmux and gets no note), and while a viewer's join is
   refused the chip turns amber (`LIVE · 1 waiting`) and its title and the popover say "Viewers are
-  waiting — open this terminal in nodeterm to let them watch." The fix is a session-host watcher join
-  (an additive, negotiated attach-only subscribe with no size vote, beside the visible capture): a
-  follow-up.
+  waiting — open this terminal in nodeterm to let them watch."
 - **The LIVE chip** (`LiveLinkChip`, one component): node header (beside `PresenceChips`), kanban card,
   card modal header, sessions-sidebar row. `● LIVE`, `● LIVE · 2`, `LIVE · 3 · 1 typing` (someone typed
   in the last 4 s; the title names who, quoted), amber `LIVE · offline` (reconnecting), amber `LIVE · 1
@@ -978,7 +1093,13 @@ From the spec, verbatim:
   link a kicked controller can reconnect and unlock again: to take typing from a person, change the
   password or turn typing off.
 - **Residual — the fragment lives in browser history** and can be synced by the browser to the
-  viewer's other devices. Answered by the short default expiry and Stop.
+  viewer's other devices. **Closed by the viewer page** (finding L1): it moves the fragment into the
+  tab's `sessionStorage` and strips it from the address bar, so history keeps only `/s/<linkId>`. What
+  remains: the moment between the page loading and the strip (the history entry is replaced, not
+  added); a browser that restores a closed tab or a crashed session also restores its
+  `sessionStorage`, so session-restore files still hold the fragment while that tab can be restored;
+  every page of nodeterm.dev opened later in the same tab can read it (our own scripts only — no
+  third-party script runs on the site); and a browser that blocks storage keeps the old behaviour.
 - **Residual — the owner-supplied label and node title are shown to viewers.** They are rendered as
   text inside fixed nodeterm chrome, marked as sharer-set; terminal output cannot draw over the
   chrome and has no clickable links.
@@ -989,8 +1110,8 @@ Found while building it:
   per viewer at a 2.7 MB/s flood (measured), ≤ 10 viewers per link.
 - **Text typed with no escape after a co-attach join lags** until the next escape or the 2 s keyframe
   (R23): the mid-stream filter swallows it by design.
-- **On a backend with no visible capture** (Windows session host, direct Windows pty, plain shell,
-  Zellij) a throttled viewer shows gaps until the app repaints (R36). A Zellij node with no painter held
+- **On a backend with no visible capture** (a session host from an older build, direct Windows pty,
+  plain shell, Zellij) a throttled viewer shows gaps until the app repaints (R36). A Zellij node with no painter held
   in this process (a closed project, after a restart) cannot be watched at all until one is.
 - **A single capture failure on a tmux/SSH backend is treated as "no capture"**: no repaint until the
   next keyframe or the app's redraw. Retrying there would stall the stream for good on the backends that
@@ -1005,9 +1126,10 @@ Found while building it:
   agents included) or a session switch (`C-b (` / `)`) reaches every viewer. It is the owner's own
   action, shown on the owner's own screen too, and the create dialog's warning says so. Following
   `#{client_session}` and treating a switch as a lifecycle event is a possible follow-up.
-- **Windows, and any machine whose local terminals are not tmux:** a link to a terminal that is not
-  open in the app cannot be watched until it is (Surfaces, above). Said, never silent; the session-host
-  watcher join is the follow-up.
+- **Any machine whose local terminals are neither tmux nor a `watch-attach` session host:** a link to a
+  terminal that is not open in the app cannot be watched until it is (Surfaces, above). Said, never
+  silent. On the session host, Control typing still needs the node open at the moment the viewer joins (a
+  viewer already riding a `watch-attach` attachment is not upgraded when the owner opens the node).
 - **A tmux < 3.2 host cannot be watched** (fail closed, "waiting").
 - **After a run whose index was missing, unreadable or corrupt, node-gone waits for the next launch**
   (R44/R54): a link to a node deleted in that run lives until its expiry (≤ 24 h) — an Unlimited link
@@ -1039,10 +1161,24 @@ From the Control spec (§6), in substance:
   terminal, for as long as the link lives, which with Unlimited is until Stop. The dialog says so, and
   names the machine. The password is the second factor: the link alone grants watching and chat.
 - **Brute force needs the link first**, then runs into the host-side throttles: 1 attempt per 2 s per
-  viewer, 3 wrong per connection, 10 wrong per link before control locks (persisted; only the owner
-  clears it). The hash is scrypt, and only a person who can already read the owner's userData has it.
+  viewer, 3 wrong per connection, 10 wrong per link before control locks (persisted; it lifts by itself
+  after 15 minutes, doubling per lock to 24 h, and the owner can lift it sooner). Over a day that is at
+  most a few dozen guesses at first and 10 per day once the backoff reaches 24 h. The hash is scrypt,
+  and only a person who can already read the owner's userData has it.
+- **Any link holder can still lock control for a while** (finding L2): 10 wrong attempts lock it for
+  everyone. It used to be until the owner acted; now it lifts by itself, and the owner's notice names the
+  name the attempt that tipped it gave. The host cannot see a viewer's address (the relay hides it), so
+  nothing counts per person. The same holder can still fill the link's 10 viewer slots or spend its
+  host-token budget by reconnecting (the backend's per-link limits); Stop and a new link end that.
+- **The unlock is sealed per connection, the typing is not** (finding L3): a holder of the link with a
+  recording of the relay traffic cannot read a password a controller typed (it is sealed to a key pair
+  derived from nothing), but CAN read everything that controller typed after unlocking, and everything
+  the terminal showed (the tunnel's keys derive from the link). An active attacker on the relay holding
+  the link can answer as the host and read the password too. A page or host from before sealing sends
+  and accepts the password in the clear, as before.
 - **Named controllers are not authenticated.** A name is a claim, like a chat name, and is shown quoted
-  as one. Everyone who unlocked holds the same password. Accountability is "who was connected and
+  as one. It cannot hide an invisible character (finding L4), so two names that look alike are the same
+  name; look-alike letters from other scripts (a Cyrillic "а") still pass. Everyone who unlocked holds the same password. Accountability is "who was connected and
   typing, by their own word", not identity.
 - **What stays out of reach** (host-enforced): the canvas, other terminals and other sessions (pane
   delivery: the tmux prefix never reaches tmux), files and git; resizing; the owner's IPC
@@ -1376,3 +1512,47 @@ The final review's fixes:
     pastes in under 20 ms (a script on the viewer page). Expect: the first 64 chunks land, the rest of that
     batch does not, the viewer sees "Some of your input didn't reach the terminal.", and typing right after
     works.
+
+Read-back (`watch:history`):
+
+98. **Claude node, Viewer link:** share a Claude node, have it answer two prompts, open the link, scroll
+    up over the terminal. Expect: "Since the link was shared" opens with both prompts and replies, tool
+    chips without their output, and "The link was shared at …" at the top; a prompt from before the
+    link is not there. Back to live returns to the terminal, which kept streaming.
+99. **Long session:** a link on a node whose conversation since sharing is longer than one page. Expect:
+    scrolling to the top of the panel loads earlier messages without jumping, and stops at the share line.
+100. **SSH node:** the same over an SSH project's Claude node. With the ControlMaster down, the panel says
+    "Couldn't read the conversation." with Try again — never an empty conversation.
+101. **Plain terminal / grok:** a plain terminal's link shows no Scroll back button; a grok node's says
+    its conversation records no times.
+102. **Phone:** Scroll back on a phone opens a panel tall enough to read and scrolls inside it.
+
+Security hardening (findings L1–L6):
+
+103. **Address bar (L1):** open a link in Chrome, Safari and Firefox. Expect: once the page has loaded the
+    address bar shows `/s/<id>` with no `#…`; the history menu and a synced device's history show no
+    fragment; Reload keeps watching; **Copy link** copies the full link, which opens in a new window; a
+    bare `/s/<id>` pasted into a new tab says the link is incomplete; pasting a different link into the
+    same tab loads that link. With site data blocked (Chrome "Block third-party cookies" is not enough —
+    block all site data for nodeterm.dev) the fragment stays in the address bar and Reload still works.
+104. **Session restore (L1):** close the viewer tab and reopen it (⇧⌘T), then quit the browser and
+    restore the session. Note whether the tab watches again (the browser restored `sessionStorage`) —
+    expected yes in Chrome and Firefox; it is the residual the doc names.
+105. **Timed lock (L2):** from browsers, 10 wrong passwords on a Control link. Expect: the owner's sticky
+    strip "Control of … is locked until HH:MM after 10 wrong passwords; the last came from a viewer using
+    the name “…”."; the popover reads "Control locked after 10 wrong passwords, until HH:MM."; the viewer
+    page reads "Too many wrong passwords. You can ask for control again at HH:MM, or sooner if the sharer
+    allows it." 15 minutes later every viewer's Take control is enabled again, the strip's popover line
+    is gone, and the right password works; the next lock lasts 30 minutes; Allow control again lifts it
+    at once and the lock after that lasts 15 minutes again.
+106. **A lock across a restart (L2):** lock a link, quit nodeterm, start it again within 15 minutes:
+    still locked, lifting at the same time. Lock again, quit for longer than the lock: at launch the link
+    is unlocked and the right password works at once.
+107. **Sealed unlock (L3):** unlock with the new page against the new desktop (works); with the new page
+    against a desktop build from before this change (works, in the clear, as before); with a page cached
+    from before this change against the new desktop (works). A wrong password still counts in all three.
+108. **Invisible names (L4):** chat as "Sharer" followed by a zero-width space (paste it): the name shows
+    and is announced as "Sharer", identical to a plain "Sharer"; an emoji with a ZWJ (👩‍💻) in a chat
+    MESSAGE survives, in a NAME it becomes 👩💻.
+109. **Stop all reaches a full link (L6):** fill a link's 10 viewer slots, then Stop all from another
+    machine. Expect: the viewers see "The sharer stopped this live link." within about a minute.

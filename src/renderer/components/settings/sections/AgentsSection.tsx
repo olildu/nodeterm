@@ -40,13 +40,14 @@ import {
   unsupportedModesNote
 } from '@shared/agents/approval-mode'
 import { codexApprovalCaps } from '@renderer/state/codexCli'
+import { codexIdentityCapsNow } from '@renderer/state/codexIdentity'
 import { AgentIcon } from '../../../lib/agentIcons'
 import { chipFor } from '../../../lib/keybindingOverrides'
 import { NODE_IDENTITY_STRICT_DATE } from '@shared/node-identity'
 import {
   CONFIRM_WAIVABLE_VERBS,
-  pruneControlConfirmWaivers,
-  sanitizeControlConfirmWaivers
+  sanitizeControlConfirmWaivers,
+  withProjectWaiver
 } from '@shared/control-confirm'
 import { useControlConfirm } from '../../../state/controlConfirm'
 import { SegmentedPill } from '@renderer/ui/SegmentedPill'
@@ -67,7 +68,7 @@ const ROWS = {
   },
   agents: {
     title: 'Show in Add menus',
-    keywords: ['agent', 'claude', 'codex', 'gemini', 'enable', 'disable', 'show', 'hide', 'menu', 'default']
+    keywords: ['agent', 'claude', 'codex', 'gemini', 'cursor', 'enable', 'disable', 'show', 'hide', 'menu', 'default']
   },
   launchCommands: {
     title: 'Launch commands',
@@ -85,7 +86,8 @@ const ROWS = {
       'codex',
       'gemini',
       'grok',
-      'opencode'
+      'opencode',
+      'cursor'
     ]
   },
   vanillaLaunch: {
@@ -127,6 +129,7 @@ const ROWS = {
       'grok',
       'gemini',
       'codex',
+      'cursor',
       'approval',
       'shift tab'
     ]
@@ -381,18 +384,11 @@ export function AgentsSection({ isActive }: { isActive: boolean }): React.JSX.El
     }))
     .filter((r) => r.name !== undefined)
     .sort((a, b) => (a.name ?? '').localeCompare(b.name ?? ''))
-  /** Revoke one verb's per-project waiver. Prunes dead projects in the same write — this section
-   *  is the only surface that ever sees the whole map, so it is the natural place to tidy it. */
+  /** Revoke one verb's per-project waiver. Prunes dead projects in the same write, through the one
+   *  merge every per-project writer shares (`withProjectWaiver`). */
   const revokeProjectWaiver = (projectId: string, verb: string): void => {
     const live = new Set(allProjects.map((p) => p.id))
-    const pruned = pruneControlConfirmWaivers(waivers, live)
-    const rest = (pruned.projects?.[projectId] ?? []).filter((v) => v !== verb)
-    const projects = { ...(pruned.projects ?? {}) }
-    if (rest.length) projects[projectId] = rest
-    else delete projects[projectId]
-    update({
-      controlConfirmWaivers: sanitizeControlConfirmWaivers({ ...pruned, projects })
-    })
+    update({ controlConfirmWaivers: withProjectWaiver(waivers, projectId, verb, false, live) })
   }
   const activeProjectId = useProjects((s) => s.activeProjectId)
   const activeProject = useProjects((s) => s.projects.find((p) => p.id === activeProjectId))
@@ -550,6 +546,11 @@ export function AgentsSection({ isActive }: { isActive: boolean }): React.JSX.El
                   Overrides the managed per-node launcher — sessions join as plain clients.
                 </span>
               ) : null}
+              {hasSharedIdentity(id) && codexIdentityCapsNow().unavailableReason === 'unsupported-platform' ? (
+                <span className="text-[12px] text-muted">
+                  Shared Codex app-server is not available on Windows yet; each node runs its own codex.
+                </span>
+              ) : null}
             </div>
           ))}
         </div>
@@ -684,10 +685,10 @@ export function AgentsSection({ isActive }: { isActive: boolean }): React.JSX.El
             <FieldRow
               label="Waived in these projects"
               // The rule this section exists for: every loosening stays visible and revocable. A
-              // per-project waiver is granted from a DIALOG, which is gone the moment it is
-              // answered — so without this row the grant would be permanent, invisible, and
-              // findable only by hand-editing settings.json.
-              description="You chose \u201cDon\u2019t ask again for agents in \u2026\u201d in an agent\u2019s dialog. These survive restarts, and apply only to agents running in the project named. A project you delete takes its waivers with it."
+              // per-project waiver is granted from a DIALOG (gone the moment it is answered) or a
+              // project tab's menu (one project at a time) — so this row is the one consolidated list
+              // of grants across every project.
+              description="You chose \u201cDon\u2019t ask again for agents in \u2026\u201d in an agent’s dialog, or switched it on in the project tab’s “Agents may, without asking” menu. These survive restarts, and apply only to agents running in the project named. A project you delete takes its waivers with it."
               control={
                 <div className="flex flex-col items-end gap-2">
                   {projectWaiverRows.map((row) =>

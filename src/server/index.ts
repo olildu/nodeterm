@@ -1,4 +1,5 @@
 import { subagentReplay } from '../core/subagent-replay'
+import { registerAgentStatusSnapshotIpc } from '../core/agent-status-snapshot'
 import fs from 'fs'
 import { readAgentSessionName } from '../core/agent-session-name'
 import { startSessionNameSweep, displayNodeTitle } from '../core/session-name-sweep'
@@ -10,7 +11,7 @@ import { ServerPlatform } from './platform-server'
 import { Auth } from './auth'
 import { createHttpHandler } from './http'
 import { attachWsServer } from './ws'
-import { describeTrustedNets } from './proxy-trust'
+import { authBootMessages } from './auth-boot-messages'
 import type { ServerConfig } from './config'
 
 import { initPlatform } from '../core/platform'
@@ -50,6 +51,7 @@ import { installLogSink } from '../core/log-sink'
 import { registerLogHandlers } from '../core/log-handlers'
 import os from 'os'
 import { hookServer } from '../core/agents/hook-server'
+import { wireClaudePaneOrigin } from '../core/agents/claude-pane-origin'
 import { serverEditionControlHandler } from './control-unsupported'
 import { initServerCanvasControl, serverCanvasShimPath, type ServerCanvasControl } from './canvas-control'
 import { registerStationNoticeIpc } from '../core/agents/station-notice'
@@ -91,7 +93,8 @@ import {
   setNodeHibernated,
   seedNodeIdentities,
   sessionNameSweepEntries,
-  nodeSessionName
+  nodeSessionName,
+  nodesForAgentSession
 } from '../core/agent-status-mirror'
 import { mirrorCustomAgents } from '../core/mirror-custom-agents'
 import { createPushNotify, createLiveUpdatePush } from '../core/push-notify'
@@ -231,15 +234,13 @@ export async function startServer(
 
   const auth = new Auth(config.dataDir)
   if (config.passwordSeed && !auth.isConfigured()) auth.setPassword(config.passwordSeed)
-  if (config.trustProxy) {
-    // Loud on purpose: this line is the operator's one chance to notice a trust
-    // misconfiguration (wrong header name, or nets wider than the proxy's own subnet).
-    console.log(
-      `⚠️  Proxy header trust ENABLED: requests from [${describeTrustedNets(config.trustProxy.nets)}] ` +
-        `carrying a non-empty "${config.trustProxy.header}" header are authenticated WITHOUT a ` +
-        `password. Ensure ONLY your SSO reverse proxy can reach this server from those networks, ` +
-        `and that it strips/overwrites this header on client requests.`
-    )
+  // Loud on purpose: these lines are the operator's one chance to notice a sign-in
+  // misconfiguration (header trust refused for want of a secret, nets wider than the proxy's own
+  // subnet, a short seeded password). See auth-boot-messages.ts.
+  {
+    const { errors, notices } = authBootMessages(config)
+    for (const line of errors) console.error(line)
+    for (const line of notices) console.log(line)
   }
   if (!config.headless && !auth.isConfigured()) {
     // No password set yet: print the one-time setup URL so the operator can bootstrap.
@@ -275,7 +276,8 @@ export async function startServer(
     console.warn('[model-gateway] could not migrate the legacy API key to secret storage', error)
   }
   // Agent-integration consent (issue #744): grandfather an install from before this feature (our own
-  // hook scripts / shims are on disk) as enabled, before any browser can load settings.
+  // hook scripts are on disk) as enabled, before any browser can load settings. Decided once per
+  // install: a first boot without evidence is marked fresh and never grandfathered later (#1149).
   if (config.installHooks !== false) {
     try {
       const grandfathered = resolveIntegrationConsentAtBoot(
@@ -375,7 +377,8 @@ export async function startServer(
     getSettings: () => settingsStore.get(),
     onSettingsChange: (cb) => settingsStore.onChange(cb),
     downloadTickets,
-    localProjectCwd: (projectId: string) => workspaceStore.localCwdForProject(projectId)
+    localProjectCwd: (projectId: string) => workspaceStore.sideFilesFolderForProject(projectId),
+    whiteboardLocation: (projectId: string) => workspaceStore.whiteboardLocationForProject(projectId)
   })
   // Project setup/archive runner — same construction as src/main/index.ts, and the SAME
   // `registerProjectSetupHandlers` trust boundary (project-setup-handlers.ts): it derives rootPath/
@@ -413,6 +416,10 @@ export async function startServer(
   // on the desktop it would also reach relay peers. A headless server with nobody attached simply
   // gets no answer, the prompt expires, and the shared value stays unused: fail closed on the
   // grant, fail open on the spawn.
+  // A node owned by an SSH project is never spawned on THIS machine (issue #1186). This shell has
+  // no SSH-project manager, so such a node cannot run anywhere here — refusing is the honest answer,
+  // the same one the desktop gives while that project's ControlMaster is down.
+  ptyManager.setSshProjectCheck((projectId) => workspaceStore.sshProjectIds().includes(projectId))
   ptyManager.setProjectSpawnOverrides(
     makeProjectSpawnOverrides({
       readSettings: (projectId) => workspaceStore.readProjectSettings(projectId),
@@ -439,7 +446,7 @@ export async function startServer(
   // an SSH-ref project answers `{ entries: [], unsupported: true }` (v1: no remote board log here).
   const boardLog = registerBoardLogHandlers(platform, {
     route: (projectId: string): BoardLogRoute => {
-      const cwd = workspaceStore.localCwdForProject(projectId)
+      const cwd = workspaceStore.boardLogRootForProject(projectId)
       return cwd ? { kind: 'local', cwd } : { kind: 'unsupported' }
     }
   })
@@ -554,8 +561,27 @@ export async function startServer(
   // rather than an unknown channel when canvas control is off.
   registerStationOutcomeIpc(platform, () => canvasControl?.stationOutcomes ?? null)
   registerStationHandoverIpc(platform, () => canvasControl?.stationHandovers ?? null)
-  const { contextTail, geminiContextTail, codexContextTail } = wireAgentStatus(platform, {
+  const {
+    contextTail,
+    geminiContextTail,
+    codexContextTail,
+    cursorContextTail,
+    antigravityContextTail
+  } = wireAgentStatus(platform, {
     onEvent: (event) => canvasControl?.onAgentEvent(event)
+  })
+  // Cursor NEEDS YOU, same seam as the desktop (core/agents/cursor-approval.ts).
+  hookServer.setPaneReader((nodeId) => ptyManager.captureSession(nodeId))
+  // Which claude may speak for a node (#1112, #1153): the pane tty from THIS shell's PtyManager.
+  // Same call as the desktop's (hook-verified-parity.test.ts).
+  wireClaudePaneOrigin({
+    hooks: hookServer,
+    paneOwner: (nodeId) => ptyManager.paneOwner(nodeId),
+    // No SSH-project manager here: such a node's pane is on another machine, never readable.
+    cannotRead: (nodeId) => !!workspaceStore.sshProjectIdForNode(nodeId),
+    on: (channel, cb) => platform.on(channel, cb),
+    destroyChannel: IPC.ptyDestroy,
+    recycleChannel: IPC.ptyRecycle
   })
   // The ⌘M chat view + the find-bar's transcript index. Registered HERE rather than with the rest
   // of the handlers because the hook-fed path authority is the tail created just above. No remote
@@ -589,6 +615,10 @@ export async function startServer(
           return codexContextTail
         case 'gemini':
           return geminiContextTail
+        case 'cursor':
+          return cursorContextTail
+        case 'antigravity':
+          return antigravityContextTail
         default:
           return undefined
       }
@@ -627,6 +657,8 @@ export async function startServer(
   // inbox event(s) + re-sends an 'end' live-update so the paired phone dismisses its lingering DONE
   // Live Activity. Fire-and-forget; no-op with no unresolved done.
   platform.handle(IPC.agentSubagentSnapshot, () => subagentReplay.snapshot())
+  // The host's per-node agent states off the mirror, for a relay tab that joins late (parity with desktop).
+  registerAgentStatusSnapshotIpc(platform)
   platform.handle(IPC.agentAckDone, (nodeId: string) => {
     ackDone(nodeId)
   })
@@ -856,7 +888,9 @@ export async function startServer(
   // hostMemReader). Kept identical to the desktop shell so the two cannot drift.
   const sessionReaper = createSessionReaper({
     tmuxBin: () => ptyManager.getTmuxBin(),
-    shadowed: (socket) => ptyManager.shadowedTmuxSessions(socket)
+    shadowed: (socket) => ptyManager.shadowedTmuxSessions(socket),
+    // No tmux (Windows): the session host's sessions are reaped under the same budget rules.
+    sessionHost: () => ptyManager.sessionHostReaperBackend()
   })
   sessionReaper.start()
   // Memory pressure (core/memory-pressure.ts): only the reaper leg on this shell. A CRITICAL
@@ -924,6 +958,8 @@ export async function startServer(
     tmuxBin: () => ptyManager.getTmuxBin(),
     // Zellij-backed sessions are not in the tmux sweep; the panel says how many it did not measure.
     unmeasuredSessions: () => ptyManager.zellijSessionCount(),
+    // Windows (no tmux): the session host's sessions; undefined where it is not the backend.
+    sessionHost: () => ptyManager.sessionHostListing(),
     remote: {
       isRemoteProject: sshScopePredicate({ sshProjectIds: () => workspaceStore.sshProjectIds() })
     }
@@ -988,6 +1024,9 @@ export async function startServer(
     // stop a stream the viewer already joined). One map lookup.
     nodeOfSession: (sessionId) => ptyManager.nodeOfSession(sessionId),
     projectCwd: (projectId) => workspaceStore.localCwdForProject(projectId),
+    // A `context:update` names an agent session, not a node: the mirror attributes it, so a
+    // non-editor receives a meter only for a session of a shared project.
+    nodesOfAgentSession: (sessionId) => nodesForAgentSession(sessionId),
     // A share or unshare: the authority adopts what joined and writes + releases what left, then every
     // client hears the new governed set (a client alone on a newly shared canvas must start publishing).
     // RESIDUAL, the share-time window (docs/hosted-team-relay.md): an edit a client made just before
@@ -1200,6 +1239,7 @@ export async function startServer(
       auth,
       rendererDir: config.rendererDir,
       trustProxy: config.trustProxy,
+      publicOrigin: config.publicOrigin,
       downloadTickets
     })
   )
@@ -1209,7 +1249,8 @@ export async function startServer(
     platform,
     auth,
     onClientGone: dropUiClient,
-    trustProxy: config.trustProxy
+    trustProxy: config.trustProxy,
+    publicOrigin: config.publicOrigin
   })
 
   await new Promise<void>((resolve, reject) => {

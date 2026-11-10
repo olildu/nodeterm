@@ -4,6 +4,7 @@ import { encodePtyData, decodePtyData } from '../../shared/rpc'
 import {
   WATCH_CHAT_CAST,
   WATCH_EVENT,
+  WATCH_HISTORY_CAST,
   WATCH_INPUT_CAST,
   WATCH_RELEASE_CAST,
   WATCH_UNLOCK_CAST,
@@ -39,15 +40,18 @@ describe('watcherAccess', () => {
 
   // The whole inbound surface, three roles by every viewer method there is (plus one that is not),
   // as a request and as a cast. Exactly these are admitted; everything else is the same refusal.
-  it('admits exactly: chat for commenter and controller, unlock / input / release for controller, all as casts', () => {
+  it('admits exactly: history for every role, chat for commenter and controller, unlock / input / release for controller, all as casts', () => {
     const admitted = new Set([
+      `cast ${WATCH_HISTORY_CAST} viewer`,
+      `cast ${WATCH_HISTORY_CAST} commenter`,
+      `cast ${WATCH_HISTORY_CAST} controller`,
       `cast ${WATCH_CHAT_CAST} commenter`,
       `cast ${WATCH_CHAT_CAST} controller`,
       `cast ${WATCH_UNLOCK_CAST} controller`,
       `cast ${WATCH_INPUT_CAST} controller`,
       `cast ${WATCH_RELEASE_CAST} controller`
     ])
-    const methods = [WATCH_CHAT_CAST, WATCH_UNLOCK_CAST, WATCH_INPUT_CAST, WATCH_RELEASE_CAST, 'watch:anything']
+    const methods = [WATCH_CHAT_CAST, WATCH_HISTORY_CAST, WATCH_UNLOCK_CAST, WATCH_INPUT_CAST, WATCH_RELEASE_CAST, 'watch:anything']
     let allowed = 0
     for (const kind of ['req', 'cast'] as const) {
       for (const method of methods) {

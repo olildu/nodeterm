@@ -47,6 +47,7 @@ import {
 } from './antigravity-windows-wrapper'
 import { readCmdAutoRun, type CmdAutoRunCheck } from './antigravity-autorun'
 import { findExecutableSync, resolveShellPath } from '../../exec-path'
+import { isRecord } from '../../../shared/is-record'
 
 /**
  * Where the vendor's own installer puts `agy` (antigravity.google/docs/cli/install): `~/.local/bin`
@@ -198,9 +199,6 @@ export function isAntigravityManagedCommand(command: unknown): boolean {
     c.includes(`.nodeterm/agent-hooks/${ANTIGRAVITY_WINDOWS_WRAPPER_FILE}`)
   )
 }
-
-const isRecord = (v: unknown): v is Record<string, unknown> =>
-  typeof v === 'object' && v !== null && !Array.isArray(v)
 
 /**
  * Copy a key as an OWN property. `JSON.parse` makes a `"__proto__"` key an own property, but

@@ -9,9 +9,16 @@
 //
 // ── The API split (binding, from docs/remote-sessions.md line 70–76) ──────────────────────────────
 // • CORE-BOUND namespaces (`pty`, `workspace`, `fs`, `git`, `files`, `context`, `canvas`, `presence`,
-//   the `onAgentStatus`/`onSubagentActivity` streams, `claude.cliCaps`, `userDataDir`) route over the
-//   relay RpcClient → they hit the REMOTE core. This is what makes the tab actually remote: its
-//   terminals, repos, files, canvas and presence all live on the host's machine.
+//   the agent members from `buildAgentApi` except `seedAgentIdentity` (below), `claude.cliCaps`,
+//   `userDataDir`) route over the relay RpcClient → they hit the REMOTE core. This is what makes the
+//   tab actually remote: its terminals, repos, files, canvas and presence all live on the host's
+//   machine.
+//   Routing an agent stream here subscribes nothing: Canvas's agent listeners run on the LOCAL api
+//   only. The relay session subscribes `onAgentStatus` itself, for its lifetime, into its own store,
+//   and then asks `agentStatusSnapshot` once (`session/relay-agent-status.ts`, wired in
+//   `relay-tab.ts`). `onSubagentActivity` and `onUnreadClear` are deliberately NOT subscribed on a
+//   relay tab: it renders no subagent cards, and its unread marks are this desktop's own, so a read
+//   recorded on the host (a phone read-ack) clears nothing here, as a read here acks nothing there.
 // • APP-GLOBAL namespaces (`updates`, `license`, `clipboard`, `shell`, `dialog`, `media`,
 //   `settings`, `pairing`, `announcements`, `usage`, `ssh*`, `remote*`, `relay*`, notifications, menu events)
 //   stay LOCAL (`window.nodeTerminal.*`). Your update banner shows YOUR version, a file picker
@@ -31,7 +38,7 @@
 //    calls `buildRelayApi` while the approval dialog is still open, THEN awaits `ready()`. Building
 //    it after approval already fired leaves `ready()` pending forever and the api never comes up.
 
-import type { HostedRole, NodeTerminalApi } from '../../shared/types'
+import type { HostedRole, NodeTerminalApi, PaneKeysResult } from '../../shared/types'
 import { type FrameTransport, RelayFrameTransport } from './frame-transport'
 import { RoleGatedRpcClient } from './hosted-gate'
 import { emitLocalRelayClose } from './relay-local-close'
@@ -113,7 +120,9 @@ export function buildRelayApi(
     context: files.context,
     githubIssues: github.githubIssues,
     githubControl: local.githubControl,
-    ...buildAgentApi(client), // onAgentStatus / onSubagentActivity — the host's agent hooks
+    // The host's agent hooks. Only `onAgentStatus` (+ `agentStatusSnapshot`) is used on a relay tab,
+    // by session/relay-agent-status.ts; `onSubagentActivity` / `onUnreadClear` stay unsubscribed.
+    ...buildAgentApi(client),
     ...buildCanvasApi(client), // canvas sync against the host's reflector
     ...buildPresenceApi(client), // the host's presence hub
     // `cliCaps` is REAL over the relay so the --permission-mode auto version gate probes the HOST's
@@ -125,6 +134,8 @@ export function buildRelayApi(
     // channel, so subscribe on the local preload, same shape as a local pty.
     pty: {
       ...real.pty,
+      // Host-only: a relay tab never types into the host's panes by id.
+      sendPaneKeys: async () => ({ ok: false, reason: 'unsupported-backend' }) as PaneKeysResult,
       // On the NAMESPACED key main delivers relay output on — never the bare host id, which is a
       // LOCAL terminal's channel too (shared/relay-pty-channel.ts).
       onData: (sessionId, listener) => local.pty.onData(relayPtyDataKey(connectionId, sessionId), listener)

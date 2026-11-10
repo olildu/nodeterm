@@ -1,3 +1,4 @@
+import { isRecord } from '../shared/is-record'
 // The readable body of a tool call in the ⌘M chat view. Most tool calls are plumbing — a one-line
 // chip (`Bash ls`) says all there is to say. Two are not: `ExitPlanMode` carries the full plan the
 // user is being asked to approve, and `AskUserQuestion` carries the question and its options. The
@@ -8,6 +9,12 @@
 //   ExitPlanMode    → {"plan": "<full markdown plan>"}
 //   AskUserQuestion → {"questions": [{"question", "header", "multiSelect", "options": [{"label", "description"?}]}]}
 // Anything that does not match degrades to NO body (today's chip) — never a half-rendered guess.
+//
+// `TodoWrite` (the agent's todo list) gets a body only on the opt-in `rich` read, so the golden
+// fixtures and the phone's `chat.page` keep its chip. Its shape is the tool's own schema —
+//   TodoWrite       → {"todos": [{"content", "status": "pending" | "in_progress" | "completed", "activeForm"?}]}
+// — NOT a measurement: no TodoWrite record exists on this server's transcripts (2026-11-02; its CLIs,
+// 2.1.209–2.1.316, write `TaskCreate` / `TaskUpdate` instead). The same no-guess rule covers that gap.
 
 /** The body crosses IPC/WS with every chat read; a plan is prose, and 64K characters (UTF-16 code
  *  units, i.e. `String.length`) is far past any real one. */
@@ -16,13 +23,28 @@ export const TOOL_BODY_TRUNCATED = '\n\n… (truncated)'
 
 const FENCE = /^\s*```/
 
-function capBody(s: string): string {
-  if (s.length <= TOOL_BODY_CAP) return s
+/** The first `TOOL_BODY_CAP` code units of `s`, never leaving half a surrogate pair (an emoji)
+ *  dangling at the cut. */
+function cutAtCap(s: string): string {
   let end = TOOL_BODY_CAP
-  // Do not leave half a surrogate pair (an emoji) dangling at the cut.
   const last = s.charCodeAt(end - 1)
   if (last >= 0xd800 && last <= 0xdbff) end -= 1
-  let kept = s.slice(0, end)
+  return s.slice(0, end)
+}
+
+/** Caps a long text at `TOOL_BODY_CAP`, then appends `TOOL_BODY_TRUNCATED` — and nothing else: for
+ *  text that is NOT rendered as markdown, each side of an Edit/Write diff in the chat parse. A diff
+ *  side is file content, so `capBody`'s fence repair would add a line the file never had (a balanced
+ *  markdown file cut inside a code block showed `+```` before the marker). */
+export function capText(s: string): string {
+  return s.length <= TOOL_BODY_CAP ? s : cutAtCap(s) + TOOL_BODY_TRUNCATED
+}
+
+/** Caps a long markdown tool body at `TOOL_BODY_CAP`, then appends `TOOL_BODY_TRUNCATED` — closing
+ *  a code fence the cut left open first. For a text that is not markdown, `capText`. */
+export function capBody(s: string): string {
+  if (s.length <= TOOL_BODY_CAP) return s
+  let kept = cutAtCap(s)
   // A cut inside an open ``` block would render the marker as code (and swallow nothing after it
   // only by luck): an odd number of fence lines means one is open — close it first.
   const fences = kept.split('\n').filter((l) => FENCE.test(l)).length
@@ -37,7 +59,6 @@ const oneLine = (s: string): string => s.replace(/\s*[\r\n]+\s*/g, ' ').trim()
 const escapeEmphasis = (s: string): string => s.replace(/[\\*_]/g, (c) => `\\${c}`)
 const bold = (s: string): string => `**${escapeEmphasis(oneLine(s))}**`
 
-const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
 const nonBlank = (v: unknown): v is string => typeof v === 'string' && v.trim() !== ''
 
 function planBody(input: Record<string, unknown>): string | undefined {
@@ -48,14 +69,14 @@ function questionsBody(input: Record<string, unknown>): string | undefined {
   if (!Array.isArray(input.questions)) return undefined
   const blocks: string[] = []
   for (const q of input.questions) {
-    if (!isObj(q) || !nonBlank(q.question)) continue
+    if (!isRecord(q) || !nonBlank(q.question)) continue
     const lines: string[] = []
     if (nonBlank(q.header)) lines.push(bold(q.header), '')
     // The question keeps its own paragraphs: it is a block of its own, not a one-line slot.
     lines.push(q.multiSelect === true ? `${q.question} _(select all that apply)_` : q.question)
     const options = Array.isArray(q.options)
       ? q.options
-          .filter((o): o is Record<string, unknown> => isObj(o) && nonBlank(o.label))
+          .filter((o): o is Record<string, unknown> => isRecord(o) && nonBlank(o.label))
           .map((o) => `- ${bold(o.label as string)}${nonBlank(o.description) ? ` — ${oneLine(o.description)}` : ''}`)
       : []
     if (options.length) lines.push('', ...options)
@@ -64,10 +85,37 @@ function questionsBody(input: Record<string, unknown>): string | undefined {
   return blocks.length ? blocks.join('\n\n') : undefined
 }
 
-/** Markdown body for a tool call worth reading in full, or undefined (render the plain chip). */
-export function toolBody(name: string, input: unknown): string | undefined {
-  if (!isObj(input)) return undefined
+// One checklist line per readable todo: done ticked, the one in progress in bold and named so, any
+// other status (pending, or one the schema does not know) an open box.
+function todosBody(input: Record<string, unknown>): string | undefined {
+  if (!Array.isArray(input.todos)) return undefined
+  const lines: string[] = []
+  for (const t of input.todos) {
+    if (!isRecord(t) || !nonBlank(t.content)) continue
+    const content = escapeEmphasis(oneLine(t.content))
+    lines.push(
+      t.status === 'completed'
+        ? `- [x] ${content}`
+        : t.status === 'in_progress'
+          ? `- [ ] **${content}** _(in progress)_`
+          : `- [ ] ${content}`
+    )
+  }
+  return lines.length ? lines.join('\n') : undefined
+}
+
+/** Markdown body for a tool call worth reading in full, or undefined (render the plain chip).
+ *  `opts.rich` adds the bodies only the desktop ⌘M panel draws (`ChatParseOptions.rich`): today
+ *  the `TodoWrite` checklist. */
+export function toolBody(name: string, input: unknown, opts?: { rich?: boolean }): string | undefined {
+  if (!isRecord(input)) return undefined
   const body =
-    name === 'ExitPlanMode' ? planBody(input) : name === 'AskUserQuestion' ? questionsBody(input) : undefined
+    name === 'ExitPlanMode'
+      ? planBody(input)
+      : name === 'AskUserQuestion'
+        ? questionsBody(input)
+        : name === 'TodoWrite' && opts?.rich === true
+          ? todosBody(input)
+          : undefined
   return body === undefined ? undefined : capBody(body)
 }

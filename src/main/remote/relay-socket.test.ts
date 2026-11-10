@@ -136,7 +136,7 @@ describe('relay-socket: a handshake control frame after the session is READY is 
     const sasBefore = host.sas()
     const peerBefore = host.peerPublicKeyB64()
     expect(peerBefore).toBe(publicKeyToB64(clientKeys.publicKey)) // the REAL peer
-    expect(sasBefore).toMatch(/^\d{3} \d{3}$/)
+    expect(sasBefore).toMatch(/^\d{3} \d{3} \d{4}$/)
 
     // The MITM injects a fresh, well-formed e2ee_hello carrying the ATTACKER's keypair. On the
     // vulnerable code this re-derives baseKey/sessionKey and overwrites peerPubB64.
@@ -169,7 +169,7 @@ describe('relay-socket: a handshake control frame after the session is READY is 
 
   it('the genuine single handshake is unaffected (both ends reach ready and agree on the SAS)', () => {
     const { host, client } = readyPair()
-    expect(host.sas()).toMatch(/^\d{3} \d{3}$/)
+    expect(host.sas()).toMatch(/^\d{3} \d{3} \d{4}$/)
     expect(host.sas()).toBe(client.sas())
   })
 })

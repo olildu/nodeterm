@@ -1,6 +1,6 @@
 import { KanbanScopeSwitch } from './KanbanScopeSwitch'
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { KanbanColumnCategory, KanbanLabel, KanbanSavedView, KanbanViewQuery, ProjectKanban } from '@shared/types'
+import type { KanbanColumnCategory, KanbanLabel, KanbanSavedView, KanbanViewQuery, PendingLaunch, ProjectKanban } from '@shared/types'
 import { deleteView, renameView, sameViewQuery, saveView, updateView, viewQuery } from '@shared/kanban-views'
 import { promptDialog } from '../promptDialog'
 import {
@@ -17,6 +17,7 @@ import { useViewMode } from '../../state/viewMode'
 import { useProjects } from '../../state/projects'
 import { useSettings } from '../../state/settings'
 import { useBoardWallpaperStyle } from '../../state/wallpaper'
+import { AerialWallpaper } from '../AerialWallpaper'
 import {
   AT_COLUMN_END, addColumn, assignNode, assignedTo, boardLabels, cardAssignees, cardMatchesLabelFilter, cardMeta, columnForNode,
   deleteColumn, labelsForCard, moveColumn,
@@ -43,8 +44,8 @@ import type { GitHubCloseReason, GitHubIssueCardView } from '@shared/github-issu
 import { issueKey, issueRefFromHtmlUrl, issueUrl, type IssueRef } from '@shared/github-issue-ref'
 import { NO_ISSUE_RUNS, boundRunsByIssue, type IssueRun } from '../../lib/issueRuns'
 import { useGitHubIssues } from '../../state/githubIssues'
-import { useAgentStatus } from '../../state/agentStatus'
-import { useSession } from '../../session/session'
+import { agentStatusForProject, useSession, useSessionRegistryVersion } from '../../session/session'
+import { ProjectSessionScope } from '../../session/owning-project'
 import { KanbanSourceFilter, type KanbanSource } from './KanbanSourceFilter'
 import { GitHubIssueSummaryModal } from './GitHubIssueSummaryModal'
 import { ConfirmDialog } from '../ConfirmDialog'
@@ -93,6 +94,12 @@ export interface KanbanSession {
   /** The branch of the worktree the node's enclosing group is bound to (`data.worktree.branch`,
    *  nearest bound ancestor). A pull request whose head is this branch links to the card. */
   worktreeBranch?: string
+  /** The node's held launch (terminal cards only) — shown as QUEUED with a ▶ on the card and in its
+   *  modal. */
+  pendingLaunch?: PendingLaunch
+  /** The node's first-open `initialCommand` is still set: with no reported delivery and no hold, the
+   *  launch is merely in flight and the chip hides (the node hides it too — `firstOpenInFlight`). */
+  launchFirstOpen?: boolean
 }
 
 /** What the per-column "+ New" menu can create. */
@@ -134,14 +141,20 @@ export interface KanbanViewProps {
   /**
    * The node's own rows for its card menu — the SAME builder the canvas node menu and the sessions
    * sidebar use (lib/nodeActionItems), narrowed by Canvas to `BOARD_NODE_ACTION_IDS`: stop agent
-   * control, color, icon, Share live link…, Switch Claude/Codex account. Optional: a board with no
-   * canvas behind it (a test, a future read-only view) shows none.
+   * control, color, icon, refresh terminal, Share live link…, restart, switch model, Switch
+   * Claude/Codex account, pause. Optional: a board with no canvas behind it (a test, a future
+   * read-only view) shows none.
    */
   nodeActionItems?: (nodeId: string) => MenuItem[]
+  /** The card modal's ⋯ session rows (same builder, narrowed to `BOARD_MODAL_ACTION_IDS`).
+   *  Optional: no ⋯ button without it. */
+  sessionActionItems?: (nodeId: string) => MenuItem[]
   /** "Name with AI" on a card (Canvas `aiNameSession`, the sessions sidebar's funnel). Optional. */
   onAiName?: (nodeId: string) => void
   /** Set a card's node color — the card modal's Color button. Optional: no button without it. */
   onSetColor?: (nodeId: string, color: string) => void
+  /** Start a card's held launch now (its QUEUED chip's ▶) — Canvas's `run` path. */
+  onRunQueued?: (nodeId: string) => void
   /** The board moving a session card itself because its linked pull requests merged (Canvas owns
    *  the compare-and-set + board-log line). Optional: without it nothing ever auto-moves. */
   onAutoMoveFromPulls?: (
@@ -241,7 +254,7 @@ function useCanvasCovered(): void {
 
 export const KanbanView = memo(function KanbanView({
   board, sessions, onChange, onOpenNode, onCreateNode, onRenameNode, onEditSticky, onDeleteNode,
-  onModalNodeChange, onBrowserNav, onSetIcon, nodeActionItems, onAiName, onSetColor, onAutoMoveFromPulls, issueAgentMenu,
+  onModalNodeChange, onBrowserNav, onSetIcon, nodeActionItems, sessionActionItems, onAiName, onSetColor, onRunQueued, onAutoMoveFromPulls, issueAgentMenu,
   issueWorktreeMenu, teams, onIssueMoved
 }: KanbanViewProps) {
   useCanvasCovered()
@@ -297,6 +310,17 @@ export const KanbanView = memo(function KanbanView({
   // Which machine this board's nodes run on — only a local board shows this machine's LIVE chips
   // (R57). A primitive, so the memoized cards are not re-rendered by it.
   const liveLinkSource = projectSessionSource(projectId)
+  // The agent-status store of the session this board's PROJECT belongs to: a team tab's cards read
+  // its relay session's store (they share node ids with the handed-off SSH project, whose entries
+  // are the default store's). Every card, the chips' signature and the open card's read mark use it.
+  const registryVersion = useSessionRegistryVersion()
+  const statusStore = useMemo(
+    () => agentStatusForProject(projectId).store,
+    // `registryVersion`: a reconnect swaps the project's session (and so its store) under the same
+    // id, and an unbind sends it to the offline session's; the memo must re-resolve on either.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [projectId, registryVersion]
+  )
   // The card face's Ports chip: this board is always the project on the canvas, which is the one
   // the dev-port scanner covers. Stable identities, because SessionCard is memoized.
   const portsRemote = useProjects((s) => !!s.getProject(projectId)?.ssh)
@@ -390,9 +414,11 @@ export const KanbanView = memo(function KanbanView({
     setLabelFilter((f) => (f.includes(id) ? f.filter((x) => x !== id) : [...f, id]))
   // Report the open node to the canvas (dictation shortcut targeting) and mark its completion read.
   // This clears notification affordances only; the live `done` state remains waiting for a prompt.
+  // On the board project's own store: a relay card's read stays on this desktop (that store sends
+  // no ack to the host) and never clears the handed-off SSH project's entry under the same id.
   useEffect(() => {
     onModalNodeChange(modalNodeId)
-    if (modalNodeId) useAgentStatus.getState().clearUnread(modalNodeId)
+    if (modalNodeId) statusStore.getState().clearUnread(modalNodeId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [modalNodeId])
   // Someone asked for a card while the board is up (notch Go, a notification, ⌘K…). Open it here
@@ -565,7 +591,7 @@ export const KanbanView = memo(function KanbanView({
   // running / needs-you / unread fact does) — never `byId`, which changes on every hook event of
   // every node and would re-render the whole board each time.
   const chipCards = useMemo<StatusChipCard[]>(() => sessions.map((s) => ({ id: s.id, kind: s.kind })), [sessions])
-  const statusSig = useAgentStatus((st) => statusChipSig(st.byId, chipCards))
+  const statusSig = statusStore((st) => statusChipSig(st.byId, chipCards))
   const statusFacts = useMemo(() => parseStatusChipSig(statusSig), [statusSig])
   const statusCounts = useMemo(() => chipCounts(statusFacts), [statusFacts])
   const toggleStatusChip = (chip: StatusChip): void =>
@@ -947,6 +973,8 @@ export const KanbanView = memo(function KanbanView({
             liveLinkSource={liveLinkSource}
             ports={cardPorts}
             onOpenPort={openPort}
+            onRunQueued={onRunQueued}
+            statusStore={statusStore}
           />
         ))
       })
@@ -1038,6 +1066,7 @@ export const KanbanView = memo(function KanbanView({
 
   return (
     <div className="kanban-overlay" style={boardStyle}>
+      {boardStyle && <AerialWallpaper board />}
       {/* Title strip: names the board's project AND pushes the columns below the top-right
           controls cluster, so column headers never sit under its icons. */}
       <div className="kanban-header">
@@ -1266,6 +1295,9 @@ export const KanbanView = memo(function KanbanView({
         />
       )}
       {modalNodeId && byId.has(modalNodeId) && (
+        // The board renders under App's LOCAL provider, outside Canvas's node subtree: the modal
+        // runs under ITS project's session, so a team tab's terminal attaches to the host's core.
+        <ProjectSessionScope projectId={projectId}>
         <CardModal
           projectName={projectName}
           projectColor={projectColor}
@@ -1287,6 +1319,8 @@ export const KanbanView = memo(function KanbanView({
           onBrowserNav={(patch) => onBrowserNav(modalNodeId, patch)}
           onSetIcon={(icon) => onSetIcon(modalNodeId, icon)}
           onSetColor={onSetColor ? (color) => onSetColor(modalNodeId, color) : undefined}
+          sessionActions={sessionActionItems ? () => sessionActionItems(modalNodeId) : undefined}
+          onRunQueued={onRunQueued ? () => onRunQueued(modalNodeId) : undefined}
           onDelete={() => onDeleteNode(modalNodeId)}
           onAiName={onAiName ? () => onAiName(modalNodeId) : undefined}
           onOpenIssue={(ref) => {
@@ -1301,6 +1335,7 @@ export const KanbanView = memo(function KanbanView({
             onOpenNode(nodeId)
           }}
         />
+        </ProjectSessionScope>
       )}
       {modalIssue && (
         <GitHubIssueSummaryModal

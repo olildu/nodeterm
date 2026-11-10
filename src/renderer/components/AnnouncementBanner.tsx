@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { IconClose } from './icons'
+import { useEntitlement } from '../state/entitlement'
 import type { Announcement } from '@shared/types'
 
 // Polls the remote announcements feed (via the main process) and shows the newest
@@ -27,17 +28,22 @@ function saveSeen(seen: Set<string>): void {
 
 export function AnnouncementBanner(): JSX.Element | null {
   const [current, setCurrent] = useState<Announcement | null>(null)
+  // Messages can be aimed at paid or free users, and main asks the feed with the CURRENT plan — so
+  // a purchase or a lapse re-asks now instead of leaving the other plan's message (a "try Pro"
+  // nudge, say) up for six hours.
+  const isPremium = useEntitlement((s) => s.isPremium)
 
   useEffect(() => {
     let cancelled = false
 
     const check = async () => {
       const items = await window.nodeTerminal.announcements.fetch()
-      if (cancelled || !items.length) return
+      if (cancelled) return
       const seen = loadSeen()
-      // Feed is newest-first; show the first one not yet dismissed.
-      const next = items.find((a) => !seen.has(a.id))
-      if (next) setCurrent(next)
+      // Feed is newest-first; show the first one not yet dismissed. A message that is no longer in
+      // the feed (deactivated, or aimed at the plan this install just left) comes down with it —
+      // a failed read answers with the last good feed, so going offline does not clear it.
+      setCurrent(items.find((a) => !seen.has(a.id)) ?? null)
     }
 
     void check()
@@ -46,7 +52,7 @@ export function AnnouncementBanner(): JSX.Element | null {
       cancelled = true
       clearInterval(timer)
     }
-  }, [])
+  }, [isPremium])
 
   if (!current) return null
 

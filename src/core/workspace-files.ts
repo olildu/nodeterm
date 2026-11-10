@@ -1,6 +1,7 @@
 import path from 'path'
 import { migrateLegacyAgentSimKind } from '../shared/sim'
 import { healPathAsName } from '../shared/project-name'
+import { neutralSshProjectNodes, routeSshProjectNodes } from '../shared/ssh-project-nodes'
 import type { AgentPermissionMode } from '../shared/agents/config'
 import { collisionSeed, derivedProjectId, legacyFileId } from '../shared/project-id'
 import {
@@ -22,6 +23,7 @@ import {
   type CanvasLayout,
   type LayoutViewports
 } from '../shared/canvas-layout'
+import { isRecord } from '../shared/is-record'
 
 /**
  * Drop a browser node's persisted `partition` unless it is exactly the jar THIS project (its
@@ -253,7 +255,13 @@ export interface IndexEntryV3 {
   /**
    * This entry is a LOCAL-DATA ref: its content lives in `userData/inline-projects/<id>.json` and
    * THAT FILE is the source of truth. Absent = the pre-file shape, where `project` below IS the
-   * content. Never set together with `cwd`/`ssh`.
+   * content. Never set together with `ssh`.
+   *
+   * Set together with `cwd` it is a FOLDER-DATA-REF (issue #1145): a folder project whose canvas
+   * is kept here instead of in `<cwd>/.nodeterm/project.json` (`Project.storeInAppData`). The
+   * folder is the project's working directory only — nothing reads or writes its `.nodeterm/`, and
+   * the watcher does not watch it. `project` (the cache) is stored without `cwd`, so a build that
+   * predates the kind opens it as a plain inline canvas instead of writing into the folder.
    *
    * A build that predates this field ignores it and reads `project`, which is why the two are
    * written together for one release (the downgrade contract).
@@ -300,6 +308,32 @@ export interface IndexEntryV3 {
    * the hoist. See `hoistLegacyNodeExec`.
    */
   execMigrated?: boolean
+}
+
+/**
+ * A folder project's canvas as a folder-data-ref stores it — in its data file and its index cache:
+ * the project WITHOUT `cwd` (node cwds stay absolute; an older build reads the cache as a plain
+ * inline canvas) and without the runtime-only flags. ONE definition for `splitWorkspace` and for
+ * the store's "the move into the folder did not land" path.
+ */
+export function appDataCanvas(p: Project): Project {
+  const { unavailable: _u, cwd: _cwd, storeInAppData: _s, ...inline } = p
+  return inline
+}
+
+/** A folder project whose canvas lives in app data (issue #1145) — see `IndexEntryV3.dataFile`. */
+export function isFolderDataRef(e: Pick<IndexEntryV3, 'cwd' | 'ssh' | 'dataFile'>): boolean {
+  return !!(e.dataFile && e.cwd && !e.ssh)
+}
+
+/**
+ * The folder whose `.nodeterm/project.json` holds this entry's CONTENT, or undefined. Not the same
+ * question as "does it have a cwd": a folder-data-ref has a working directory and keeps its canvas
+ * in app data, so every reader or writer of the folder FILE asks this, and everything that only
+ * needs where terminals run keeps reading `cwd`.
+ */
+export function folderFileCwd(e: Pick<IndexEntryV3, 'cwd' | 'ssh' | 'dataFile'>): string | undefined {
+  return e.cwd && !e.dataFile ? e.cwd : undefined
 }
 
 export interface WorkspaceIndexV3 {
@@ -359,7 +393,13 @@ export function projectToFile(
   // reached the live nodes some other way (a peer mutation, a hand edit) is never written into
   // the shared file as if it were ours.
   const nodes = sanitizeNodeTriggers(
-    stripSharedNodeExec(p.cwd ? toPortableNodes(p.nodes, p.cwd) : p.nodes)
+    stripSharedNodeExec(
+      p.cwd
+        ? toPortableNodes(p.nodes, p.cwd)
+        : // The SSH mirror records shared LAYOUT, not where this machine runs a node: the host's own
+          // desktop opens the same file as a local project (issue #1186). Re-derived on every load.
+          neutralSshProjectNodes(p.nodes, p.ssh)
+    )
   )
   const icon = sanitizeProjectIcon(p.icon)
   // The SECOND seam for layouts. Live project data is reachable by a peer canvas mutation and by a
@@ -409,9 +449,6 @@ export function validKanban(k: unknown): k is ProjectKanban {
     Array.isArray((k as ProjectKanban).assignments)
   )
 }
-
-const isRecord = (x: unknown): x is Record<string, unknown> =>
-  !!x && typeof x === 'object' && !Array.isArray(x)
 
 /**
  * A project's `bridges` / `ropes` as they may be ADMITTED. Both come straight out of the git-shared,
@@ -688,7 +725,15 @@ export function fileToProject(
     // loadedAgentBrowserPartition; without it a cloned project.json forges another project's jar.
     nodes: sanitizeNodeTriggers(
       sanitizeBrowserPartitions(
-        applyLocalNodeExec(base.cwd ? resolveNodes(f.nodes, base.cwd) : f.nodes, base.localExec),
+        applyLocalNodeExec(
+          base.cwd
+            ? resolveNodes(f.nodes, base.cwd)
+            : // An SSH project's nodes run on ITS host, whatever the shared file says (issue #1186):
+              // the host's own desktop, a teammate or git writes nodes into that file without this
+              // machine's routing fields. See @shared/ssh-project-nodes.
+              routeSshProjectNodes(f.nodes, base.ssh),
+          base.localExec
+        ),
         base.id
       )
     ),
@@ -846,6 +891,9 @@ export function splitWorkspace(
       // data. Emit a header-only ref preserving the ref shape — NEVER a file and NEVER an ssh
       // cache built from the placeholder, so a later save can't clobber the on-disk source.
       if (p.ssh) entries.push({ ...header, ssh: p.ssh })
+      // A folder-data-ref placeholder keeps `dataFile`: without it the next load would read the
+      // folder's own `.nodeterm/project.json` — a stale or a teammate's canvas — as this project.
+      else if (p.cwd && p.storeInAppData) entries.push({ ...header, cwd: p.cwd, dataFile: true })
       else if (p.cwd) entries.push({ ...header, cwd: p.cwd })
       else {
         const { unavailable: _u, ...inline } = p
@@ -870,6 +918,21 @@ export function splitWorkspace(
         // file. It is no longer identity even there: `fileToProject` is handed `e.id` regardless.
         cache: projectToFile(p, revOf(p.id), savedAt, p.id)
       })
+    } else if (p.cwd && p.storeInAppData) {
+      // The FOLDER-DATA-REF (issue #1145): a folder project whose canvas lives in
+      // `userData/inline-projects/<id>.json`, so nothing is written into the folder. It is stored
+      // exactly like a cwd-less canvas — the file and its `project` cache both hold the project
+      // WITHOUT `cwd`, so node cwds stay absolute and the inline load/write paths serve it
+      // unchanged — and the entry adds the `cwd` back. Two consequences are deliberate:
+      //  - It never claims `files` for its cwd, so it can sit beside a folder ref on the same
+      //    folder without either being demoted to the second-tab branch below.
+      //  - A build that predates the kind reads the cwd-less cache and sees an ordinary inline
+      //    canvas: it loses the folder binding but never writes into the folder.
+      //  - A hand-edited id we will not turn into a path gets no file — the cache IS the storage,
+      //    as for the pre-file inline shape — but it still never falls through to the folder.
+      const inline = appDataCanvas(p)
+      if (isInlineProjectFileId(p.id)) dataFiles.set(p.id, projectToFile(inline, revOf(p.id), savedAt))
+      entries.push({ ...header, ...localState, ...localRef, cwd: p.cwd, dataFile: true, project: inline })
     } else if (p.cwd && !files.has(p.cwd)) {
       files.set(p.cwd, projectToFile(p, revOf(p.id), savedAt))
       entries.push({ ...header, ...localState, ...localRef, cwd: p.cwd })

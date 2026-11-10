@@ -1,8 +1,10 @@
 // The `watcher` relay role, as two RelayHostHooks pieces. It deliberately does NOT go through
 // access-policy.ts's `decideAccess`: that function evaluates any non-editor role against the whole
 // VIEW table (files, git, presence, board log), and a live link may reach none of it.
-//  - Inbound: every request and cast is refused, except the chat cast on a Commenter or Control
-//    link, and the unlock / input / release casts on a Control link. The policy knows only the role:
+//  - Inbound: every request and cast is refused, except the read-back cast (`watch:history`) on
+//    every link, the chat cast on a Commenter or Control link, and the unlock / input / release casts
+//    on a Control link. The read-back is only ever the watched agent's conversation since the link
+//    was created (./history.ts), which every role was shown live. The policy knows only the role:
 //    whether THIS viewer may type (it unlocked with the link's password) is the link host's
 //    per-connection state, and the link host refuses input from a viewer that is not controlling.
 //  - Outbound, deny by default too: `watch:*` events, this viewer's own pty data frames (filtered,
@@ -21,6 +23,7 @@ import { decodePtyData, decodePtyDataSessionId, encodePtyData } from '../../shar
 import {
   WATCH_CHAT_CAST,
   WATCH_EVENT_PREFIX,
+  WATCH_HISTORY_CAST,
   WATCH_INPUT_CAST,
   WATCH_RELEASE_CAST,
   WATCH_UNLOCK_CAST,
@@ -37,10 +40,11 @@ export const WATCHER_RESUME_BELOW = 256 * 1024
 
 const CONTROL_CASTS: ReadonlySet<string> = new Set([WATCH_UNLOCK_CAST, WATCH_INPUT_CAST, WATCH_RELEASE_CAST])
 
-/** The ONLY admits: chat for a Commenter or Control link, unlock / input / release for a Control
- *  link, all as casts. Every request, and everything else, is refused. */
+/** The ONLY admits: the read-back for every link, chat for a Commenter or Control link, unlock /
+ *  input / release for a Control link, all as casts. Every request, and everything else, is refused. */
 export function watcherAccess(kind: 'req' | 'cast', method: string, role: WatchLinkRole): AccessDecision {
   if (kind !== 'cast') return { allow: false, message: WATCHER_REFUSAL }
+  if (method === WATCH_HISTORY_CAST) return { allow: true }
   if (method === WATCH_CHAT_CAST && (role === 'commenter' || role === 'controller')) return { allow: true }
   if (CONTROL_CASTS.has(method) && role === 'controller') return { allow: true }
   return { allow: false, message: WATCHER_REFUSAL }

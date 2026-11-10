@@ -32,6 +32,8 @@ import { LiveLinksSection } from './sections/LiveLinksSection'
 import { SshSection } from './sections/SshSection'
 import { UpdatesSection } from './sections/UpdatesSection'
 import { PrivacySection } from './sections/PrivacySection'
+import { SignInSection } from './sections/SignInSection'
+import { isBrowserRuntime } from '@renderer/bridge/runtime'
 import { DebugSection } from './sections/DebugSection'
 import { GitHubIssuesSection } from './sections/GitHubIssuesSection'
 import { ModelGatewaySection } from './sections/ModelGatewaySection'
@@ -184,6 +186,11 @@ export function SettingsPage({
             <SettingsSectionBoundary title="Privacy" visible={active === 'privacy'}>
               <PrivacySection isActive={active === 'privacy'} />
             </SettingsSectionBoundary>
+            {isBrowserRuntime() && (
+              <SettingsSectionBoundary title="Sign-in" visible={active === 'sign-in'}>
+                <SignInSection isActive={active === 'sign-in'} />
+              </SettingsSectionBoundary>
+            )}
             <SettingsSectionBoundary title="Debug" visible={active === 'debug'}>
               <DebugSection isActive={active === 'debug'} />
             </SettingsSectionBoundary>

@@ -12,6 +12,7 @@ nodeterm's license.
 | @xyflow/react (React Flow) | MIT |
 | @xterm/xterm, @xterm/addon-fit | MIT |
 | monaco-editor | MIT |
+| @excalidraw/excalidraw (whiteboard node) | MIT |
 | node-pty | MIT |
 | marked | MIT |
 | DOMPurify | Apache-2.0 OR MPL-2.0 |

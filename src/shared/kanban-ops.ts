@@ -15,6 +15,7 @@ import type {
   KanbanAssignment, KanbanCardMeta, KanbanColumn, KanbanColumnCategory, KanbanLabel,
   KanbanLabelColor, KanbanOp, KanbanPriority, KanbanSavedView, ProjectKanban
 } from './types'
+import { isRecord } from './is-record'
 
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/
 /** What a display name must never carry: C0/C1 controls (they break a name out of its one-line chip),
@@ -35,7 +36,6 @@ const CATEGORIES: readonly KanbanColumnCategory[] = ['unstarted', 'started', 'do
 const DUE_MIN = 0
 const DUE_MAX = 32_503_680_000_000
 
-const isObj = (x: unknown): x is Record<string, unknown> => !!x && typeof x === 'object' && !Array.isArray(x)
 const text = (x: unknown, max: number): string | null =>
   typeof x === 'string' && x.length <= max && !CONTROL.test(x) ? x : null
 /**
@@ -59,7 +59,7 @@ const idList = (x: unknown): string[] | null => {
 }
 
 function column(x: unknown): KanbanColumn | null {
-  if (!isObj(x) || !isRefId(x.id)) return null
+  if (!isRecord(x) || !isRefId(x.id)) return null
   const title = displayText(x.title, TITLE_MAX)
   if (title === null) return null
   const out: KanbanColumn = { id: x.id, title, color: text(x.color, COLOR_MAX) ?? DEFAULT_COLUMN_COLOR }
@@ -68,18 +68,18 @@ function column(x: unknown): KanbanColumn | null {
 }
 
 function assignment(x: unknown): KanbanAssignment | null {
-  if (!isObj(x) || !isRefId(x.nodeId) || !isRefId(x.columnId)) return null
+  if (!isRecord(x) || !isRefId(x.nodeId) || !isRefId(x.columnId)) return null
   const out: KanbanAssignment = { nodeId: x.nodeId, columnId: x.columnId }
   if (isValidRank(x.rank)) out.rank = x.rank
   return out
 }
 
 function meta(x: unknown): KanbanCardMeta | null {
-  if (!isObj(x) || !isRefId(x.nodeId)) return null
+  if (!isRecord(x) || !isRefId(x.nodeId)) return null
   const out: KanbanCardMeta = { nodeId: x.nodeId }
   if (Array.isArray(x.assignees)) {
     const a = x.assignees
-      .filter(isObj)
+      .filter(isRecord)
       .map((p) => ({ name: displayText(p.name, NAME_MAX), color: text(p.color, COLOR_MAX) }))
       .filter((p): p is { name: string; color: string } => !!p.name && p.color !== null)
       .slice(0, 50)
@@ -94,7 +94,7 @@ function meta(x: unknown): KanbanCardMeta | null {
 }
 
 function label(x: unknown): KanbanLabel | null {
-  if (!isObj(x) || !isRefId(x.id)) return null
+  if (!isRecord(x) || !isRefId(x.id)) return null
   const name = displayText(x.name, LABEL_NAME_MAX)
   if (name === null) return null
   const color: KanbanLabelColor = KANBAN_LABEL_COLORS.includes(x.color as KanbanLabelColor)
@@ -118,7 +118,7 @@ export function isKanbanOp(m: { op?: unknown }): boolean {
  *  label's to `default`), rank, priority, dueAt, category, and the display text (label name, column
  *  title, assignee name: see `displayText`). */
 export function sanitizeKanbanOp(m: unknown): KanbanOp | null {
-  if (!isObj(m)) return null
+  if (!isRecord(m)) return null
   switch (m.op) {
     case 'kb-column': { const c = column(m.column); return c && { op: 'kb-column', column: c } }
     case 'kb-column-remove': return isRefId(m.id) ? { op: 'kb-column-remove', id: m.id } : null
@@ -175,7 +175,7 @@ export function isKanbanDeletion(m: KanbanOp): boolean {
 // edit. Malformed entries are invisible to both: the diff never casts them, and the one op that
 // writes a list back writes it clean.
 const isEntry = <K extends string>(key: K) => (x: unknown): x is Record<K, string> =>
-  isObj(x) && typeof x[key] === 'string'
+  isRecord(x) && typeof x[key] === 'string'
 const columnsOf = (b: ProjectKanban): KanbanColumn[] =>
   Array.isArray(b.columns) ? b.columns.filter(isEntry('id')) as KanbanColumn[] : []
 const assignmentsOf = (b: ProjectKanban): KanbanAssignment[] =>
@@ -282,7 +282,7 @@ export function applyKanbanOp(board: ProjectKanban | undefined, m: KanbanOp, pro
 
 function stable(v: unknown): string {
   return JSON.stringify(v, (_k, val) =>
-    isObj(val) ? Object.fromEntries(Object.keys(val).sort().map((k) => [k, val[k]])) : val)
+    isRecord(val) ? Object.fromEntries(Object.keys(val).sort().map((k) => [k, val[k]])) : val)
 }
 const same = (a: unknown, b: unknown): boolean => stable(a) === stable(b)
 

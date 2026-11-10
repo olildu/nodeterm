@@ -26,7 +26,9 @@ import type { TeamRole } from './team-store'
 import type { AccessDecision } from './relay-host'
 import type { UiSink } from '../ui-sink-registry'
 import { stripSharedNodeExec } from '../../shared/node-exec'
-import type { CanvasNodeState } from '../../shared/types'
+import { BOARD_LOG_TEXT_MAX, type CanvasNodeState } from '../../shared/types'
+import type { PeerState } from '../../shared/presence'
+import { shareRootProblem, within } from './share-root'
 
 export interface AccessContext {
   role: TeamRole
@@ -48,6 +50,13 @@ export interface AccessContext {
   /** Does `p` resolve (symlinks followed) to a regular file? false when it is missing, not a file,
    *  or unreadable. Only the git rule asks it (`ownRepoMarker`). */
   isFile(p: string): boolean
+  /** The host user's home directory, for `shareRootProblem` (a shared root that IS the home, or
+   *  contains it, is never a root). Absent = `os.homedir()`. */
+  homeDir?: string
+  /** The nodes whose current AGENT session is `agentSessionId` (the agent-status mirror's record). A
+   *  `context:update` without a `nodeId` is attributed through it; absent = such an update is never
+   *  attributable, so a non-editor never receives it. */
+  nodesOfAgentSession?(agentSessionId: string): readonly string[]
 }
 
 type Check = (args: unknown[], ctx: AccessContext) => AccessDecision
@@ -82,17 +91,16 @@ function sharedRoots(ctx: AccessContext): string[] {
   const roots: string[] = []
   for (const cwd of ctx.projectCwds()) {
     if (typeof cwd !== 'string' || !path.isAbsolute(cwd)) continue
+    // A shared folder that is the disk root, the home directory or an ancestor of either (or of this
+    // server's data dir) is NOT a root: every file under it would be readable, `~/.ssh` included
+    // (security audit F4). Its files and git are refused to non-editors (share-root.ts).
+    if (shareRootProblem(cwd, { home: ctx.homeDir, dataDir: ctx.hostDataDir, realpath: (p) => ctx.realpath(p) })) continue
     roots.push(ctx.realpath(cwd) ?? cwd)
   }
   return roots
 }
 
-/** `p` is `root` or below it. Relative-path based, so a sibling like `/srv/app2` is not inside
- *  `/srv/app`, a root of `/` contains everything, and a path on another Windows drive is outside. */
-export function within(root: string, p: string): boolean {
-  const rel = path.relative(root, p)
-  return rel === '' || (rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel))
-}
+export { within }
 
 const READ_JAIL = 'Viewers can only read files inside a shared project.'
 const HOST_DATA = "Viewers can't read this server's own data folder."
@@ -246,6 +254,8 @@ export const VIEW: Readonly<Record<string, Check>> = Object.freeze({
   [IPC.ptyTmuxStatus]: pass,
   [IPC.fsList]: pathArg0,
   [IPC.fsRead]: pathArg0,
+  // A whiteboard is read by (projectId, nodeId); the core derives the file inside that project.
+  [IPC.filesReadWhiteboard]: projectArg0,
   [IPC.fsReadBinary]: pathArg0,
   [IPC.fsExists]: pathArg0,
   // Every git VIEW method: the cwd jail, then the shared root must be its own repository (C1).
@@ -257,6 +267,8 @@ export const VIEW: Readonly<Record<string, Check>> = Object.freeze({
   [IPC.gitHistory]: gitView(),
   // The RESPONSE is trimmed by narrowResponseForRole (it is a response, not an event).
   [IPC.agentSubagentSnapshot]: pass,
+  // Same: the host's per-node agent states for a late joiner, trimmed to the shared nodes.
+  [IPC.agentStatusSnapshot]: pass,
   [IPC.presenceHello]: pass,
   [IPC.presenceCursor]: pass,
   [IPC.presenceFocus]: pass,
@@ -274,9 +286,47 @@ export const COMMENT: Readonly<Record<string, Check>> = Object.freeze({
   // presence identity): a comment under someone else's name is a documented limit.
   [IPC.boardLogAppend]: (a, ctx) => {
     if (!sharedProject(a[0], ctx)) return no('That project is not shared.')
-    return field(a[1], 'kind') === 'comment' ? OK : no('Commenters can only add comments to the board log.')
+    if (field(a[1], 'kind') !== 'comment') return no('Commenters can only add comments to the board log.')
+    // The entry is written as sent, extra fields included, and the log keeps ONE rotated generation
+    // (board-log.ts, 4 MiB): an entry padded with a megabyte of junk rotated real history out in a
+    // handful of appends (security audit F3). Only the fields a comment has are kept; the per-peer
+    // rate and byte budget is the host's (`createAppendBudget`, applied by hosted-service.ts).
+    const entry = commentEntry(a[1])
+    return entry ? { allow: true, args: [a[0], entry] } : no('That is not a board comment.')
   }
 })
+
+const COMMENT_ID_MAX = 128
+const COMMENT_NAME_MAX = 128
+const COMMENT_COLOR_MAX = 32
+
+/** A Commenter's board entry reduced to the fields a comment has (`BoardLogEntry`), each type-checked
+ *  and bounded; null when it is not a comment at all. The text is clamped by the store
+ *  (BOARD_LOG_TEXT_MAX); bounding it here too keeps a hostile one from costing a 1 MB copy. */
+export function commentEntry(v: unknown): Record<string, unknown> | null {
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return null
+  const e = v as Record<string, unknown>
+  const author = e.author
+  if (
+    field(e, 'kind') !== 'comment' ||
+    typeof e.id !== 'string' || !e.id || e.id.length > COMMENT_ID_MAX ||
+    typeof e.ts !== 'number' || !Number.isFinite(e.ts) ||
+    author === null || typeof author !== 'object' || Array.isArray(author) ||
+    typeof (author as Record<string, unknown>).name !== 'string' ||
+    typeof (author as Record<string, unknown>).color !== 'string' ||
+    (e.text !== undefined && typeof e.text !== 'string')
+  ) {
+    return null
+  }
+  const a = author as { name: string; color: string }
+  if (a.name.length > COMMENT_NAME_MAX || a.color.length > COMMENT_COLOR_MAX) return null
+  const out: Record<string, unknown> = { id: e.id, ts: e.ts, author: { name: a.name, color: a.color }, kind: 'comment' }
+  if (typeof e.text === 'string') {
+    out.text = e.text.length > BOARD_LOG_TEXT_MAX + 1 ? e.text.slice(0, BOARD_LOG_TEXT_MAX + 1) : e.text
+  }
+  if (typeof e.nodeId === 'string' && e.nodeId.length <= COMMENT_ID_MAX) out.nodeId = e.nodeId
+  return out
+}
 
 /**
  * Relay-reachable channels reviewed and deliberately left Editor-only: every `IPC.*` the relay tab's
@@ -293,15 +343,32 @@ export const EDITOR_ONLY: ReadonlySet<string> = new Set<string>([
   IPC.ptySessionAge,
   IPC.ptySendText,
   IPC.ptySendChatPrompt,
+  IPC.ptySendToEmptyPrompt,
+  // The composer's screen poll; only an editor has a composer.
+  IPC.ptyReadChatScreen,
+  IPC.ptyInterruptChat,
   IPC.ptyPaneOwner,
   // A host filesystem path, not a view of the terminal — a viewer's file links keep the node cwd.
   IPC.ptyPaneCwd,
   IPC.ptyTerminateForeground,
+  // Also HOST_ONLY (host-control.ts): refused for every relay peer before this table is read.
+  IPC.ptySendPaneKeys,
   IPC.ptyReadSessionName,
+  // Executes an agent launch and reads a host-local prompt file. Also HOST-ONLY for every peer
+  // (shared/host-control.ts); a relay tab never sends it (its terminals are not `source: 'local'`).
+  IPC.ptyExecuteLaunch,
   // Workspace, project settings and setup: writes, probes of arbitrary folders, trust, scripts.
   IPC.workspaceSave,
+  // Host-only for every peer (shared/host-control.ts): a peer's claim would make every viewer of
+  // the host stand down from a launch (#1173). A relay tab never sends it.
+  IPC.workspaceClaimLaunch,
   IPC.workspaceProbeFolder,
   IPC.workspaceProjectFileState,
+  // Moving a project's storage (issue #1145): both write and delete files on the host.
+  IPC.workspaceReleaseFolderFiles,
+  IPC.workspacePrepareFolderStorage,
+  // …and the read the move asks after its save; a relay tab never offers the move.
+  IPC.workspaceProjectStorage,
   IPC.projectSettingsRead,
   IPC.projectSettingsWriteShared,
   IPC.projectSettingsUpdateLocal,
@@ -331,6 +398,7 @@ export const EDITOR_ONLY: ReadonlySet<string> = new Set<string>([
   IPC.filesDownloadTicket,
   IPC.filesSaveUpload,
   IPC.filesSaveCanvasImage,
+  IPC.filesSaveWhiteboard,
   // Custom alert sounds live in the HOST's data dir and replace the host user's own chime.
   IPC.filesSaveAlertSound,
   IPC.filesReadAlertSound,
@@ -497,10 +565,21 @@ export const VIEW_EVENTS: Readonly<Record<string, EventCheck>> = Object.freeze({
   [IPC.workspaceExternalChange]: (a, ctx) => sharedProject(field(a[0], 'id'), ctx),
   [IPC.workspaceServerChange]: (a, ctx) => sharedProject(field(a[0], 'id'), ctx),
   [IPC.projectTrustChanged]: (a, ctx) => sharedProject(field(a[0], 'projectId'), ctx),
-  // Token counts + model for an opaque agent session id: no project, node, path or text.
-  [IPC.contextUpdate]: always,
-  [IPC.presenceSync]: always,
-  [IPC.presencePeer]: always,
+  // Token counts, model id and effort for one agent session. Only for a SHARED node's session
+  // (security audit (d)): by its `nodeId` when the payload names one, else through the mirror's
+  // session → node record; an update that cannot be attributed is dropped, never guessed.
+  [IPC.contextUpdate]: (a, ctx) => {
+    const nodeId = field(a[0], 'nodeId')
+    if (typeof nodeId === 'string') return sharedNode(nodeId, ctx)
+    const sessionId = field(a[0], 'sessionId')
+    if (typeof sessionId !== 'string' || !sessionId || !ctx.nodesOfAgentSession) return false
+    const nodes = ctx.nodesOfAgentSession(sessionId)
+    return nodes.length > 0 && nodes.every((n) => sharedNode(n, ctx))
+  },
+  // `presence:sync` / `presence:peer` are NOT here: they carry every peer's project, focus node,
+  // typing node and cursor-chat text for ALL projects, and what a non-editor may see of them depends
+  // on what it already saw, so they go through the stateful `createPresenceFilter` (wrapSinkForRole,
+  // scoped-guest-policy wrapSink). Through this table they are dropped.
   // The shared set itself — exactly what a viewer's narrowed workspace already reveals.
   [IPC.relayHostedSharedChanged]: always
 })
@@ -566,15 +645,20 @@ export function filterOutboundEvent(json: string, ctx: AccessContext, subagentOw
   return false
 }
 
+/** The snapshot responses keyed by node, trimmed to the shared nodes for a non-editor: the subagent
+ *  snapshot (every running subagent's task text) and the agent-status snapshot (every node's state,
+ *  session id and account). */
+const NODE_KEYED_SNAPSHOTS: ReadonlySet<string> = new Set([IPC.agentSubagentSnapshot, IPC.agentStatusSnapshot])
+
 /**
- * A response the peer asked for that no argument check can narrow. Only the subagent snapshot today:
- * it holds every running subagent's task text, keyed by node. Editors and every other method pass
- * through unchanged. Wire it into the host's `narrowResponse` hook.
+ * A response the peer asked for that no argument check can narrow: the node-keyed snapshots above,
+ * and the workspace with its exec fields removed. Editors and every other method pass through
+ * unchanged. Wire it into the host's `narrowResponse` hook.
  */
 export function narrowResponseForRole(method: string, result: unknown, ctx: AccessContext): unknown {
   if (isEditor(ctx.role)) return result
   if (method === IPC.workspaceLoad) return redactWorkspaceExec(result)
-  if (method !== IPC.agentSubagentSnapshot) return result
+  if (!NODE_KEYED_SNAPSHOTS.has(method)) return result
   return Array.isArray(result) ? result.filter((e) => sharedNode(field(e, 'nodeId'), ctx)) : []
 }
 
@@ -634,12 +718,166 @@ export function filterOutboundBinary(buf: Uint8Array, ctx: AccessContext): boole
 }
 
 /**
+ * ── PRESENCE, per peer ─────────────────────────────────────────────────────────────────────────────
+ *
+ * `presence:sync` / `presence:peer` carry EVERY peer's project id, focused node id, typing node id,
+ * dino node and live cursor-chat text, for every project on this core. A peer limited to some
+ * projects (a hosted Viewer/Commenter, a scoped Team Access guest) must see presence only for peers
+ * ON its shared projects, and no node reference outside them (security audit (a): it was also the
+ * targeting primitive for F1).
+ *
+ * Why a stateful filter and not a VIEW_EVENTS entry: an `update` diff carries only the changed
+ * fields, so whether it may be delivered depends on the peer's project, which arrived in an EARLIER
+ * event; and a peer that moves INTO a shared project must appear with its name and colour, which the
+ * recipient never received. So the filter tracks every peer's full state (`PeerState`) and what the
+ * recipient currently believes is visible, and rewrites the stream:
+ *  - sync → the visible peers only, each with off-scope node references nulled;
+ *  - a peer moving in → a synthesised `join`; moving out → a synthesised `leave`;
+ *  - an update of a visible peer → its patch, node references sanitised;
+ *  - an editor (shell access) gets the stream as-is; a change of role or of the shared set is
+ *    applied on the next presence event, a role change by resending a whole `sync`.
+ * Tracking runs BEFORE the context is built, so a context that cannot be built drops the event
+ * without the tracked state drifting. Anything that does not parse as presence is dropped.
+ */
+export interface PresenceFilter {
+  /** `undefined`: not a presence event (let the caller's other filters judge it). `null`: drop it.
+   *  A string: send this instead. `ctxFor` may throw; the caller's guard drops the event then. */
+  handle(json: string, ctxFor: () => AccessContext): string | null | undefined
+}
+
+/** Peers tracked per sink. The hub's own table is bounded by the connected clients; this is a guard. */
+const PRESENCE_PEERS_MAX = 1024
+
+function isPeer(v: unknown): v is PeerState {
+  return v !== null && typeof v === 'object' && typeof (v as { clientId?: unknown }).clientId === 'number'
+}
+
+export function createPresenceFilter(): PresenceFilter {
+  const peers = new Map<number, PeerState>()
+  /** The peers the recipient was last told about (and not told left). */
+  const delivered = new Set<number>()
+  /** Whether the recipient's view is the unfiltered one (an editor), the filtered one, or neither yet. */
+  let mode: 'full' | 'filtered' | null = null
+
+  const track = (channel: string, args: unknown[]): boolean => {
+    if (channel === IPC.presenceSync) {
+      if (!Array.isArray(args[0])) return false
+      peers.clear()
+      for (const p of args[0]) if (isPeer(p) && peers.size < PRESENCE_PEERS_MAX) peers.set(p.clientId, p)
+      return true
+    }
+    const d = args[0] as { op?: unknown; peer?: unknown; clientId?: unknown; patch?: unknown } | undefined
+    if (!d || typeof d !== 'object') return false
+    if (d.op === 'join' && isPeer(d.peer)) {
+      if (peers.size < PRESENCE_PEERS_MAX || peers.has(d.peer.clientId)) peers.set(d.peer.clientId, d.peer)
+      return true
+    }
+    if (d.op === 'leave' && typeof d.clientId === 'number') {
+      peers.delete(d.clientId)
+      return true
+    }
+    if (d.op === 'update' && typeof d.clientId === 'number' && d.patch !== null && typeof d.patch === 'object') {
+      const prev = peers.get(d.clientId)
+      if (prev) {
+        const patch = d.patch as Partial<PeerState>
+        const next: PeerState = { ...prev, ...patch, clientId: d.clientId }
+        // A cursor-chat bubble belongs to the canvas it was typed on: one typed on another project
+        // must not appear with the peer when it moves onto a shared one.
+        if ('projectId' in patch && patch.projectId !== prev.projectId && !('chat' in patch)) next.chat = null
+        peers.set(d.clientId, next)
+      }
+      return true
+    }
+    return false
+  }
+
+  const visible = (p: PeerState, ctx: AccessContext): boolean =>
+    typeof p.projectId === 'string' && ctx.sharedProjects.has(p.projectId)
+  /** A peer's node references, nulled where they point outside the shared projects. */
+  const sanitize = <T extends Partial<PeerState>>(p: T, ctx: AccessContext): T => {
+    const out: T = { ...p }
+    if ('focus' in out && out.focus !== null && !sharedNode(out.focus, ctx)) out.focus = null
+    if ('typing' in out && out.typing !== null && !sharedNode(field(out.typing, 'nodeId'), ctx)) out.typing = null
+    if ('dino' in out && out.dino !== null && !sharedNode(field(out.dino, 'nodeId'), ctx)) out.dino = null
+    return out
+  }
+  const ev = (channel: string, payload: unknown): string => JSON.stringify({ t: 'ev', channel, args: [payload] })
+  const fullSync = (): string => {
+    delivered.clear()
+    for (const id of peers.keys()) delivered.add(id)
+    return ev(IPC.presenceSync, [...peers.values()])
+  }
+  const filteredSync = (ctx: AccessContext): string => {
+    delivered.clear()
+    const list: PeerState[] = []
+    for (const p of peers.values()) {
+      if (!visible(p, ctx)) continue
+      delivered.add(p.clientId)
+      list.push(sanitize(p, ctx))
+    }
+    return ev(IPC.presenceSync, list)
+  }
+
+  return {
+    handle(json, ctxFor) {
+      let m: unknown
+      try {
+        m = JSON.parse(json)
+      } catch {
+        return undefined
+      }
+      const channel = field(m, 't') === 'ev' ? field(m, 'channel') : undefined
+      if (channel !== IPC.presenceSync && channel !== IPC.presencePeer) return undefined
+      const raw = field(m, 'args')
+      const args = Array.isArray(raw) ? raw : []
+      if (!track(channel, args)) return null
+      const ctx = ctxFor()
+      if (isEditor(ctx.role)) {
+        const was = mode
+        mode = 'full'
+        if (was === 'filtered') return fullSync()
+        if (channel === IPC.presenceSync) return fullSync()
+        const d = args[0] as { op: string; clientId?: number; peer?: PeerState }
+        if (d.op === 'join' && d.peer) delivered.add(d.peer.clientId)
+        if (d.op === 'leave' && typeof d.clientId === 'number') delivered.delete(d.clientId)
+        return json
+      }
+      if (mode !== 'filtered' || channel === IPC.presenceSync) {
+        mode = 'filtered'
+        return filteredSync(ctx)
+      }
+      const d = args[0] as { op: string; clientId?: number; peer?: PeerState; patch?: Partial<PeerState> }
+      if (d.op === 'leave') {
+        const id = d.clientId as number
+        if (!delivered.delete(id)) return null
+        return ev(IPC.presencePeer, { op: 'leave', clientId: id })
+      }
+      const id = d.op === 'join' ? (d.peer as PeerState).clientId : (d.clientId as number)
+      const now = peers.get(id)
+      const was = delivered.has(id)
+      const nowVisible = now !== undefined && visible(now, ctx)
+      if (!nowVisible) {
+        if (!was) return null
+        delivered.delete(id)
+        return ev(IPC.presencePeer, { op: 'leave', clientId: id })
+      }
+      if (!was || d.op === 'join') {
+        delivered.add(id)
+        return ev(IPC.presencePeer, { op: 'join', peer: sanitize(now as PeerState, ctx) })
+      }
+      return ev(IPC.presencePeer, { op: 'update', clientId: id, patch: sanitize(d.patch ?? {}, ctx) })
+    }
+  }
+}
+
+/**
  * The peer's sink, filtered for its role. `ctxFor` is asked per message, so a role or share change
  * applies to the next event or terminal frame. `bufferedAmount` stays the underlying socket's —
  * Stage 2 backpressure and the 8 MB drop ceiling key on it (see relay-host.ts `open`).
  */
 export function wrapSinkForRole(sink: UiSink, ctxFor: () => AccessContext): UiSink {
   const owners: SubagentOwners = new Map()
+  const presence = createPresenceFilter()
   let warned = false
   /** Run a delivery decision. Fail closed WITHOUT throwing: the registry reads a throwing sink as a
    *  dead socket and would tear the peer down while its relay socket stays open. The socket's own
@@ -661,6 +899,13 @@ export function wrapSinkForRole(sink: UiSink, ctxFor: () => AccessContext): UiSi
       // exec fields (redactOutboundEvent). Decided inside `decide`, so a throw drops the event.
       let out: string | null = null
       decide(() => {
+        // Presence first: it is rewritten per peer (see `createPresenceFilter`), never passed or
+        // dropped whole by the stateless table.
+        const p = presence.handle(json, ctxFor)
+        if (p !== undefined) {
+          out = p
+          return p !== null
+        }
         const ctx = ctxFor()
         if (!filterOutboundEvent(json, ctx, owners)) return false
         out = isEditor(ctx.role) ? json : redactOutboundEvent(json)

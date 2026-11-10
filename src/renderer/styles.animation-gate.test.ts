@@ -1,4 +1,5 @@
 import fs from 'node:fs'
+import { createRequire } from 'node:module'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 
@@ -101,6 +102,44 @@ describe('idle-window animation gate', () => {
         'the window, which takes back the whole win of the gate (see the header of this file).\n' +
         `Add "${PLAY_STATE};" directly after the shorthand, or give the element an explicit\n` +
         "`:root[data-nt-window='idle']` rule and list its keyframe in STATIC_WHEN_IDLE.\n"
+    ).toEqual([])
+  })
+
+  it("gates React Flow's own infinite animations (dashdraw), which the scan above cannot see", () => {
+    // styles.css @imports xyflow's sheet, whose `dashdraw 0.5s linear infinite` on animated edges
+    // never read the variable, so both gates missed it — MEASURED: one working edge under Liquid
+    // Glass held 79 % GPU + 36 % renderer and +340 MB GPU footprint on an idle window; the
+    // play-state rule took it back to the 0.5 % / 3.3 % baseline. Every infinite rule in the vendor
+    // sheet needs a rule here with the SAME selector (same specificity, later by order, so it wins)
+    // that sets the play-state — an upgrade that adds one fails here instead of silently costing.
+    const vendor = fs
+      .readFileSync(createRequire(__filename).resolve('@xyflow/react/dist/style.css'), 'utf8')
+      .replace(/\r\n/g, '\n')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+    const vendorSelectors = [...vendor.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+      .filter((m) => /animation:[^;]*\binfinite\b/.test(m[2]))
+      .flatMap((m) => m[1].split(',').map((s) => s.trim().replace(/\s+/g, ' ')))
+    // Non-vacuous: the edge rule is the one that was measured.
+    expect(vendorSelectors).toContain('.react-flow__edge.animated path')
+
+    // Offsets below are all taken on the same comment-stripped text.
+    const stripped = css.replace(/\/\*[\s\S]*?\*\//g, '')
+    const ours = [...stripped.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+      .filter((m) => m[2].includes(PLAY_STATE))
+      .map((m) => ({
+        index: m.index ?? 0,
+        selectors: m[1].split(',').map((s) => s.trim().replace(/\s+/g, ' '))
+      }))
+    const importAt = stripped.indexOf("@import '@xyflow/react/dist/style.css'")
+    expect(importAt, 'styles.css no longer imports the xyflow sheet').toBeGreaterThanOrEqual(0)
+
+    const ungated = vendorSelectors.filter(
+      (sel) => !ours.some((r) => r.index > importAt && r.selectors.includes(sel))
+    )
+    expect(
+      ungated,
+      "These @xyflow/react rules run an infinite animation that ignores --nt-anim-state. Add the\n" +
+        `exact selector to the rule in styles.css that sets "${PLAY_STATE};" for React Flow.\n`
     ).toEqual([])
   })
 

@@ -39,6 +39,7 @@ import type { TrustDeniedReason } from './relay-trust'
 import { createHostKey, loadHostKey, rotateHostKey, hostAddress, HostKeyUnreadableError } from './host-key'
 import { TeamStore, peerFor, upsertPeer, removePeer, setShared, TEAM_ROLES, type TeamPeer, type TeamRole } from './team-store'
 import { decideAccess, wrapSinkForRole, narrowResponseForRole, type AccessContext } from './access-policy'
+import { BOARD_APPEND_REFUSED, createAppendBudgets } from './append-budget'
 import { mintHostToken } from './host-token'
 import { createHostedScheduler, type Listener, type SchedulerStatus } from './hosted-scheduler'
 import { encodeJoinCode } from './join-code'
@@ -99,6 +100,9 @@ export interface HostedServiceDeps {
    *  are judged by it, so `team unshare` stops a stream the viewer already joined (R45). */
   nodeOfSession(sessionId: string): string | undefined
   projectCwd(projectId: string): string | undefined
+  /** The nodes whose current agent session is this id (`agent-status-mirror` `nodesForAgentSession`).
+   *  A non-editor's `context:update` is attributed through it; absent = never delivered to one. */
+  nodesOfAgentSession?(agentSessionId: string): readonly string[]
   /** TEST ONLY: an in-process transport per listener. Production opens a real WebSocket. */
   transport?: () => RelayTransport
   /** TEST ONLY: the host-token mint's fetch. */
@@ -238,6 +242,8 @@ export function createHostedService(deps: HostedServiceDeps): HostedService {
    *  existence (R2) or start one with the key a rotation is replacing. */
   let lifecycle: Promise<unknown> = Promise.resolve()
   const conns = new Set<Conn>() // every listener whose session has not ended
+  /** A Commenter's board-log append budget, per peer key (see append-budget.ts). */
+  const boardBudget = createAppendBudgets(256, { now: monoNow })
   const pending = new Map<string, PendingEntry>()
 
   const onLifecycle = <T>(op: () => Promise<T>): Promise<T> => {
@@ -264,7 +270,8 @@ export function createHostedService(deps: HostedServiceDeps): HostedService {
       // Never readable by a non-editor, even when a shared project's folder contains it (M7).
       hostDataDir: deps.dataDir,
       realpath,
-      isFile
+      isFile,
+      ...(deps.nodesOfAgentSession ? { nodesOfAgentSession: (sid: string) => deps.nodesOfAgentSession!(sid) } : {})
     }
   }
 
@@ -487,7 +494,16 @@ export function createHostedService(deps: HostedServiceDeps): HostedService {
             if (method === IPC.workspaceSave) return { allow: false, message: RELAY_WORKSPACE_SAVE_REFUSED }
             const role = standing(c, s)
             if (role === null) return { allow: false, message: NOT_A_MEMBER }
-            return decideAccess(kind, method, args, ctxWith(role))
+            const decision = decideAccess(kind, method, args, ctxWith(role))
+            // A Commenter's board comments are rate- and byte-bounded per peer KEY (a reconnect does
+            // not reset it): the log keeps one rotated generation, and a flood would push the
+            // project's real history out of it (security audit F3, append-budget.ts).
+            if (decision.allow && role === 'commenter' && method === IPC.boardLogAppend) {
+              const entry = (decision.args ?? args)[1]
+              const bytes = JSON.stringify(entry ?? null)?.length ?? 0
+              if (!boardBudget(s.peerKeyB64() ?? '').admit(bytes)) return { allow: false, message: BOARD_APPEND_REFUSED }
+            }
+            return decision
           },
           wrapSink: (s, sink) => {
             const filtered = wrapSinkForRole(sink, () => ctxWith(standing(c, s) ?? 'viewer'))

@@ -310,7 +310,7 @@ describe('initRelayHost — nothing is served before mutual approval', () => {
 
     const pending = pendingSent()
     expect(pending).toBeTruthy()
-    expect(pending!.sas).toMatch(/^\d{3} \d{3}$/)
+    expect(pending!.sas).toMatch(/^\d{3} \d{3} \d{4}$/)
     expect(pending!.peerKeyB64).toBe(host.peerKeyB64)
     // No client, no presence, no open before the human confirms.
     expect(peerRegistry().ids()).toEqual([])
@@ -706,6 +706,51 @@ describe('initRelayHost — Team Access start() aliases invite (additive)', () =
     // A second start does NOT supersede the first (which would close it); it is refused at cap 1.
     await expect(h.handlers[IPC.relayHostStart]({})).rejects.toThrow(E_SEATS_FULL)
     expect(captured[0].session.close).not.toHaveBeenCalled()
+  })
+})
+
+// Security audit F4: a project whose folder is the disk root or the home directory (or contains it)
+// would hand the guest every file under it, `~/.ssh` included. The invite UI greys it out; the host
+// refuses to MINT such a seat, whatever the renderer sent.
+describe('initRelayHost — a share rooted at the home directory is refused host-side', () => {
+  const wire = () => {
+    const win = fakeWin()
+    const connect = vi.fn(() => makeFakeSession(0) as unknown as RelayHostSession)
+    initRelayHost(win as never, platform, {
+      loadKeys: async () => genKeyPair(),
+      mintToken: async () => ({ pairingToken: 'tok' }),
+      isPremium: () => true,
+      relayAllowed: () => true,
+      getEntitlement: () => 'ent',
+      licensedSeats: () => 3,
+      connect,
+      scope: {
+        projectsOfNode: () => [],
+        nodeOfSession: () => undefined,
+        projectCwd: (id) => ({ home: '/home/ada', root: '/', parent: '/home', app: '/home/ada/code/app' })[id],
+        homeDir: '/home/ada',
+        hostDataDir: '/home/ada/.config/node-terminal',
+        realpath: (p) => p
+      }
+    })
+    return { connect }
+  }
+  it('start and invite refuse it, before any token is minted or socket opened', async () => {
+    const { connect } = wire()
+    for (const projectId of ['home', 'root', 'parent']) {
+      await expect(h.handlers[IPC.relayHostStart]({}, projectId)).rejects.toThrow(/home directory|root of the disk/)
+      await expect(h.handlers[IPC.relayHostInvite]({}, { projectId })).rejects.toThrow(/home directory|root of the disk/)
+    }
+    expect(connect).not.toHaveBeenCalled()
+    await h.handlers[IPC.relayHostStart]({}, 'app')
+    expect(connect).toHaveBeenCalledTimes(1)
+  })
+  it('scope-problems names exactly the refused projects, with the reason', () => {
+    wire()
+    const out = h.handlers[IPC.relayHostScopeProblems]({}, ['home', 'root', 'parent', 'app', 'unknown', 42]) as Record<string, string>
+    expect(Object.keys(out).sort()).toEqual(['home', 'parent', 'root'])
+    expect(out.home).toMatch(/home directory/)
+    expect(h.handlers[IPC.relayHostScopeProblems]({}, 'not-a-list')).toEqual({})
   })
 })
 

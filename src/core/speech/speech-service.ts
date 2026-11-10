@@ -1,4 +1,5 @@
-import { open } from 'node:fs/promises'
+import { open, readFile } from 'node:fs/promises'
+import os from 'node:os'
 import { whisperModel } from '../../shared/speech'
 import type { WhisperModelStore } from './whisper-models'
 
@@ -25,6 +26,40 @@ export function isGgmlModelHeader(header: Uint8Array): boolean {
     header.length >= 4 &&
     header[0] === 0x6c && header[1] === 0x6d && header[2] === 0x67 && header[3] === 0x67
   )
+}
+
+/** CPU features the SIMD build of whisper.cpp is compiled for (`-mavx -mavx2 -mfma -mf16c`, see
+ * scripts/patch-smart-whisper.mjs). Every one must be present, or that binary SIGILLs the app. */
+export const WHISPER_SIMD_FLAGS = ['avx', 'avx2', 'fma', 'f16c'] as const
+
+/** The `flags` line of /proc/cpuinfo as a set. Pure — tested. */
+export function parseCpuFlags(cpuinfo: string): Set<string> {
+  const line = cpuinfo.split('\n').find((l) => /^flags\s*:/.test(l))
+  return new Set(line ? line.slice(line.indexOf(':') + 1).trim().split(/\s+/) : [])
+}
+
+/** Which smart-whisper binary to load (issue #1267). The SIMD build exists only on linux x64; on a
+ * CPU without its flags — or when the flags could not be read — the baseline is the only safe
+ * answer, since a wrong guess is a SIGILL, not an error. Pure — tested. */
+export function pickWhisperBinary(input: {
+  platform: string
+  arch: string
+  cpuFlags: ReadonlySet<string> | null
+}): 'smart-whisper' | 'smart-whisper-avx2' {
+  if (input.platform !== 'linux' || input.arch !== 'x64' || !input.cpuFlags) return 'smart-whisper'
+  return WHISPER_SIMD_FLAGS.every((f) => input.cpuFlags!.has(f)) ? 'smart-whisper-avx2' : 'smart-whisper'
+}
+
+/** whisper.cpp threads for a machine with `available` logical CPUs. whisper.cpp's own default is
+ * min(4, cpus), which leaves most of a modern laptop idle. Using EVERY logical CPU is worse than
+ * the default, though: ggml's workers spin-wait, so one oversubscribed or hyperthread-paired worker
+ * stalls the whole graph (measured, 12 logical CPUs under load, base model: 4 threads 1.9 s,
+ * 8 threads 1.4 s, 12 threads 12.8 s). So: about half plus two, never below whisper's own 4 when
+ * the machine has them, capped at 8 where the gain flattens. Pure — tested. */
+export function whisperThreads(available: number): number {
+  const n = Math.max(1, Math.floor(available) || 1)
+  if (n <= 4) return n
+  return Math.min(8, Math.max(4, Math.ceil(n / 2) + 2))
 }
 
 /** Local dictation via whisper.cpp (smart-whisper). One loaded model at a
@@ -117,11 +152,38 @@ export class SpeechService {
   }
 }
 
+let loggedBinary = false
+
+/** Linux only — the one platform with a SIMD variant. null = unknown, which picks the baseline. */
+async function readCpuFlags(): Promise<Set<string> | null> {
+  if (process.platform !== 'linux') return null
+  try {
+    return parseCpuFlags(await readFile('/proc/cpuinfo', 'utf8'))
+  } catch {
+    return null
+  }
+}
+
 async function defaultEngineFactory(modelPath: string): Promise<WhisperEngineHandle> {
   let mod: any
   try {
+    // Read by the patched smart-whisper loader (scripts/patch-smart-whisper.mjs) at its first
+    // import; later imports are cached, so setting it again is harmless.
+    const g = globalThis as { __NODETERM_WHISPER_BINARY__?: string; __NODETERM_WHISPER_LOADED__?: string }
+    g.__NODETERM_WHISPER_BINARY__ ??= pickWhisperBinary({
+      platform: process.platform,
+      arch: process.arch,
+      cpuFlags: await readCpuFlags(),
+    })
     // @ts-ignore -- optional native dep: absent until installed, and @ts-ignore stays valid either way (an expect-error would break the build the moment it resolves)
     mod = await import('smart-whisper')
+    if (!loggedBinary) {
+      loggedBinary = true
+      console.info(
+        `[speech] whisper binary: ${g.__NODETERM_WHISPER_LOADED__ ?? 'smart-whisper (unpatched)'}` +
+          ` (wanted ${g.__NODETERM_WHISPER_BINARY__})`,
+      )
+    }
   } catch (err) {
     console.error('[speech] smart-whisper failed to load:', err)
     throw new Error(
@@ -147,9 +209,13 @@ async function defaultEngineFactory(modelPath: string): Promise<WhisperEngineHan
     )
   }
   const whisper = new mod.Whisper(modelPath, { gpu: true })
+  const nThreads = whisperThreads(os.availableParallelism?.() ?? os.cpus().length)
   return {
     async transcribe(pcm, language) {
-      const task = await whisper.transcribe(pcm, { language: language === 'auto' ? 'auto' : language })
+      const task = await whisper.transcribe(pcm, {
+        language: language === 'auto' ? 'auto' : language,
+        n_threads: nThreads,
+      })
       const result = await task.result
       return (Array.isArray(result) ? result.map((r: any) => r.text).join(' ') : String(result ?? '')).trim()
     },

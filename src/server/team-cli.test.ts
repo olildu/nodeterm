@@ -7,6 +7,7 @@ import { startTeamAdmin, adminSocketPath, type AdminStatusResult, type TeamAdmin
 import { genKeyPair, publicKeyToB64 } from '../core/relay/e2ee'
 import type { HostedService, HostedStatus } from '../core/relay/hosted-service'
 import { POP_REFUSED_MESSAGE } from '../core/relay/relay-pop'
+import { SAS_COMPARE_HINT } from '../shared/remote/sas'
 import { BOOTSTRAP_MARKER } from '../core/remote-ssh/share-team-remote'
 
 const KEY = publicKeyToB64(genKeyPair().publicKey)
@@ -182,9 +183,10 @@ describe('describeStatus', () => {
   })
 
   it('pending join requests are listed by their SAS', () => {
-    const text = describeStatus(idleStatus({}, { pending: [{ pendingId: 'x', sas: '123 456', peerKeyB64: 'k', since: 0 }] })).join('\n')
+    const text = describeStatus(idleStatus({}, { pending: [{ pendingId: 'x', sas: '123 456 7890', peerKeyB64: 'k', since: 0 }] })).join('\n')
     expect(text).toMatch(/1 join request/)
-    expect(text).toMatch(/123 456/)
+    expect(text).toMatch(/123 456 7890/)
+    expect(text).toContain(SAS_COMPARE_HINT)
   })
 
   it('tolerates a reply shape it does not know (an older or newer server)', () => {

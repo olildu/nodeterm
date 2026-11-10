@@ -12,6 +12,8 @@
 // and is unrecoverable). Latin1 is lossless byte↔char, which is what makes `decodeOctal`'s
 // byte-per-char output re-assemblable into correct UTF-8 downstream.
 
+import { exactPaneTarget } from './tmux-naming'
+
 export type ControlEvent =
   | { kind: 'output'; paneId: string; data: string }
   | { kind: 'reply'; num: number; ok: boolean; body: string[] }
@@ -34,13 +36,15 @@ export function decodeOctal(s: string): string {
 }
 
 /**
- * A `send-keys` command line that types `data` into `target`. Hex (`-H`) because a control-mode
- * command must fit on ONE text line: it sidesteps every quoting/UTF-8 hazard that `-l` literal mode
- * would need shell-grade escaping for.
+ * A `send-keys` command line that types `data` into the session NAMED `target`. Hex (`-H`) because a
+ * control-mode command must fit on ONE text line: it sidesteps every quoting/UTF-8 hazard that `-l`
+ * literal mode would need shell-grade escaping for. The target is the EXACT form (`=name:`,
+ * tmux-naming.ts `exactPaneTarget`, which also refuses a name this app did not generate): a bare
+ * name prefix-matches a longer session on a miss.
  */
 export function encodeSendKeysHex(target: string, data: string): string {
   const bytes = [...Buffer.from(data, 'utf8')].map((b) => b.toString(16).padStart(2, '0'))
-  return `send-keys -t ${target} -H ${bytes.join(' ')}`
+  return `send-keys -t ${exactPaneTarget(target)} -H ${bytes.join(' ')}`
 }
 
 /**

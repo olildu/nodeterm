@@ -110,8 +110,18 @@ describe('every CSS variable resolves', () => {
     '--term-glass-header-bg',
     '--term-glass-fg',
     '--term-glass-chip-wash', // TerminalNode, status-chip wash per theme (glassChipWash)
+    '--term-glass-backdrop', // TerminalNode, backdrop squeeze per node (glassBackdropFilter)
+    '--glass-node-bg', // App.tsx, canvas-card fill at the slider's alpha (glassSurfaceAlpha)
+    '--glass-node-squeeze', // App.tsx, canvas-card backdrop squeeze (glassChromeBackdropRange)
     '--glass-chrome-bg', // App.tsx, Liquid Glass chrome fill (lib/glassContrast.ts glassChromeAlpha)
     '--glass-control-bg', // App.tsx, Liquid Glass small-control fill (glassChromeAlphas)
+    '--glass-refract', // App.tsx, the rim refraction, only left of the Readable tick (glassRefractionOn)
+    '--frost-x', // GlassFrostSync, the wallpaper's box in flow units, written onto each frost layer
+    '--frost-y',
+    '--frost-w',
+    '--frost-h',
+    '--node-x', // TerminalNode, the node's absolute flow position (its frost layer)
+    '--node-y',
     '--glass-fill', // GlassSlider, the slider value (fills the track)
     '--glass-tick', // GlassSlider, the Readable tick position (the notch)
     '--peer-color', // presence chips, per peer

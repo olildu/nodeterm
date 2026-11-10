@@ -22,6 +22,17 @@ export interface ChatTranscriptPageRequest {
    *  asked for. Readers whose read is expensive (opencode's `export`) may space these out; a
    *  reader that ignores it answers exactly as before. */
   background?: boolean
+  /** Also emit `thinking` parts for claude's readable thinking summaries (the "thinking out loud"
+   *  lines its TUI prints between tool calls). Opt-in so every other caller — the phone's
+   *  `chat.page`, and the Swift ports locked to the shared fixtures — gets the same parts as before.
+   *  Only claude's reader honours it. */
+  thinking?: boolean
+  /** Also emit the parts only the desktop ⌘M panel draws (`ChatParseOptions.rich`): an `image` part
+   *  for each image the user attached to a prompt, a `diff` on each `Edit` / `Write` call, a
+   *  `Compaction` chip in place of a context compaction's summary record, and a checklist `body` on
+   *  each `TodoWrite` call. Opt-in for the same reason as `thinking` (the phone and the Swift ports
+   *  locked to the shared fixtures never set it). Only claude's reader honours it. */
+  rich?: boolean
 }
 
 /** A validated page: `before: null` = end of file. */
@@ -30,6 +41,10 @@ export interface ChatTranscriptPage {
   maxBytes: number
   /** Present (and `true`) only for a background live refresh — see the request field. */
   background?: true
+  /** Present (and `true`) only when the caller asked for thinking parts — see the request field. */
+  thinking?: true
+  /** Present (and `true`) only when the caller asked for rich parts — see the request field. */
+  rich?: true
 }
 
 /**
@@ -57,8 +72,14 @@ export function normalizeChatPage(page: unknown): ChatTranscriptPage | null {
   if (typeof maxBytes === 'number' && Number.isFinite(maxBytes)) {
     m = Math.min(CHAT_PAGE_MAX_BYTES, Math.max(CHAT_PAGE_MIN_BYTES, Math.floor(maxBytes)))
   }
-  const { background } = page as { background?: unknown }
-  return background === true ? { before: b, maxBytes: m, background: true } : { before: b, maxBytes: m }
+  const { background, thinking, rich } = page as { background?: unknown; thinking?: unknown; rich?: unknown }
+  return {
+    before: b,
+    maxBytes: m,
+    ...(background === true ? { background: true as const } : {}),
+    ...(thinking === true ? { thinking: true as const } : {}),
+    ...(rich === true ? { rich: true as const } : {})
+  }
 }
 
 /**

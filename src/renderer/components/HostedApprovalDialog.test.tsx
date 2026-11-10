@@ -11,6 +11,7 @@ import { createRoot, type Root } from 'react-dom/client'
 import { HostedApprovalDialog } from './HostedApprovalDialog'
 import { CONFIRM_ARM_MS } from './confirm-key'
 import { openDialogCount, pushDialog, popDialog, resetDialogStack } from './dialog-stack'
+import { SAS_COMPARE_HINT } from '@shared/remote/sas'
 
 ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -30,7 +31,7 @@ afterEach(() => {
 
 const pending = (over: Partial<{ pendingId: string; sas: string; peerKeyB64: string; since: number }> = {}) => ({
   pendingId: 'p',
-  sas: '123 456',
+  sas: '123 456 7890',
   peerKeyB64: 'AAAABBBBCCCC',
   since: 0,
   ...over
@@ -58,7 +59,10 @@ const key = (target: EventTarget, init: KeyboardEventInit) => {
 describe('HostedApprovalDialog', () => {
   it('defaults to Viewer, shows SAS + fingerprint, and approves with the chosen role', () => {
     const { onApprove } = mount()
-    expect(byText('123 456')).toBeTruthy()
+    expect(byText('123 456 7890')).toBeTruthy()
+    // The ten-digit code carries the comparison rule under it (an older joiner shows six digits).
+    expect(text()).toContain(SAS_COMPARE_HINT)
+    expect(text().indexOf('123 456 7890')).toBeLessThan(text().indexOf(SAS_COMPARE_HINT))
     expect(text()).toMatch(/AAAA·BBBB/)
     expect(roleSelect().value).toBe('viewer')
     act(() => {

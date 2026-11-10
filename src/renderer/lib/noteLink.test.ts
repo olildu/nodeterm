@@ -14,8 +14,10 @@ import {
   contextLinkForEdge,
   edgeToBridge,
   linkReadPairs,
-  isCurrentLinkDirection
+  isCurrentLinkDirection,
+  usesLinkedContextSkill
 } from './noteLink'
+import { setCustomAgentBaseResolver } from '@shared/agents/config'
 import type { CanvasNodeState } from '@shared/types'
 import { LINK_NOT_LINKABLE } from '@shared/canvas-link'
 
@@ -226,11 +228,44 @@ describe('buildContextLinkNote', () => {
     expect(msg).toContain('[nodeterm] You are now linked to "Builder"')
     expect(msg).toContain('get-linked-context skill')
   })
+  it('cursor (reads ~/.claude/skills) gets the skill wording; grok, unverified, keeps the CLI', () => {
+    expect(buildContextLinkNote('cursor', 'Builder', '/x/context.sh')).toContain('get-linked-context skill')
+    expect(buildNotePushMessage('N', 'x'.repeat(3000), 'cursor')).toContain('get-linked-context skill')
+    expect(buildContextLinkNote('grok', 'Builder', '/x/context.sh')).toContain('sh "/x/context.sh"')
+  })
+  it('a custom agent words it as its base does: claude-base and cursor-base alike (LINKED_CONTEXT_SKILL_AGENTS)', () => {
+    setCustomAgentBaseResolver((id) => (id === 'my-claude' ? 'claude' : id === 'my-cursor' ? 'cursor' : id === 'my-grok' ? 'grok' : undefined))
+    try {
+      for (const id of ['my-claude', 'my-cursor']) {
+        expect(usesLinkedContextSkill(id), id).toBe(true)
+        expect(buildContextLinkNote(id, 'Builder', '/x/context.sh'), id).toContain('get-linked-context skill')
+      }
+      expect(usesLinkedContextSkill('my-grok')).toBe(false)
+    } finally {
+      setCustomAgentBaseResolver(null)
+    }
+  })
   it('codex/gemini get the inline CLI command, single line', () => {
     const msg = buildContextLinkNote('codex', 'Builder', '/x/context.sh')
     expect(msg).toContain('sh "/x/context.sh"')
     expect(msg).toContain('Builder')
     expect(msg).not.toContain('\n')
+  })
+  it('a Windows core: codex/gemini are told to run the .cmd launcher; claude keeps the skill line', () => {
+    const msg = buildContextLinkNote('codex', 'Builder', 'C:\\d\\context.sh', 'win32')
+    expect(msg).toContain('run: & "C:\\d\\context.cmd" list')
+    expect(msg).not.toContain('sh "')
+    expect(msg).not.toContain('\n')
+    expect(buildContextLinkNote('claude', 'Builder', 'C:\\d\\context.sh', 'win32')).toBe(
+      buildContextLinkNote('claude', 'Builder', 'C:\\d\\context.sh')
+    )
+  })
+  it('a POSIX or unknown core (remote node, older core) keeps the exact sh line', () => {
+    for (const host of [undefined, 'linux', 'darwin']) {
+      expect(buildContextLinkNote('gemini', 'Builder', '/x/context.sh', host)).toBe(
+        buildContextLinkNote('gemini', 'Builder', '/x/context.sh')
+      )
+    }
   })
   it('every variant says the note is informational — no action now', () => {
     // The message is injected + submitted as a prompt, so an agent that reads it as a task

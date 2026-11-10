@@ -102,7 +102,9 @@ vi.mock('child_process', () => {
     execCalls.push({ file, args })
     const ok = (stdout: string): void => cb?.(null, { stdout, stderr: '' })
     if (args.includes('has-session')) {
-      const target = args[args.indexOf('-t') + 1]
+      // Production asks with the EXACT form (`=nt-…` / `=nt-…:`); tmux matches it against the name.
+      const raw = args[args.indexOf('-t') + 1]
+      const target = raw.startsWith('=') ? raw.slice(1).replace(/:$/, '') : raw
       if (liveTmuxSessions.has(target)) ok('')
       // Real execFile carries tmux's exit status on err.code — 1 is what probeSaysAbsent
       // reads as genuine absence (vs a spawn failure, which has a string/no code).
@@ -265,8 +267,12 @@ describe('SINGLE-USER REGRESSION: co-attach must not change the solo path', () =
     expect(args[args.indexOf('-c') + 1]).toBe(cwd)
     expect(args.slice(-2)).toEqual(['-s', sessionName('solo-1')])
     // The spawned process env is the pre-co-attach env: forced TERM, no inherited TMUX nesting,
-    // and the real login-shell PATH.
-    expect(spawnArgs[0].cwd).toBe(cwd)
+    // and the real login-shell PATH. The CLIENT runs from a stable dir, never the node's: the
+    // pane's directory is the `-c` above (issue #1131 — a client in the project dir can start the
+    // shared server there, and tmux 3.7 then drops every later pane's `-c` once that dir is gone).
+    const { localTmuxClientCwd } = await import('./pty-manager')
+    expect(spawnArgs[0].cwd).toBe(localTmuxClientCwd())
+    expect(spawnArgs[0].cwd).not.toBe(cwd)
     expect(env.TERM).toBe('xterm-256color')
     expect(env.TMUX).toBeUndefined()
     expect(env.TMUX_PANE).toBeUndefined()
@@ -792,7 +798,8 @@ describe('SINGLE-USER REGRESSION: co-attach must not change the solo path', () =
     kill(sessionId)
     const captures = tmuxCalls('capture-pane')
     expect(captures).toHaveLength(1)
-    expect(captures[0].args[captures[0].args.indexOf('-t') + 1]).toBe(sessionName('solo-1'))
+    // Exact (`=name:`): a bare target prefix-matches a longer session (tmux-naming `exactPaneTarget`).
+    expect(captures[0].args[captures[0].args.indexOf('-t') + 1]).toBe(`=${sessionName('solo-1')}:`)
   })
 
   it('killAll (app quit) detaches the client but never kills the tmux session', async () => {

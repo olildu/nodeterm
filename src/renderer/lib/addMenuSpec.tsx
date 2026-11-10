@@ -30,6 +30,8 @@
 import type { ReactNode } from 'react'
 import type { MenuItem } from '../components/ContextMenu'
 import { ACCOUNT_CAPABLE_AGENT_IDS } from '@shared/agents/account-binding'
+import { SIMULATOR_SSH_HINT } from '@shared/simulator'
+import { isBrowserRuntime } from '../bridge/runtime'
 import {
   IconAgent,
   IconBranch,
@@ -40,10 +42,12 @@ import {
   IconExplorer,
   IconGroup,
   IconNote,
+  IconPhone,
   IconPlay,
   IconRemote,
   IconTerminal,
   IconWeb,
+  IconWhiteboard,
   IconBellFilled
 } from '../components/icons'
 
@@ -59,9 +63,11 @@ export type AddItem =
   | { kind: 'terminal' }
   | { kind: 'remote' }
   | { kind: 'run' } // disabledOnSsh
+  | { kind: 'simulator' } // macOS desktop only
   | { kind: 'browser' }
   | { kind: 'web' }
   | { kind: 'sticky' }
+  | { kind: 'whiteboard' }
   | { kind: 'files' } // requiresCwd
   | { kind: 'dino' }
   | { kind: 'agentsim' } // disabled unless the desktop app on macOS
@@ -82,6 +88,8 @@ export const CONTENT_ADD_ITEMS: readonly AddItem[] = [
   { kind: 'terminal' },
   { kind: 'remote' },
   { kind: 'run' },
+  { kind: 'simulator' },
+  { kind: 'whiteboard' },
   { kind: 'browser' },
   { kind: 'web' },
   { kind: 'sticky' },
@@ -107,6 +115,12 @@ export interface AddCtx {
    * available — the node explains itself if the helper turns out to be missing.
    */
   simulatorUnavailable?: string
+  /** Whether the core that owns the active project runs on Windows (`hostPlatformFor`). Disables
+   *  "New run configuration" — its launcher is a POSIX `sh` script. Absent = not Windows. */
+  isWindowsCore?: boolean
+  /** Whether the active project is a relay tab (another machine's core). Disables "New simulator":
+   *  the node would show THIS machine's devices inside the host's project. Absent = not relay. */
+  isRelayTab?: boolean
 }
 
 /**
@@ -122,6 +136,8 @@ export interface AddHandlers {
   remote: (screenPos: { x: number; y: number }) => void
   /** A run node (a `.vscode/launch.json` configuration with Run/Stop/Restart), in the project folder. */
   run: (at?: AddPos) => void
+  /** A Simulator node: a live iOS simulator screen with touch, keyboard and buttons. */
+  simulator: (at?: AddPos) => void
   browser: (at?: AddPos) => void
   web: (at?: AddPos) => void
   sticky: (at?: AddPos) => void
@@ -129,6 +145,7 @@ export interface AddHandlers {
   dino: (at?: AddPos) => void
   /** Adds a simulator node: an iOS Simulator or Android emulator of this host, drawn inside the canvas (desktop, macOS). */
   agentsim: (at?: AddPos) => void
+  whiteboard: (at?: AddPos) => void
   /** Adds a trigger node (issue #493) — a canvas-owned schedule that fires into another node. */
   trigger: (at?: AddPos) => void
   openFile: (at?: AddPos) => void
@@ -142,6 +159,35 @@ export interface AddHandlers {
 export const WORKTREE_SSH_HINT = 'Not supported in SSH projects yet'
 /** A run node's launcher, processes and (Flutter) simulators all live on THIS machine. */
 export const RUN_SSH_HINT = 'Run configurations run on this machine — not in SSH projects yet'
+/** iOS simulators live on the Mac the desktop app runs on; a browser tab (Server Edition) is not it. */
+export const SIMULATOR_UNAVAILABLE_HINT = 'Simulators need the desktop app'
+/** Whether this renderer can show a Simulator node: the desktop app on any OS — Android emulators
+ *  run everywhere; iOS simulators are simply absent from the list off macOS. Not a Server Edition
+ *  tab, whose emulators would be the server's. */
+export function simulatorAvailable(relayTab = false): boolean {
+  return !isBrowserRuntime() && !relayTab
+}
+/** A relay tab's project lives on another machine; this machine's simulators do not belong in it. */
+export const SIMULATOR_RELAY_HINT = 'Simulators run on this machine — not in a relay tab'
+export { SIMULATOR_SSH_HINT }
+/** The simulator row's gate, one rule for the menu, the Dock, ⌘K and the canvas refusal. */
+export function simulatorRefusal(relayTab = false, sshProject = false): string | undefined {
+  if (isBrowserRuntime()) return SIMULATOR_UNAVAILABLE_HINT
+  if (relayTab) return SIMULATOR_RELAY_HINT
+  if (sshProject) return SIMULATOR_SSH_HINT
+  return undefined
+}
+
+/** The core's launcher is a POSIX `sh` script stopped by POSIX signals (see `RUN_WINDOWS_REASON`). */
+export const RUN_WINDOWS_HINT = 'Run configurations that launch a process are not supported on Windows yet'
+
+/** The run row's gate, one rule for the menu and the Dock: SSH first (its reason is the more
+ *  specific one), then a Windows core. */
+function runGate(ctx: AddCtx): { disabled: boolean; hint?: string } {
+  if (ctx.isSshProject) return { disabled: true, hint: RUN_SSH_HINT }
+  if (ctx.isWindowsCore) return { disabled: true, hint: RUN_WINDOWS_HINT }
+  return { disabled: false }
+}
 
 /**
  * The two rows that need a project FOLDER, shown disabled with their reason rather than hidden.
@@ -186,12 +232,22 @@ export function contentAddItemsToMenuItems(
       case 'remote':
         out.push({ label: 'New remote…', icon: <IconTerminal />, onClick: () => handlers.remote(remotePos) })
         break
+      case 'simulator': {
+        const refusal = simulatorRefusal(ctx.isRelayTab, ctx.isSshProject)
+        out.push({
+          label: 'New simulator',
+          icon: <IconPhone />,
+          disabled: !!refusal,
+          hint: refusal,
+          onClick: () => handlers.simulator(at)
+        })
+        break
+      }
       case 'run':
         out.push({
           label: 'New run configuration',
           icon: <IconPlay />,
-          disabled: ctx.isSshProject,
-          hint: ctx.isSshProject ? RUN_SSH_HINT : undefined,
+          ...runGate(ctx),
           onClick: () => handlers.run(at)
         })
         break
@@ -218,12 +274,15 @@ export function contentAddItemsToMenuItems(
           onClick: () => handlers.files(at)
         })
         break
+      case 'whiteboard':
+        out.push({ label: 'New whiteboard', icon: <IconWhiteboard />, onClick: () => handlers.whiteboard(at) })
+        break
       case 'dino':
         out.push({ label: 'New dino game', icon: <IconDino />, onClick: () => handlers.dino(at) })
         break
       case 'agentsim':
         out.push({
-          label: 'New simulator / emulator',
+          label: 'New simulator (agent-drivable)',
           icon: <IconSimulator />,
           disabled: !!ctx.simulatorUnavailable,
           hint: ctx.simulatorUnavailable,
@@ -305,13 +364,24 @@ export function contentAddItemsToDockRows(
         // The Dock uses its own "New Remote Connection" affordance, not the remote picker. Skip
         // here so the Dock's content rows don't duplicate it.
         break
+      case 'simulator': {
+        const refusal = simulatorRefusal(ctx.isRelayTab, ctx.isSshProject)
+        out.push({
+          kind: 'simulator',
+          label: 'Simulator',
+          icon: <IconPhone />,
+          disabled: !!refusal,
+          hint: refusal,
+          onClick: () => handlers.simulator()
+        })
+        break
+      }
       case 'run':
         out.push({
           kind: 'run',
           label: 'Run Configuration',
           icon: <IconPlay />,
-          disabled: ctx.isSshProject,
-          hint: ctx.isSshProject ? RUN_SSH_HINT : undefined,
+          ...runGate(ctx),
           onClick: () => handlers.run()
         })
         break
@@ -333,6 +403,9 @@ export function contentAddItemsToDockRows(
           hint: ctx.hasCwd ? undefined : FILES_NO_CWD_HINT,
           onClick: () => handlers.files()
         })
+        break
+      case 'whiteboard':
+        out.push({ kind: 'whiteboard', label: 'Whiteboard', icon: <IconWhiteboard />, onClick: () => handlers.whiteboard() })
         break
       case 'dino':
         out.push({ kind: 'dino', label: 'Dino Game', icon: <IconDino />, onClick: () => handlers.dino() })
@@ -417,12 +490,14 @@ export const ADD_ITEM_GROUP: Record<AddItem['kind'], AddGroupId> = {
   terminal: 'top',
   remote: 'top',
   run: 'view',
+  simulator: 'view',
   browser: 'view',
   web: 'view',
   sticky: 'view',
   files: 'view',
   dino: 'view',
   agentsim: 'view',
+  whiteboard: 'view',
   'open-file': 'files',
   'new-file': 'files',
   'spawn-team': 'orchestrate',

@@ -21,6 +21,7 @@ const KIND_LABEL: Partial<Record<NodeKind, string>> = {
   browser: 'browser',
   dino: 'dino',
   agentsim: 'simulator',
+  whiteboard: 'whiteboard',
   group: 'group'
 }
 

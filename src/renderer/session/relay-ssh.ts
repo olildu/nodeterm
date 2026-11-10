@@ -19,9 +19,18 @@ import { withoutCoreOrigin } from '@shared/node-exec'
  * (`projectMayDialSsh`) — defence in depth: either half alone closes the hole.
  *
  * What survives:
- *  - `sshRemoteTmux` on a node — a plain boolean. It keeps `requireRemote` on the create the tab
- *    sends to the HOST's core, which then co-attaches when the host holds the session live and
- *    refuses otherwise; it never creates a local session on the host under the node's identity.
+ *  - `sshRemoteTmux` on a node — a plain boolean — but only on nodes that still CARRY it: the
+ *    host's SSH-project nodes it is serving over the relay as they are. On such a node it keeps
+ *    `requireRemote` on the create the tab sends to the HOST's core, which then co-attaches when
+ *    the host holds the session live and refuses otherwise; it never creates a local session on
+ *    the host under the node's identity. A project shared from SSH WITH A TEAM is different: the
+ *    host ADOPTS it (`team bootstrap` → `localizeAdoptedNode` drops `sshRemoteTmux`/`ssh`/`sshFs`,
+ *    correct for the host, which now runs those sessions itself), so its nodes reach the tab as
+ *    plain terminals and nothing on the node says "remote". What keeps them off THIS core is the
+ *    session keying — Canvas's node subtree and the card modal run under the project's relay
+ *    session (an unbound one under the offline relay session) — and `spawnBelongsElsewhere`
+ *    (session/owning-project.ts), which refuses a remote project's spawn under any other session.
+ *    Do NOT re-stamp `sshRemoteTmux` onto those nodes: the host would refuse its own sessions.
  *  - `relaySsh` on the project — display-only strings for the tab's `SSH user@host` chip. It is not
  *    an `SshConnection` and nothing that dials reads it.
  *  - A plain `ssh <host>` node (`ssh` without `sshRemoteTmux`) keeps its connection: its create runs

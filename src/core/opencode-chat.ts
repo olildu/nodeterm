@@ -36,6 +36,7 @@ import { CHAT_TOOL_ARG_MAX } from '../shared/chat-command'
 import { CHAT_PAGE_MAX_BYTES, type ChatTranscriptPage } from '../shared/chat-page'
 import { findInLoginPath } from './exec-path'
 import { isSafeOpencodeSessionId, runOpencodeExportAt, type OpencodeExportOutcome } from './opencode-export'
+import { isRecord } from '../shared/is-record'
 
 /** Same bounds as claude's reader (`summarizeResult` / `metaString`). */
 const TOOL_RESULT_LINES = 3
@@ -55,8 +56,6 @@ export interface OpencodeChatParse {
   effort?: string
 }
 
-const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
-
 function metaString(v: unknown): string | undefined {
   return typeof v === 'string' && v.length > 0 && v.length <= CHAT_META_MAX_CHARS ? v : undefined
 }
@@ -75,14 +74,14 @@ function summarize(text: string): string {
  */
 export function opencodeToolArg(input: unknown, title?: unknown): string {
   let v: unknown
-  if (isObj(input)) {
+  if (isRecord(input)) {
     for (const k of ['command', 'filePath', 'file_path', 'pattern', 'path', 'url', 'query', 'description', 'prompt', 'name']) {
       if (typeof input[k] === 'string') {
         v = input[k]
         break
       }
     }
-    if (v === undefined && Array.isArray(input.questions) && isObj(input.questions[0])) {
+    if (v === undefined && Array.isArray(input.questions) && isRecord(input.questions[0])) {
       const q = input.questions[0].question
       if (typeof q === 'string') v = q
     }
@@ -94,7 +93,7 @@ export function opencodeToolArg(input: unknown, title?: unknown): string {
 /** A tool part's chip. `null` = not a mappable tool part. */
 function toolPart(p: Record<string, unknown>): ToolPart | null {
   const state = p.state
-  if (!isObj(state)) return null
+  if (!isRecord(state)) return null
   const part: ToolPart = {
     kind: 'tool',
     name: typeof p.tool === 'string' && p.tool ? p.tool : 'tool',
@@ -114,9 +113,9 @@ function toolPart(p: Record<string, unknown>): ToolPart | null {
 
 /** The sentence an errored assistant message ends with. `null` = malformed (counted as skipped). */
 function errorText(e: unknown): string | null {
-  if (!isObj(e)) return null
+  if (!isRecord(e)) return null
   const name = typeof e.name === 'string' && e.name ? e.name : 'Error'
-  const message = isObj(e.data) && typeof e.data.message === 'string' ? e.data.message.trim() : ''
+  const message = isRecord(e.data) && typeof e.data.message === 'string' ? e.data.message.trim() : ''
   return message ? `[${name}] ${message}` : `[${name}]`
 }
 
@@ -138,14 +137,14 @@ export function parseOpencodeExport(raw: string, sessionId: string): OpencodeCha
   } catch {
     return null
   }
-  if (!isObj(doc) || !isObj(doc.info) || doc.info.id !== sessionId) return null
+  if (!isRecord(doc) || !isRecord(doc.info) || doc.info.id !== sessionId) return null
 
   const messages: ChatMessage[] = []
   let skipped = 0
   let lastAssistant: Record<string, unknown> | undefined
   const entries = Array.isArray(doc.messages) ? doc.messages : []
   for (const entry of entries) {
-    if (!isObj(entry) || !isObj(entry.info)) {
+    if (!isRecord(entry) || !isRecord(entry.info)) {
       skipped++
       continue
     }
@@ -160,7 +159,7 @@ export function parseOpencodeExport(raw: string, sessionId: string): OpencodeCha
       skipped++
       continue
     }
-    const created = isObj(info.time) ? info.time.created : undefined
+    const created = isRecord(info.time) ? info.time.created : undefined
     const at = typeof created === 'number' && Number.isFinite(created) ? created : undefined
     const stamp = (m: ChatMessage): ChatMessage => (at === undefined ? m : { ...m, at })
 
@@ -169,7 +168,7 @@ export function parseOpencodeExport(raw: string, sessionId: string): OpencodeCha
     const own: ChatPart[] = []
     const chips: ChatPart[] = []
     for (const p of entry.parts) {
-      if (!isObj(p) || typeof p.type !== 'string') {
+      if (!isRecord(p) || typeof p.type !== 'string') {
         skipped++
         continue
       }

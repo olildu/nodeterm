@@ -54,13 +54,17 @@ const ALLOWED = new Map<string, { calls: number; why: string }>([
   [
     'index.ts',
     {
-      calls: 14,
+      calls: 18,
       why:
-        '3 second-instance restore/show/focus (the user launched the app again); 1 first-paint ' +
+        '3 raiseForUserLaunch restore/show/focus (the user launched the app again, or clicked a nodeterm:// link — a link reaches us as a second launch or open-url); 1 first-paint ' +
         'show (once, never on — #737); 4 file-drop IPC restore/show/app.focus(steal)/focus, now ' +
         'sender-guarded (a real drop, and macOS does not activate a drop destination by itself); ' +
         '3 notification-CLICK restore/show/focus — the one legitimate exception, a tap; 1 ' +
-        "Notification.show() posting it; 2 app.on('activate') show/focus (Dock click)"
+        "Notification.show() posting it; 2 app.on('activate') show/focus (Dock click); 3 " +
+        'showMainWindowFromBackground restore/show/focus — reached only from a tray click / tray ' +
+        '"Open nodeterm" / a click on the background-hint toast (Windows/Linux background mode); ' +
+        "1 Notification.show() posting that one-time hint, raised by the user's own window close " +
+        '(a notification is not a window raise). The taskbar flashFrame(true) is attention, not a raise'
     }
   ],
   [
@@ -75,12 +79,21 @@ const ALLOWED = new Map<string, { calls: number; why: string }>([
   [
     'notch-hud.ts',
     {
-      calls: 5,
+      calls: 4,
+      why:
+        'setAlwaysOnTop for the HUD panel itself, which is shown with showInactive and never ' +
+        "takes focus; and restore/show/focus in the HUD row's own click handler — a click on a " +
+        'nodeterm surface'
+    }
+  ],
+  [
+    'dock-presence.ts',
+    {
+      calls: 1,
       why:
         'app.dock.show() (Dock PRESENCE, not a raise — it keeps the focusable:false HUD from ' +
-        'making the app look like an accessory); setAlwaysOnTop for the HUD panel itself, which ' +
-        'is shown with showInactive and never takes focus; and restore/show/focus in the HUD ' +
-        "row's own click handler — a click on a nodeterm surface"
+        'making the app look like an accessory), and only when the app has actually lost its ' +
+        'Dock tile (issue #1305)'
     }
   ],
   [

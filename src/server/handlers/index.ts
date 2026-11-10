@@ -6,8 +6,10 @@ import { DOWNLOAD_PATH, downloadName } from '../download'
 import { GitService } from '../../core/git-service'
 import { generateCommitMessage } from '../../core/commit-message'
 import { registerFsHandlers } from '../../core/fs-handlers'
+import type { WhiteboardLocation } from '../../core/whiteboards'
 import { claudeCliCaps, registerClaudeCliIpc } from '../../core/claude-cli'
 import { registerGrokCliIpc } from '../../core/grok-cli'
+import { registerCursorCliIpc } from '../../core/cursor-cli'
 import { registerCodexIdentityIpc } from '../../core/codex-identity-caps'
 import { registerCodexCliIpc } from '../../core/codex-cli'
 import { registerWallpaperIpc } from '../../core/wallpaper'
@@ -35,6 +37,8 @@ export function registerCoreHandlers(
     downloadTickets?: DownloadTickets
     /** See fs-handlers' dep of the same name — the canvas-image write directory. */
     localProjectCwd?: (projectId: string) => string | undefined
+    /** See fs-handlers' dep of the same name — where a project's whiteboards go. */
+    whiteboardLocation?: (projectId: string) => Omit<WhiteboardLocation, 'userDataDir'>
   }
 ): { gitService: GitService } {
   // Explorer downloads: mint a one-shot ticket over this (authenticated) channel; the transfer
@@ -54,7 +58,8 @@ export function registerCoreHandlers(
           return { url: `${DOWNLOAD_PATH}?t=${encodeURIComponent(token)}`, name: downloadName(p, dir) }
         }
       : undefined,
-    localProjectCwd: deps.localProjectCwd
+    localProjectCwd: deps.localProjectCwd,
+    whiteboardLocation: deps.whiteboardLocation
   })
 
   const gitService = new GitService()
@@ -79,6 +84,7 @@ export function registerCoreHandlers(
   // Invariant 11 for probes: registered in BOTH shells, or session-id minting silently works on
   // the desktop and not in the browser, with nothing to say which.
   registerGrokCliIpc()
+  registerCursorCliIpc()
   // The codex CLI's own approval vocabulary, and this one is registered FOR REAL rather than
   // stubbed. `registerCodexIdentityIpc` below declines a shared app-server on purpose; this is the
   // opposite case, and the distinction matters — the Server Edition's Codex sessions run on THIS

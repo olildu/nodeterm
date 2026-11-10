@@ -19,7 +19,7 @@ import { chmodSync, lstatSync, rmSync } from 'node:fs'
 import { ensurePrivateDir } from './private-dir'
 import { TeamStore, TEAM_LABEL_MAX, TEAM_PROJECT_ID_MAX } from './team-store'
 import { loadHostKey } from './host-key'
-import { publicKeyFromB64, publicKeyToB64 } from './e2ee'
+import { isLowOrderPublicKey, publicKeyToB64 } from './e2ee'
 import { ADMIN_ERROR_CODE_RE, adminErrorCode } from './admin-error'
 import { runBootstrap } from './team-bootstrap'
 import { parseResumeSessions, type ResumeEntry, type ResumeResult } from '../../shared/share-team'
@@ -149,14 +149,11 @@ export function socketPathProblem(sock: string, platform: NodeJS.Platform = proc
  *  (missing padding, stray whitespace — Node's base64 decoder skips both) would be written to the
  *  team and never match anyone. */
 export function ownerKeyProblem(key: string): string | null {
-  let bytes: Uint8Array
-  try {
-    bytes = publicKeyFromB64(key)
-  } catch {
-    const got = Buffer.from(key, 'base64').length
+  const bytes = Buffer.from(key, 'base64')
+  if (bytes.length !== 32) {
     return (
       `That is not a device key: a device key is 32 bytes of base64 (44 characters ending in "="), ` +
-      `and this decodes to ${got} bytes. Check that the whole key was copied.`
+      `and this decodes to ${bytes.length} bytes. Check that the whole key was copied.`
     )
   }
   if (publicKeyToB64(bytes) !== key) {
@@ -164,6 +161,12 @@ export function ownerKeyProblem(key: string): string | null {
       'That is not a device key in canonical base64 form — check for a typo, a missing "=", ' +
       'spaces, or "-"/"_" in place of "+"/"/".'
     )
+  }
+  // A low-order X25519 point: no device holds a secret for it, and the relay handshake refuses it
+  // (its shared secret is a public constant). Writing it to team.json would name a member nobody
+  // could ever be — or, before that refusal existed, everybody.
+  if (isLowOrderPublicKey(Uint8Array.from(bytes))) {
+    return 'That is not a usable device key: it is a low-order X25519 point, which the relay refuses.'
   }
   return null
 }

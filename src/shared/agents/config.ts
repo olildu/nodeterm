@@ -12,6 +12,7 @@ export type BuiltinAgentId =
   | 'grok'
   | 'copilot'
   | 'antigravity'
+  | 'cursor'
 // Open type — custom agents are any string ('custom:<uuid>'). Never restrict the set.
 export type AgentId = BuiltinAgentId | (string & {})
 
@@ -89,7 +90,8 @@ export const BUILTIN_AGENT_IDS: readonly BuiltinAgentId[] = [
   'gemini',
   'opencode',
   'grok',
-  'copilot'
+  'copilot',
+  'cursor'
 ]
 
 export const AGENT_CONFIG: Record<BuiltinAgentId, AgentConfig> = {
@@ -171,6 +173,36 @@ export const AGENT_CONFIG: Record<BuiltinAgentId, AgentConfig> = {
     promptInjectionMode: 'flag-interactive',
     promptFlag: '--prompt-interactive',
     expectedProcess: 'agy'
+  },
+  cursor: {
+    // Cursor Agent CLI. Measured on `cursor-agent` 2026.09.23-86fc751 (macOS).
+    label: 'Cursor',
+    // Cursor's own mark is monochrome, so there is no brand hue to borrow. The first pick, a neutral
+    // grey (#6b7280), was OKLab 0.018 from Grok's #64748b: the two swatches looked identical in the
+    // picker, sidebar, kanban and minimap (review 2026-10-03). This magenta is at least 0.12 OKLab
+    // from every palette swatch (system, agent and FALLBACK_AGENT_COLOR; nearest: system red), and
+    // about 4:1 against both the dark (#1e1e1e) and light (#fff) canvas as a dot or border. It is an
+    // agent colour, so it never carries text (SYSTEM_NODE_COLORS owns those surfaces).
+    // `node-colors.test.ts` pins the distance.
+    color: '#d9468f',
+    // Not `agent`: the CLI installs that alias too, and grok ships a binary of the same name.
+    launchCmd: 'cursor-agent',
+    // Usage is `agent [options] [command] [prompt...]`, so a one-word prompt collides with a
+    // subcommand (`login`, `update`, `ls`, ...). Unlike grok, `--` does NOT help: measured,
+    // `cursor-agent -- whoami` still runs `whoami`. The `agent` subcommand ("Start the Cursor
+    // Agent") takes the prompt with no subcommands of its own: `cursor-agent agent whoami` opens
+    // the TUI with "whoami" as the prompt. `stdin-after-start` is out: a first launch in a folder
+    // shows a workspace-trust dialog that a typed prompt + Enter would answer.
+    // MEASURED (2026.09.28): flags BEFORE `agent` reach the session. `agent` is a commander
+    // subcommand with no options of its own; its action reads the ROOT program's options, and root
+    // parses `--model` / `--force` / `--mode` wherever they sit (before or after `agent`, both
+    // measured in the TUI). So the composers' flags-before-separator placement is correct.
+    promptInjectionMode: 'argv',
+    argvPromptSeparator: 'agent',
+    // The wrapper script runs `exec -a "$0" node index.js`, so ps shows argv0 `cursor-agent`.
+    expectedProcess: 'cursor-agent',
+    // The two env overrides `cursor-agent --help` names for auth and endpoint.
+    vanillaEnvPattern: '^CURSOR_API_(KEY|ENDPOINT)$'
   }
 }
 
@@ -180,6 +212,7 @@ export const AGENT_CONFIG: Record<BuiltinAgentId, AgentConfig> = {
 // antigravity joined with ONLY this list: its normalizer (normalizeAntigravity) and its
 // installer are the leaves that exist. Every other list below is a separate leaf it does not have
 // yet — see the `antigravity capabilities` block in config.capabilities.test.ts for each reason.
+// cursor joined the same way (normalizeCursor + hooks/cursor.ts); see docs/cursor-agent.md.
 export const AGENT_HOOK_TARGETS = [
   'claude',
   'codex',
@@ -187,7 +220,8 @@ export const AGENT_HOOK_TARGETS = [
   'opencode',
   'grok',
   'copilot',
-  'antigravity'
+  'antigravity',
+  'cursor'
 ] as const
 // antigravity: `agy --conversation=<id>` — the `=` spelling agy prints in its own exit hint
 // (`agy --conversation=%s`, 1.2.12 binary). The id is the hook payload's `conversationId`, recorded
@@ -196,6 +230,11 @@ export const AGENT_HOOK_TARGETS = [
 // the history, never the launch. Without membership a cold restore (machine reboot) brought an agy
 // node back as a bare shell under an Antigravity badge (`canColdRestore` needs `canResume`).
 // UNVERIFIED on a device: that the hook's conversationId is the id `--conversation` accepts.
+//
+// cursor: `cursor-agent --resume <conversation_id>` (measured 2026.09.28, docs/cursor-agent.md). The
+// flag is a root option with an OPTIONAL value, so it goes BEFORE the `agent` subcommand and its id
+// must directly follow it. A dead id is the SAFE failure: cursor opens an EMPTY chat that ADOPTS the
+// requested id (exit 0, no error), so a wrong id costs the history, never the launch.
 export const RESUMABLE_AGENTS = [
   'claude',
   'codex',
@@ -203,7 +242,8 @@ export const RESUMABLE_AGENTS = [
   'opencode',
   'grok',
   'copilot',
-  'antigravity'
+  'antigravity',
+  'cursor'
 ] as const
 // Agents whose session id we MINT at launch (`--session-id <uuid>`) instead of learning it only
 // from hook events. Each member must have a measured caller-chosen-id grammar below.
@@ -221,7 +261,7 @@ export const RESUMABLE_AGENTS = [
 // clear/fork/compact), so hooks remain the only way to TRACK an id after launch. What minting
 // guarantees is that a node always has SOME resumable id, so the worst case degrades from "the
 // conversation is gone" to "continuity since the last /clear is gone".
-export const SESSION_ID_CAPABLE = ['claude', 'copilot', 'grok'] as const
+export const SESSION_ID_CAPABLE = ['claude', 'copilot', 'grok', 'cursor'] as const
 // Claude's flag is version-gated and comes from the Claude CLI probe. Copilot's installed 1.0.80
 // binary and current official reference accept `--session-id=<uuid>`, so it does not borrow an
 // unrelated Claude probe result. Custom agents resolve through their declared base harness.
@@ -234,7 +274,15 @@ export const SESSION_ID_CAPABLE = ['claude', 'copilot', 'grok'] as const
 // LAUNCH ERROR and never a resume; `--session-id` combines with `--resume`/`--continue` only
 // alongside `--fork-session`; and `--resume` accepts a TITLE as well as an id, failing as ambiguous
 // on duplicates — which is why nothing in this codebase resumes grok by title.
-export const UNCONDITIONAL_SESSION_ID_CAPABLE = ['copilot'] as const
+//
+// cursor mints with `--resume <uuid>` and NO probe of its own, unlike grok: the flag is the same one
+// resume already depends on (a CLI without it could not resume either), and the behavior is not a
+// flag a help probe could see. Measured 2026.09.28 with a paid TUI run: `cursor-agent --resume
+// <fresh uuid> --model composer-2.5 --force agent '<prompt>'` answered, and every hook payload's
+// `conversation_id` was that uuid; with no prompt the same line opens an empty chat under that id
+// (no model call). An id that already exists simply resumes, so a taken id is never a launch error
+// (grok's is). If an older CLI ignored the unknown id, the node degrades to hook-learned ids.
+export const UNCONDITIONAL_SESSION_ID_CAPABLE = ['copilot', 'cursor'] as const
 // claude: Task/Agent tool via hooks (tool_use_id-keyed). codex: spawn_agent collaboration via its
 // native SubagentStart/SubagentStop hooks (agent_id-keyed), measured on codex-cli 0.146.0.
 // grok: its own native SubagentStart/SubagentStop, keyed by `subagentId` — measured on 1.0.13 by
@@ -242,7 +290,10 @@ export const UNCONDITIONAL_SESSION_ID_CAPABLE = ['copilot'] as const
 // id from a type. It was assumed to key by `subagentType` (a type, so two children of one type
 // would collide); the payloads say otherwise, and `subagentId` is also the ONLY id the start and
 // the stop share — on the start `sessionId` is the PARENT's.
-export const SUBAGENT_CAPABLE = ['claude', 'codex', 'grok'] as const
+// cursor: its `subagentStart`/`subagentStop` hooks never fired (three measured runs, 2026.10.01),
+// so the start is the parent's `Task` preToolUse (keyed by `tool_use_id`) and the end is the
+// parent's `stop` (core/cursor-subagents.ts). docs/cursor-agent.md "Orchestration parity".
+export const SUBAGENT_CAPABLE = ['claude', 'codex', 'grok', 'cursor'] as const
 export const RECURRING_CAPABLE = ['claude'] as const // /loop, /schedule, /cron
 export const BRANCH_CAPABLE = ['claude'] as const
 // grok joins with NO installer of its own: it scans `~/.claude/skills` for Claude Code
@@ -255,7 +306,19 @@ export const BRANCH_CAPABLE = ['claude'] as const
 // `~/.grok/config.toml`, and `GROK_CLAUDE_SKILLS_ENABLED=false`. Then the skill is undiscoverable
 // however this list reads, and the same `inspect` cell is what says so (`enabled:false`, a
 // non-default `source`) rather than leaving support to guess.
-export const CONTEXT_LINK_CAPABLE = ['claude', 'codex', 'gemini', 'opencode', 'grok'] as const
+// cursor joins with NO installer: cursor-agent 2026.09.28 lists `~/.claude/skills/get-linked-context`
+// in the `<agent_skills>` block of a real chat's own context (measured in its store.db), i.e. it reads
+// `~/.claude/skills` like grok. Its transcript is a SQLite store read by `core/cursor-chat.ts`.
+// UNVERIFIED: a user setting that switches that Claude-compat scan off.
+export const CONTEXT_LINK_CAPABLE = [
+  'claude',
+  'codex',
+  'gemini',
+  'opencode',
+  'grok',
+  'cursor',
+  'antigravity'
+] as const
 // Agents whose per-node context meter we can fill. Each needs BOTH numbers: a used count and a
 // TRUSTWORTHY window.
 //  - claude: used from its transcript's assistant usage, window INFERRED from the model family
@@ -270,6 +333,11 @@ export const CONTEXT_LINK_CAPABLE = ['claude', 'codex', 'gemini', 'opencode', 'g
 //    grok has already computed. MEASURED on 22 real sessions (1.0.13, 2026-09-02): all three present
 //    in all 22, and the stated percentage agrees with used/window in all 22. So the window is read,
 //    never inferred from the model id, which puts grok with codex rather than with gemini.
+//  - antigravity: states `input_tokens` and `cache_read_tokens` on every `PLANNER_RESPONSE` in
+//    `~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript_full.jsonl` (core/
+//    antigravity-session.ts), and `antigravityWindowFor` (core/model-window.ts) maps its model
+//    family (`gemini-4-argon-*`, `gemini-3.8-flash-*`, `claude-*`, `gpt-oss-120b-*`) to the known
+//    context window, returning null for unknown models.
 //
 // Until 2026-09 this comment explained grok's absence by pointing at a missing parser for the wrong
 // file, and concluding there was no used count to divide. Both halves were false, and the first is
@@ -283,7 +351,13 @@ export const CONTEXT_LINK_CAPABLE = ['claude', 'codex', 'gemini', 'opencode', 'g
 // `core/grok-signals.ts` reads exactly three of them and nothing else. If a future grok drops
 // `contextWindowTokens`, that reader returns null and the meter disappears — no inferred
 // denominator, because a percentage over a guessed window is a wrong number presented as a fact.
-export const USAGE_CAPABLE = ['claude', 'codex', 'gemini', 'grok'] as const
+//
+// Cursor joined in 2026-09 with the agent's own numbers, like grok: the store's root protobuf field 5
+// (`token_details`: used_tokens, max_tokens), which matches the TUI's `/context` (`core/cursor-chat.ts`).
+// It joins the meter ONLY: its ids are not in CLAUDE_TRANSCRIPT_READABLE, so the find bar's index and
+// cold-resume stay off claude's cwd-fallback resolver, and `context.ensure` locates a cursor chat by id.
+// Account plan limits (CLI `/usage`) are a different, credentialed number and are not read.
+export const USAGE_CAPABLE = ['claude', 'codex', 'gemini', 'grok', 'cursor', 'antigravity'] as const
 // Agents whose structured transcript we can render as a chat panel (Cmd+M chat mode).
 //
 // SPLIT from CLAUDE_TRANSCRIPT_READABLE below on 2026-09-02, when grok joined. Until then this one
@@ -306,7 +380,21 @@ export const USAGE_CAPABLE = ['claude', 'codex', 'gemini', 'grok'] as const
 // (`readChatTranscript`). Like the others it is NOT in CLAUDE_TRANSCRIPT_READABLE below.
 // opencode joined 2026-09-28: it has no transcript file at all (SQLite since 1.18), so its chat is
 // read through `opencode export <id>` (core/opencode-chat.ts) and it stays out of the list below.
-export const CHAT_CAPABLE = ['claude', 'grok', 'gemini', 'codex', 'copilot', 'opencode'] as const
+// cursor joined with `core/cursor-chat.ts`: a read-only `node:sqlite` read of its chat store, located
+// strictly by the whole-UUID chat id and routed before anything claude-shaped. Not in the list below.
+// antigravity joined 2026-10 with its own reader (`core/antigravity-chat.ts`), reading
+// `~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript_full.jsonl` strictly by
+// conversation id (`locateAntigravity`).
+export const CHAT_CAPABLE = [
+  'claude',
+  'grok',
+  'gemini',
+  'codex',
+  'copilot',
+  'opencode',
+  'cursor',
+  'antigravity'
+] as const
 // CHAT_CAPABLE agents whose reader has NO remote leg: a remote (SSH) node's session lives on its
 // host, so core answers `unreadable` before touching anything — and the local reader never sets that
 // flag (copilot maps a failed local read to not-found for exactly this reason). So an unreadable read
@@ -315,7 +403,7 @@ export const CHAT_CAPABLE = ['claude', 'grok', 'gemini', 'codex', 'copilot', 'op
 // remote nodes are read on the host (`core/remote-grok-chat.ts`, `main/remote-codex-chat-page.ts`).
 // opencode has no remote leg either but is NOT here: its `unreadable` also means a failed LOCAL
 // `opencode export`, which Retry heals — the panel gives it its own copy (`exportError`) instead.
-export const CHAT_LOCAL_ONLY = ['gemini', 'copilot'] as const
+export const CHAT_LOCAL_ONLY = ['gemini', 'copilot', 'cursor', 'antigravity'] as const
 // CHAT_CAPABLE agents whose chat-view prompts are TYPED as keystrokes instead of pasted
 // (core/typed-input.ts): a multi-line paste is recorded by Claude Code as <pasted_content>, content
 // its model is told may not be the user's own words. The typed path puts a line break in as tmux's
@@ -346,8 +434,21 @@ export const SCREEN_DIALOG_READABLE = ['claude'] as const
 // delivered at the next tool boundary of the SAME turn (a `queued_command` transcript attachment, not
 // a new user turn). Every other chat-capable agent is unmeasured and keeps "wait for the reply".
 export const INPUT_QUEUE_CAPABLE = ['claude'] as const
+// Agents the ⌘M chat view may send a lone Esc to while a turn is running, to interrupt it as Esc in
+// the terminal would. MEASURED for claude (2.1.318, 2026-11-04): mid-reply it prints "Interrupted ·
+// What should Claude do instead?"; text in its own input box stays; a queued message is sent as the
+// next turn; an Esc before the first token puts the prompt back into its input box. Must stay within
+// SCREEN_DIALOG_READABLE: core reads the screen first, because Esc on a dialog would cancel it.
+export const CHAT_INTERRUPT_CAPABLE = ['claude'] as const
 // Agents whose native transcript we can read + render for cross-agent transfer.
-export const TRANSFER_SOURCE_CAPABLE = ['claude', 'codex', 'gemini', 'grok'] as const
+export const TRANSFER_SOURCE_CAPABLE = [
+  'claude',
+  'codex',
+  'gemini',
+  'grok',
+  'cursor',
+  'antigravity'
+] as const
 // Agents whose hooks announce that a session ENDED — i.e. whose orderly `/exit` we will hear about.
 //
 // Derived by reading `normalize.ts`, not by intent: exactly four normalizers map an event to
@@ -362,14 +463,31 @@ export const TRANSFER_SOURCE_CAPABLE = ['claude', 'codex', 'gemini', 'grok'] as 
 //
 // Before adding an id: find its normalizer's `sessionPhase: 'end'` branch. If there isn't one, the
 // branch is the change — this list is a consequence of it, never a substitute for it.
-export const SESSION_END_CAPABLE = ['claude', 'gemini', 'copilot', 'grok'] as const
+//
+// cursor: `sessionEnd` fires on an orderly `/quit` (measured 2026.09.28, `reason: "completed"`), and
+// `CURSOR_HOOK_EVENTS` subscribes to it; both halves are needed, the list is inert without the event.
+export const SESSION_END_CAPABLE = ['claude', 'gemini', 'copilot', 'grok', 'cursor'] as const
 // Agents that accept a node title being PUSHED back into the session — the write leg only. The
 // write is the same literal `/rename <name>` for both, which grok also accepts as `/title`.
 // The READ leg is TITLE_READ_CAPABLE below, which is a superset: an agent can name its own session
 // without offering any way to rename it (gemini). Read legs are per-agent (claude: the transcript
 // .jsonl; grok: its session summary.json; gemini: its update_topic tool call), routed once in
 // core/agent-session-name.ts.
-export const RENAME_CAPABLE = ['claude', 'grok'] as const
+// cursor: `/rename <name>` is a local TUI command (`agentStore.setMetadata("name")`) that lands in
+// the store meta TITLE_READ_CAPABLE reads, MEASURED on 2026.10.01. It needs its Enter as a SEPARATE
+// write (SEPARATE_SUBMIT_AGENTS), or the line sits unsubmitted in the composer.
+export const RENAME_CAPABLE = ['claude', 'grok', 'cursor'] as const
+// Agents whose TUI ignores an Enter that arrives in the SAME write as a bracketed paste: the text
+// lands in the composer and is never submitted. MEASURED for cursor (2026.10.01): nodeterm's one-shot
+// paste+Enter left `/rename x` unsubmitted; the same paste followed by a bare Enter, as a second
+// tmux invocation, renamed the chat. `submitsSeparately` is asked by `PtyManager.sendText`, the one
+// funnel every one-way write reaches.
+export const SEPARATE_SUBMIT_AGENTS = ['cursor'] as const
+// Agents that load nodeterm's `get-linked-context` skill from `~/.claude/skills`, so a context link,
+// a note push or a verify brief can name the skill instead of spelling out the CLI. claude, and
+// cursor (measured: it lists that skill in its own `<agent_skills>`, docs/cursor-agent.md). grok
+// reads that root too, but its pickup of this skill is unverified, so it keeps the CLI wording.
+export const LINKED_CONTEXT_SKILL_AGENTS = ['claude', 'cursor'] as const
 // Agents whose OWN session name we can READ and adopt into the node title.
 //
 // Separate from RENAME_CAPABLE because the two directions are separate facts, and gemini has only
@@ -386,7 +504,9 @@ export const RENAME_CAPABLE = ['claude', 'grok'] as const
 // (SHARED_IDENTITY_CAPABLE below) a node owns a THREAD, and that thread carries a `Thread.name` we
 // can read over the server's own socket (core/codex-session-name.ts). There is still no measured
 // rename command, so it stays out of RENAME_CAPABLE — the read⊇write invariant holds either way.
-export const TITLE_READ_CAPABLE = ['claude', 'codex', 'grok', 'gemini'] as const
+// cursor: its `name` (AI-generated, or `/rename`) is in the chat store meta; the write leg joined
+// RENAME_CAPABLE once `/rename` was measured to land there.
+export const TITLE_READ_CAPABLE = ['claude', 'codex', 'grok', 'gemini', 'cursor'] as const
 // Agents whose canvas nodes share ONE managed CLI server per machine and keep a stable per-node
 // identity inside it, instead of each node owning a whole process tree.
 //
@@ -400,8 +520,9 @@ export const TITLE_READ_CAPABLE = ['claude', 'codex', 'grok', 'gemini'] as const
 export const SHARED_IDENTITY_CAPABLE = ['codex'] as const
 // Agents allowed to drive the canvas via the `nodeterm` CLI (open/show/write/close).
 // Discovery differs per agent: claude gets the manage-nodeterm-canvas skill; codex/gemini/
-// opencode a marker block in ~/.codex/AGENTS.md / ~/.gemini/GEMINI.md /
-// ~/.config/opencode/AGENTS.md (see canvas-control.ts).
+// antigravity/opencode a marker block in ~/.codex/AGENTS.md / ~/.gemini/GEMINI.md /
+// ~/.config/opencode/AGENTS.md (see canvas-control.ts — agy loads ~/.gemini/GEMINI.md as
+// <RULE[user_global]>).
 //
 // grok needs NO new installer: it scans `~/.claude/skills` by default for Claude Code
 // compatibility (its shipped docs, user-guide/08-skills.md; switched off only by
@@ -410,13 +531,34 @@ export const SHARED_IDENTITY_CAPABLE = ['codex'] as const
 // RemoteHooks.installCanvasControl. Membership here is what sets NODETERM_CANVAS_CONTROL in the
 // session env (hook-server's buildPtyEnv, remoteHookEnvArgs), i.e. what makes the shim anything
 // other than a no-op.
-export const CANVAS_CONTROL_CAPABLE = ['claude', 'codex', 'gemini', 'opencode', 'grok', 'copilot'] as const
+//
+// cursor needs no installer either, by the same route: cursor-agent loads `~/.claude/skills` as
+// third-party skills (gated by its `thirdPartyExtensibility` setting, default on in the CLI), and
+// MEASURED on 2026.10.01 its interactive session listed `~/.claude/skills/manage-nodeterm-canvas`
+// right after its own built-ins, ahead of the tail it truncates when the skill list is long.
+export const CANVAS_CONTROL_CAPABLE = [
+  'claude',
+  'codex',
+  'gemini',
+  'opencode',
+  'grok',
+  'copilot',
+  'cursor',
+  'antigravity'
+] as const
+// Agents whose TOOL shell on Windows is POSIX: Claude Code runs its Bash tool (and its hooks)
+// through Git Bash, so `sh "<shim>.sh"` works there exactly as on macOS/Linux. Every other agent
+// runs tools in PowerShell (codex, gemini, copilot — measured in their sources) or cmd.exe, where
+// `sh` is not on PATH on a stock Git install; they are told to run the `.cmd` launcher instead
+// (`shimDialectFor` in ./shim-invocation.ts). Membership only matters on a win32 host.
+export const POSIX_TOOL_SHELL_ON_WINDOWS = ['claude'] as const
 // Agents whose session start-up permission mode we can set (see AgentPermissionMode below).
 // claude and grok share the flag SPELLING and the value vocabulary
 // (`--permission-mode auto|plan|acceptEdits|bypassPermissions`; our `manual` = no flag = grok's own
-// `default`). gemini (`--approval-mode default|auto_edit|yolo|plan`) and codex
-// (`--ask-for-approval untrusted|on-request|never`) each spell it their own way, so membership here
-// is only half the story — the translation lives in ./approval-mode.ts.
+// `default`). gemini (`--approval-mode default|auto_edit|yolo|plan`), codex
+// (`--ask-for-approval untrusted|on-request|never`), and antigravity
+// (`--mode accept-edits|auto|plan` plus `--dangerously-skip-permissions`) each spell it their own
+// way, so membership here is only half the story — the translation lives in ./approval-mode.ts.
 //
 // Membership does NOT mean every mode applies: BOTH new vocabularies are narrower than ours — codex
 // has no plan and no edit-specific mode, and gemini has nothing meaning "approve most things but not
@@ -428,13 +570,39 @@ export const CANVAS_CONTROL_CAPABLE = ['claude', 'codex', 'gemini', 'opencode', 
 //
 // NOTE: the `auto` VERSION GATE is claude's alone — see activePermissionMode in
 // renderer/state/permissionMode.ts. grok has accepted every mode we emit since 1.0.0, its first
-// release, and gemini/codex accept theirs on the versions we measured, so none of them may inherit
-// a gate fed by a `claude --version` probe.
-export const PERMISSION_MODE_CAPABLE = ['claude', 'grok', 'gemini', 'codex'] as const
+// release, and gemini/codex/antigravity accept theirs on the versions we measured, so none of them
+// may inherit a gate fed by a `claude --version` probe.
+//
+// cursor emits `--auto-review` for `auto` (a server classifier auto-runs safe calls, claude's `auto`
+// shape), `--mode plan` and `--force`; `manual` and `acceptEdits` emit no flag (its bare launch is
+// `approvalMode: allowlist`). See CURSOR_MODES in approval-mode.ts. `auto` is the DEFAULT mode, which
+// widened no existing node only because cursor shipped in the same change.
+export const PERMISSION_MODE_CAPABLE = [
+  'claude',
+  'grok',
+  'gemini',
+  'codex',
+  'cursor',
+  'antigravity'
+] as const
 // Agents whose harness accepts a per-launch model override and whose gateway protocol we know how
 // to configure. Custom agents inherit this through `capabilityAgentId`, like every other harness
 // capability — the renderer never maintains its own Claude/Codex/Copilot allowlist.
-export const MODEL_SWITCH_CAPABLE = ['claude', 'codex', 'copilot', 'grok'] as const
+export const MODEL_SWITCH_CAPABLE = [
+  'claude',
+  'codex',
+  'copilot',
+  'grok',
+  'cursor',
+  'antigravity'
+] as const
+// Members of MODEL_SWITCH_CAPABLE whose models are their OWN CLI's catalogue and can never be
+// routed through the model gateway: grok (custom models live in ~/.grok/config.toml), cursor
+// (`cursor-agent models` lists ~250 account-scoped ids), and antigravity (`agy models`).
+// Offering or defaulting a gateway id to one of these puts a `--model` on the line that names a
+// model outside its own catalogue, so every place that hands out GATEWAY models asks
+// `hasGatewayModels`, not `canSwitchModel`.
+export const OWN_MODEL_CATALOGUE = ['grok', 'cursor', 'antigravity'] as const
 // Agents whose own CLI already tells the user when it copies, so nodeterm must not say it again.
 // Claude Code captures the mouse itself and prints its own line — "copied N chars to tmux buffer ·
 // paste with prefix + ]" — which makes our copy pill a second message for one gesture. Membership
@@ -561,6 +729,7 @@ export const chatReadsLocalOnly = (id: AgentId): boolean => includes(CHAT_LOCAL_
 export const typesChatInput = (id: AgentId): boolean => includes(TYPED_INPUT_CAPABLE, id)
 export const readsScreenDialogs = (id: AgentId): boolean => includes(SCREEN_DIALOG_READABLE, id)
 export const queuesInputWhileWorking = (id: AgentId): boolean => includes(INPUT_QUEUE_CAPABLE, id)
+export const interruptsFromChat = (id: AgentId): boolean => includes(CHAT_INTERRUPT_CAPABLE, id)
 /** Can CLAUDE's transcript resolver locate and parse this agent's conversation? Never widen this
  *  to mean "can we read this agent" — see CLAUDE_TRANSCRIPT_READABLE. */
 export const readsClaudeShapedTranscript = (id: AgentId): boolean =>
@@ -570,10 +739,17 @@ export const canTransferFrom = (id: AgentId): boolean => includes(TRANSFER_SOURC
  *  answer for codex and opencode is no, and callers must degrade rather than assume a crash. */
 export const reportsSessionEnd = (id: AgentId): boolean => includes(SESSION_END_CAPABLE, id)
 export const canRename = (id: AgentId): boolean => includes(RENAME_CAPABLE, id)
+export const submitsSeparately = (id: AgentId): boolean => includes(SEPARATE_SUBMIT_AGENTS, id)
+export const readsLinkedContextSkill = (id: AgentId): boolean => includes(LINKED_CONTEXT_SKILL_AGENTS, id)
 export const canReadTitle = (id: AgentId): boolean => includes(TITLE_READ_CAPABLE, id)
 export const canControlCanvas = (id: AgentId): boolean => includes(CANVAS_CONTROL_CAPABLE, id)
+export const usesPosixToolShellOnWindows = (id: AgentId): boolean => includes(POSIX_TOOL_SHELL_ON_WINDOWS, id)
 export const hasPermissionMode = (id: AgentId): boolean => includes(PERMISSION_MODE_CAPABLE, id)
 export const canSwitchModel = (id: AgentId): boolean => includes(MODEL_SWITCH_CAPABLE, id)
+/** Can the model GATEWAY's catalogue (its discovered ids, its default model) apply to this agent?
+ *  `canSwitchModel` minus the agents that carry their own catalogue (OWN_MODEL_CATALOGUE). */
+export const hasGatewayModels = (id: AgentId): boolean =>
+  canSwitchModel(id) && !includes(OWN_MODEL_CATALOGUE, id)
 export const hasSharedIdentity = (id: AgentId): boolean => includes(SHARED_IDENTITY_CAPABLE, id)
 
 /**
@@ -649,9 +825,12 @@ export function withSessionId(cmd: string, id: AgentId, sessionId: string): stri
   if (!mintsSessionId(id)) return cmd
   const sid = sessionId.trim()
   if (!sid || !SAFE_SESSION_ID.test(sid)) return cmd
-  return capabilityAgentId(id) === 'copilot'
-    ? `${cmd} --session-id=${sid}`
-    : `${cmd} --session-id ${sid}`
+  const base = capabilityAgentId(id)
+  if (base === 'copilot') return `${cmd} --session-id=${sid}`
+  // cursor has no session-id flag: `--resume <unknown uuid>` opens an empty chat that adopts the id
+  // (measured, docs/cursor-agent.md). A root option with an optional value, so it sits before `agent`.
+  if (base === 'cursor') return `${cmd} --resume ${sid}`
+  return `${cmd} --session-id ${sid}`
 }
 
 /**
@@ -732,6 +911,7 @@ export function resumeCommandWith(
     case 'claude':
     case 'gemini':
     case 'grok':
+    case 'cursor':
       return `${launchCmd} --resume ${sid}`
     default:
       return null

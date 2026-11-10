@@ -40,7 +40,8 @@ import {
   type RelayPairingBlock
 } from './pairing-core'
 import type { DeviceRevokeResult, DeviceRevokeServerOutcome, Settings } from '../shared/types'
-import { renameAtomic, tempNameFor } from '../core/fs-atomic'
+import { renameAtomic, sweepForeignTempFiles, tempNameFor } from '../core/fs-atomic'
+import { readSshHostKeyFingerprints } from './ssh-host-key-fingerprint'
 import { publicKeyToB64, deriveSharedKey, encrypt, decrypt, type KeyPair } from './remote/e2ee'
 import { hostIdFromPublicKeyB64 } from './remote/relay-id'
 import { getDeviceId } from '../core/device-id'
@@ -271,39 +272,6 @@ async function readAgentJson(): Promise<Record<string, unknown>> {
   }
 }
 
-/**
- * Remove agent.json temps no writer in THIS process owns: the legacy fixed `agent.json.tmp`
- * (written by builds from before per-call names) and any `agent.json.<pid>.<seq>[.<uuid>].tmp`
- * whose pid is not ours. Best effort — a failure here must never break (or skip) the write that
- * follows.
- *
- * agent.json is not config: every device entry carries the `agentToken` bearer the phone presents
- * on the host-agent WebSocket, so an orphan is a live credential at 0600 that nothing will ever
- * overwrite — a unique name is never written twice. Temps bearing our own pid are untouchable: one
- * may belong to a concurrent write sitting between its `writeFile` and its `rename`, and deleting
- * it would recreate the exact race the unique names fixed. A foreign pid can in theory be the HOST
- * AGENT mid-write; ~/.nodeterm is shared with it and has no lock to begin with, and the worst case
- * is that process's rename failing cleanly (ENOENT, rethrown to its caller) instead of a forgotten
- * token file sitting on disk forever.
- */
-async function sweepStaleAgentTmp(): Promise<void> {
-  try {
-    const base = path.basename(AGENT_JSON_PATH)
-    for (const entry of await fs.readdir(AGENT_DIR)) {
-      if (!entry.startsWith(base) || !entry.endsWith('.tmp')) continue
-      const middle = entry.slice(base.length, -'.tmp'.length) // '' or '.<pid>.<seq>[.<uuid>]'
-      const owner =
-        /^\.(\d+)\.\d+(?:\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})?$/
-          .exec(middle)?.[1]
-      if (middle === '' || (owner && owner !== String(process.pid))) {
-        await fs.rm(path.join(AGENT_DIR, entry), { force: true }).catch(() => undefined)
-      }
-    }
-  } catch {
-    // A dir we cannot read is not a reason to fail (or skip) the write below.
-  }
-}
-
 /** Detect the machine's display name (macOS ComputerName, else hostname). */
 async function computerName(): Promise<string> {
   if (process.platform === 'darwin') {
@@ -434,6 +402,12 @@ export interface PairingServiceOptions {
    * leg (tests, and any shell without a standing host).
    */
   revokePhoneRelayTrust?: () => Promise<{ persisted: boolean; killed: boolean }>
+  /**
+   * This host's SSH host-key fingerprints for the QR's `sshHostKeys` (ssh-host-key-fingerprint.ts):
+   * every key sshd would serve, per its own configuration, or [] when that cannot be established.
+   * Never asked on Windows, where the QR says `ssh:false`.
+   */
+  readSshHostKeys?: () => Promise<string[]>
 }
 
 export function createPairingService(
@@ -482,7 +456,9 @@ export function createPairingService(
   async function writeAgentJson(obj: Record<string, unknown>): Promise<void> {
     await fs.mkdir(AGENT_DIR, { recursive: true, mode: 0o700 })
     await fs.chmod(AGENT_DIR, 0o700).catch(() => {})
-    await sweepStaleAgentTmp()
+    // Every device entry carries the `agentToken` bearer, so an orphaned temp is a live
+    // credential; the host agent shares ~/.nodeterm and is the foreign pid this can race.
+    await sweepForeignTempFiles(AGENT_JSON_PATH)
     const tmp = tempNameFor(AGENT_JSON_PATH)
     try {
       await fs.writeFile(tmp, JSON.stringify(obj, null, 2) + '\n', { mode: 0o600 })
@@ -623,12 +599,19 @@ export function createPairingService(
 
     const addr = srv.address()
     const pairPort = typeof addr === 'object' && addr ? addr.port : 0
-    const [name, sshOpen, windowsKeyFile] = await Promise.all([
+    const [name, sshOpen, windowsKeyFile, sshHostKeys] = await Promise.all([
       computerName(),
       probeSsh(),
       directSsh
         ? Promise.resolve(undefined)
-        : (options.detectKeyFile ?? detectWindowsKeyFile)().catch((): WindowsKeyFile => 'unknown')
+        : (options.detectKeyFile ?? detectWindowsKeyFile)().catch((): WindowsKeyFile => 'unknown'),
+      // The phone pins its first SSH connect to one of these instead of trusting whatever answers
+      // port 22 (the QR is on this screen: the same trust basis as `hostKey`). Complete or empty,
+      // never a subset (the phone refuses a key not listed); empty means the QR carries none and the
+      // phone's first contact is TOFU, as before.
+      directSsh
+        ? (options.readSshHostKeys ?? readSshHostKeyFingerprints)().catch((): string[] => [])
+        : Promise.resolve(undefined)
     ])
     // Relay reachability (network-free) — embedded in the QR so the phone can reach us over the
     // relay too. Also reused in handleRequest to mint the phone's device token. LAN-only when null.
@@ -657,7 +640,7 @@ export function createPairingService(
       name,
       hostKey,
       relay: relayCtx?.block,
-      ...(directSsh ? {} : { ssh: false as const })
+      ...(directSsh ? { sshHostKeys } : { ssh: false as const })
     })
 
     // Give up after PAIR_TIMEOUT_MS with a timeout result.

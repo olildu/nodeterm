@@ -16,6 +16,7 @@ import type { HostedPending, HostedRole } from '@shared/types'
 import { keyFingerprint } from '../lib/hostedTeam'
 import { CONFIRM_ARM_MS } from './confirm-key'
 import { useDialogStack } from './dialog-stack'
+import { SAS_COMPARE_HINT } from '@shared/remote/sas'
 
 // What each role can reach, stated at its fullest: an owner decides from this line alone. A Viewer
 // reads every file in the shared folder (the access policy jails reads to the folder, not to what
@@ -74,6 +75,8 @@ export function HostedApprovalDialog(props: {
           <strong>A device wants to join {team}</strong>
           {'\n\n'}Compare this code with the person joining (call or chat) before allowing:{'\n\n'}
           <strong>{pending.sas}</strong>
+          {'\n'}
+          {SAS_COMPARE_HINT}
           {'\n\n'}Device key {keyFingerprint(pending.peerKeyB64)}
           {more > 0 ? `\n\n${more} more ${more === 1 ? 'request is' : 'requests are'} waiting.` : ''}
           {'\n\n'}Role:

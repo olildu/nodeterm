@@ -1,6 +1,13 @@
 import os from 'os'
 import path from 'path'
-import { parseTrustedNets, DEFAULT_TRUSTED_NETS_SPEC, type TrustProxyConfig } from './proxy-trust'
+import {
+  parseTrustedNets,
+  describeTrustedNets,
+  netsCoverLoopback,
+  DEFAULT_TRUSTED_NETS_SPEC,
+  MIN_PROXY_SECRET_LENGTH,
+  type TrustProxyConfig
+} from './proxy-trust'
 import type { RelayTransport } from '../core/relay/relay-socket'
 
 /**
@@ -57,6 +64,21 @@ export type ServerConfig = {
    */
   trustProxy?: TrustProxyConfig
   /**
+   * Set when header trust was configured but refused (S2): the trusted nets include loopback and no
+   * `NODETERM_TRUST_PROXY_SECRET` is set, so every local process would count as the proxy. Header
+   * trust is then OFF (`trustProxy` undefined, password sign-in still works) and the boot prints
+   * this message, which names exactly what to set in the proxy and the environment.
+   */
+  trustProxyRefused?: string
+  /**
+   * The public https origin the server is reached at (`NODETERM_PUBLIC_ORIGIN`, e.g.
+   * `https://term.example.com`), normalized to its origin. When set, the session cookie is always
+   * `Secure`, every response carries HSTS, and an `Origin` equal to it passes the same-origin checks
+   * even when the proxy rewrites `Host`. Unset = the old behaviour (`Secure` follows
+   * `X-Forwarded-Proto`), with a one-time warning when a non-loopback Host arrives.
+   */
+  publicOrigin?: string
+  /**
    * TEST ONLY: an in-process relay transport for each hosted-team listener, in place of the real
    * WebSocket to the relay. Passed straight to `createHostedService`'s `transport`.
    * `resolveConfig` NEVER sets it — no env var or flag reaches it (pinned in config.test.ts) — so a
@@ -95,6 +117,49 @@ function parseArgv(argv: string[]): Record<string, string | boolean> {
     }
   }
   return out
+}
+
+/**
+ * The boot error for header trust on loopback nets with no secret (S2). Exported for the tests and
+ * the docs; it must name exactly what to set, because the operator's next step is to set it.
+ */
+export function trustProxyRefusedMessage(nets: string): string {
+  return [
+    `Proxy header trust is OFF: NODETERM_TRUST_PROXY_HEADER is set, but the trusted networks [${nets}] include loopback and NODETERM_TRUST_PROXY_SECRET is not set.`,
+    `On loopback every local process and every local user counts as "your proxy", so the header alone would sign any of them in as the owner, without a password. Password sign-in still works.`,
+    `To turn header trust on:`,
+    `  1. Generate a secret:            openssl rand -hex 32`,
+    `  2. Give it to nodeterm-server:   NODETERM_TRUST_PROXY_SECRET=<secret>   (environment only — never a command-line flag)`,
+    `  3. Make the proxy send it on every request, WebSocket upgrades included:   X-Nodeterm-Proxy-Secret: <secret>`,
+    `     nginx:   proxy_set_header X-Nodeterm-Proxy-Secret "<secret>";`,
+    `     Caddy:   header_up X-Nodeterm-Proxy-Secret "<secret>"`,
+    `     Traefik: a headers middleware with customRequestHeaders.X-Nodeterm-Proxy-Secret`,
+    `See "Reverse-proxy SSO" in docs/SERVER.md.`
+  ].join('\n')
+}
+
+/** Validate `NODETERM_PUBLIC_ORIGIN` into a normalized https origin. Throws (never echoing more than
+ *  the value the operator typed) on anything that is not exactly an https origin. */
+function parsePublicOrigin(value: string): string {
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    throw new Error(`NODETERM_PUBLIC_ORIGIN must be an https origin such as https://term.example.com (got "${value}").`)
+  }
+  if (
+    url.protocol !== 'https:' ||
+    url.username !== '' ||
+    url.password !== '' ||
+    (url.pathname !== '/' && url.pathname !== '') ||
+    url.search !== '' ||
+    url.hash !== ''
+  ) {
+    throw new Error(
+      `NODETERM_PUBLIC_ORIGIN must be an https origin with no path, query or credentials, such as https://term.example.com (got "${value}").`
+    )
+  }
+  return url.origin
 }
 
 function isLoopback(host: string): boolean {
@@ -166,13 +231,44 @@ export function resolveConfig(env: NodeJS.ProcessEnv, argv: string[]): ServerCon
   // Reverse-proxy SSO trust. `pick` with an empty default so "unset" and "" coincide.
   const trustHeader = pick('trust-proxy-header', 'NODETERM_TRUST_PROXY_HEADER', '')
   const trustNetsSpec = pick('trust-proxy-nets', 'NODETERM_TRUST_PROXY_NETS', '')
+  // The proxy secret is ENVIRONMENT ONLY: a command line is readable by every local user, which is
+  // exactly who the secret keeps out. A flag is refused rather than ignored, so it is not mistaken
+  // for working. Neither refusal ever echoes the value.
+  if (args['trust-proxy-secret'] !== undefined) {
+    throw new Error(
+      `--trust-proxy-secret is not accepted: a command line is readable by every local user. Pass the secret through the environment as NODETERM_TRUST_PROXY_SECRET instead.`
+    )
+  }
+  const trustSecret = env.NODETERM_TRUST_PROXY_SECRET ?? ''
+  if (trustSecret !== '') {
+    if (trustHeader === '') {
+      throw new Error(
+        `NODETERM_TRUST_PROXY_SECRET is set but no trust header is configured. Set NODETERM_TRUST_PROXY_HEADER (or --trust-proxy-header) too, or unset the secret.`
+      )
+    }
+    if (trustSecret.length < MIN_PROXY_SECRET_LENGTH) {
+      throw new Error(
+        `NODETERM_TRUST_PROXY_SECRET must be at least ${MIN_PROXY_SECRET_LENGTH} characters (header trust is not rate-limited, so every request is a guess). Generate one with: openssl rand -hex 32`
+      )
+    }
+    if (!/^[\x21-\x7e]+$/.test(trustSecret)) {
+      throw new Error(
+        `NODETERM_TRUST_PROXY_SECRET must be printable ASCII with no spaces (it travels as a request header). Generate one with: openssl rand -hex 32`
+      )
+    }
+  }
   let trustProxy: TrustProxyConfig | undefined
+  let trustProxyRefused: string | undefined
   if (trustHeader !== '') {
     // parseTrustedNets throws on a typo — a bad trust config must fail the boot, not
     // silently change who is trusted.
-    trustProxy = {
-      header: trustHeader,
-      nets: parseTrustedNets(trustNetsSpec || DEFAULT_TRUSTED_NETS_SPEC)
+    const nets = parseTrustedNets(trustNetsSpec || DEFAULT_TRUSTED_NETS_SPEC)
+    if (trustSecret === '' && netsCoverLoopback(nets)) {
+      // Fail CLOSED, not loud: the server still boots with password sign-in, and the boot prints
+      // what to set. Refusing the boot would take down a deployment that worked yesterday.
+      trustProxyRefused = trustProxyRefusedMessage(describeTrustedNets(nets))
+    } else {
+      trustProxy = { header: trustHeader, nets, ...(trustSecret !== '' ? { secret: trustSecret } : {}) }
     }
   } else if (trustNetsSpec !== '') {
     throw new Error(
@@ -182,6 +278,9 @@ export function resolveConfig(env: NodeJS.ProcessEnv, argv: string[]): ServerCon
     )
   }
 
+  const publicOriginRaw = pick('public-origin', 'NODETERM_PUBLIC_ORIGIN', '')
+  const publicOrigin = publicOriginRaw !== '' ? parsePublicOrigin(publicOriginRaw) : undefined
+
   return {
     port,
     host,
@@ -190,6 +289,8 @@ export function resolveConfig(env: NodeJS.ProcessEnv, argv: string[]): ServerCon
     insecureHttp,
     passwordSeed,
     trustProxy,
+    ...(trustProxyRefused !== undefined ? { trustProxyRefused } : {}),
+    ...(publicOrigin !== undefined ? { publicOrigin } : {}),
     headless,
     canvasControl
   }

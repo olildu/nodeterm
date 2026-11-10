@@ -1,4 +1,5 @@
 import type { NodeKind } from '@shared/types'
+import { STICKY_NODE_MIN_SIZE } from '@shared/default-node-size'
 
 /**
  * Minimum width/height for each node kind. These are the single source of truth
@@ -12,7 +13,7 @@ import type { NodeKind } from '@shared/types'
  */
 export const NODE_MIN_SIZES: Record<NodeKind, { width: number; height: number }> = {
   terminal: { width: 260, height: 160 },
-  sticky: { width: 160, height: 120 },
+  sticky: STICKY_NODE_MIN_SIZE,
   group: { width: 200, height: 140 },
   editor: { width: 320, height: 200 },
   diff: { width: 420, height: 220 },
@@ -25,8 +26,13 @@ export const NODE_MIN_SIZES: Record<NodeKind, { width: number; height: number }>
   subagent: { width: 180, height: 84 },
   loop: { width: 180, height: 84 },
   dino: { width: 400, height: 160 },
-  trigger: { width: 240, height: 120 }
+  trigger: { width: 240, height: 120 },
+  simulator: { width: 200, height: 260 },
+  whiteboard: { width: 320, height: 220 }
 }
+
+/** Height of a node when collapsed (header only). Re-exported by `state/workspace`. */
+export const COLLAPSED_HEIGHT = 40
 
 export interface Rect {
   x: number

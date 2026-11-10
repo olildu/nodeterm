@@ -5,6 +5,7 @@ import { visibleSettingsGroups, type SettingsGroup, type SettingsSectionId } fro
 import { matchesQuery } from './search'
 import { SectionIcon } from './SettingsIcons'
 import { ProjectGlyph } from '../ProjectGlyph'
+import { isBrowserRuntime } from '@renderer/bridge/runtime'
 
 const isMac = /Mac/i.test(navigator.platform || navigator.userAgent)
 
@@ -28,7 +29,7 @@ export function SettingsSidebar({
 }): React.JSX.Element {
   const hasQuery = query.trim() !== ''
   const GROUPS = useMemo(
-    () => [...visibleSettingsGroups(isMac), ...(extraGroups ?? [])],
+    () => [...visibleSettingsGroups(isMac, isBrowserRuntime()), ...(extraGroups ?? [])],
     [extraGroups]
   )
   return (

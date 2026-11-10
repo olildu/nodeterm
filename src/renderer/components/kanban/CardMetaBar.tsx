@@ -8,6 +8,7 @@ import { useShallow } from 'zustand/react/shallow'
 import { loadIdentity, selectFaces, usePresence } from '../../state/presence'
 import { useBoardLog } from '../../state/boardLog'
 import { useProjects } from '../../state/projects'
+import { useOwningProjectId } from '../../session/owning-project'
 
 const initialOf = (name: string): string => (name.trim()[0] ?? '?').toUpperCase()
 
@@ -39,7 +40,11 @@ export function CardMetaBar({ nodeId, board, onChange }: CardMetaBarProps) {
   const [labelsOpen, setLabelsOpen] = useState(false)
   const meta = cardMeta(board, nodeId)
   const labels = labelsForCard(board, nodeId)
-  const projectId = useProjects((s) => s.activeProjectId)
+  // The card's own project (the modal's ProjectSessionScope), else the active one — the same id
+  // BoardLogPanel keys the log on, so the member pool reads the log the panel shows.
+  const owningProjectId = useOwningProjectId()
+  const activeProjectId = useProjects((s) => s.activeProjectId)
+  const projectId = owningProjectId ?? activeProjectId
   const logEntries = useBoardLog((s) => s.entriesFor(projectId))
   // selectFaces + useShallow, NOT selectOthers: the pool only needs name+color, and applyDiff
   // replaces the whole PeerState on every cursor patch (~20/s per peer) — subscribing to

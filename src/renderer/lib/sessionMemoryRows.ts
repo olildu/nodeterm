@@ -5,7 +5,7 @@
 // orphan/closed-project policy is unit-testable without mounting anything.
 
 import type { AgentState } from '@shared/agents/normalize'
-import type { Project, SessionMemoryRow } from '@shared/types'
+import type { AppSelfGroup, Project, SessionHostOverhead, SessionMemoryRow } from '@shared/types'
 
 export interface SessionMemoryView {
   row: SessionMemoryRow
@@ -70,7 +70,45 @@ export function resolveSessionRows(
   })
 }
 
-/** Grand total across the resolved rows — the panel header's number. */
-export function totalMb(views: readonly SessionMemoryView[]): number {
-  return views.reduce((sum, v) => sum + v.row.totalMb, 0)
+/**
+ * Grand total — the panel header's number: every resolved row, plus the Windows session host's own
+ * cost when it was measured (it belongs to no row, so leaving it out understates what nodeterm's
+ * sessions hold; absent = not measured, which adds nothing rather than a guess).
+ */
+export function totalMb(views: readonly SessionMemoryView[], host?: SessionHostOverhead): number {
+  return views.reduce((sum, v) => sum + v.row.totalMb, 0) + (host?.totalMb ?? 0)
+}
+
+/** The host line's label: `nodeterm session host (3 consoles)`. */
+export function hostOverheadLabel(host: SessionHostOverhead): string {
+  const n = host.consoleCount
+  return `nodeterm session host (${n} console${n === 1 ? '' : 's'})`
+}
+
+/** "nodeterm itself" sub-line label: `GPU`, `Renderers ×2`, `Main process`, `Helpers ×3`. */
+export function appGroupLabel(g: AppSelfGroup): string {
+  const n = g.count > 1 ? ` ×${g.count}` : ''
+  switch (g.kind) {
+    case 'gpu':
+      return `GPU${n}`
+    case 'renderer':
+      return `Renderer${g.count > 1 ? 's' : ''}${n}`
+    case 'main':
+      return `Main process${n}`
+    default:
+      return `Helper${g.count > 1 ? 's' : ''}${n}`
+  }
+}
+
+/**
+ * CPU TIME, not a rate: `cumulativeCPUUsage` is seconds since each process started, and a
+ * percentage would need a second sample the panel's one-shot sweep does not take (Electron's own
+ * `percentCPUUsage` answers 0 on the first call — a fake zero). `42s`, `12m`, `3h 05m`.
+ */
+export function formatCpuTime(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds))
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m`
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`
 }

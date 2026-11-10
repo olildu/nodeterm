@@ -9,6 +9,7 @@
 import { spawn as nodeSpawn } from 'child_process'
 import { StringDecoder } from 'string_decoder'
 import { createControlDecoder, encodeSendKeysHex, type ControlEvent } from './tmux-control'
+import { exactSessionTarget } from './tmux-naming'
 
 /**
  * The child-process seam. Deliberately the smallest surface the client needs — stdout is handed over
@@ -101,7 +102,8 @@ export class ControlModeClient {
   /** Attach: `tmux -L <socket> -C attach-session -t <session>`. Calling twice is a no-op. */
   start(): void {
     if (this.proc || this.disposed) return
-    const args = ['-L', this.opts.socket, '-C', 'attach-session', '-t', this.opts.sessionName]
+    // Exact (`=name`): a bare name prefix-matches a longer session when this one is gone.
+    const args = ['-L', this.opts.socket, '-C', 'attach-session', '-t', exactSessionTarget(this.opts.sessionName)]
     this.proc = this.spawner.spawn(this.opts.tmuxBin, args)
     this.proc.stdout.on('data', (b) => this.onChunk(b))
     this.proc.on('exit', () => this.die('control-mode client exited'))

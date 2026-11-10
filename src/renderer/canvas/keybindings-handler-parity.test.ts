@@ -16,6 +16,9 @@ const canvasSource = readFileSync(join(__dirname, 'Canvas.tsx'), 'utf8')
 
 describe('Canvas keybinding handler parity', () => {
   const createIds = COMMAND_DEFINITIONS.map((d) => d.id).filter((id) => id.startsWith('node.new'))
+  // Ships unbound like the creates, so it has the same failure mode: a remappable row whose chord
+  // does nothing. `node.newSticky` etc. are matched by the prefix; this one is named outright.
+  const checkedIds = [...createIds, 'node.nextNeedingYou']
 
   it('finds the create commands to check (guards against an empty sweep)', () => {
     expect(createIds.length).toBeGreaterThanOrEqual(13)
@@ -23,7 +26,7 @@ describe('Canvas keybinding handler parity', () => {
 
   // `includes` + a message rather than `toContain`: a miss on a 12k-line file would otherwise
   // print the whole source as the diff and bury the one fact the failure carries.
-  it.each(createIds)('%s has a handler entry in Canvas.tsx', (id) => {
+  it.each(checkedIds)('%s has a handler entry in Canvas.tsx', (id) => {
     expect(
       canvasSource.includes(`'${id}':`),
       `Canvas.tsx has no '${id}' handler — the handlers map is Partial, so nothing else catches this`

@@ -37,6 +37,7 @@ import type { ChatCarriedToolResult, ChatMessage, ChatPart } from '../shared/typ
 import { CHAT_TOOL_ARG_MAX } from '../shared/chat-command'
 import type { ChatWindowParse } from './transcript-reader'
 import { codexHomeFor } from './codex-config-dir'
+import { isRecord } from '../shared/is-record'
 
 type ToolPart = Extract<ChatPart, { kind: 'tool' }>
 
@@ -57,8 +58,6 @@ export const CODEX_TOOL_SEARCH = 'tool_search'
  *  claude's `toolArg` keys, then `query` (tool search) and `message` (the collaboration tools). */
 const ARG_KEYS = ['cmd', 'command', 'file_path', 'path', 'pattern', 'query', 'description', 'prompt', 'message'] as const
 
-const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
-
 /**
  * The one-line hint for a tool call: `arguments` is a JSON string (function_call) or an object
  * (tool_search_call). The first `ARG_KEYS` field holding a string (or, for `command`, an array of
@@ -74,7 +73,7 @@ export function codexToolArg(args: unknown): string {
       return ''
     }
   }
-  if (!isObj(o)) return ''
+  if (!isRecord(o)) return ''
   for (const k of ARG_KEYS) {
     const v = o[k]
     if (typeof v === 'string') return v.slice(0, CHAT_TOOL_ARG_MAX)
@@ -91,7 +90,7 @@ function outputText(output: unknown): string {
   if (typeof output === 'string') return output
   if (!Array.isArray(output)) return ''
   return output
-    .filter((c): c is { type: string; text: string } => isObj(c) && (c.type === 'input_text' || c.type === 'output_text') && typeof c.text === 'string')
+    .filter((c): c is { type: string; text: string } => isRecord(c) && (c.type === 'input_text' || c.type === 'output_text') && typeof c.text === 'string')
     .map((c) => c.text)
     .join('\n')
 }
@@ -132,7 +131,7 @@ function textParts(content: unknown, type: string): ChatPart[] {
   if (!Array.isArray(content)) return []
   const parts: ChatPart[] = []
   for (const c of content) {
-    if (isObj(c) && c.type === type && typeof c.text === 'string' && c.text) parts.push({ kind: 'text', text: c.text })
+    if (isRecord(c) && c.type === type && typeof c.text === 'string' && c.text) parts.push({ kind: 'text', text: c.text })
   }
   return parts
 }
@@ -173,7 +172,7 @@ export function parseCodexChatRecords(
       skipped++
       continue
     }
-    if (!isObj(o) || !isObj(o.payload)) {
+    if (!isRecord(o) || !isRecord(o.payload)) {
       skipped++
       continue
     }
@@ -203,7 +202,7 @@ export function parseCodexChatRecords(
         // PAGINATED: the same, as a thread item. Every other item type duplicates the model stream
         // (AgentMessage) or describes a tool the model stream already carries.
         const item = p.item
-        if (isObj(item) && item.type === 'UserMessage') {
+        if (isRecord(item) && item.type === 'UserMessage') {
           const parts = textParts(item.content, 'text')
           if (parts.length) {
             push('user', parts)
@@ -214,7 +213,7 @@ export function parseCodexChatRecords(
         // A turn that FAILED (measured: `usage_limit_exceeded`) says why only here. Without the
         // note the reader sees a prompt followed by nothing.
         const err = p.error
-        if (isObj(err) && typeof err.message === 'string' && err.message.trim()) {
+        if (isRecord(err) && typeof err.message === 'string' && err.message.trim()) {
           push('assistant', [{ kind: 'text', text: `[error] ${err.message}` }])
           rendered = true
         }

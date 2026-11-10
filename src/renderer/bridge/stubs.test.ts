@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { buildStubApi, unsupported } from './stubs'
 import { E_UNSUPPORTED } from '../../shared/rpc'
+import { INACTIVE_PROJECT_LIMIT } from '../../shared/project-limit'
 
 describe('bridge stubs', () => {
   it('unsupported rejects with a coded error', async () => {
@@ -11,6 +12,7 @@ describe('bridge stubs', () => {
     const s = buildStubApi()
     for (const un of [
       s.license.onChange(() => {}),
+      s.projectLimit.onChange(() => {}),
       s.onCloseNode(() => {}),
       s.onFocusNode(() => {}),
       s.browser.onBrowserNewWindow(() => {}),
@@ -81,6 +83,8 @@ describe('bridge stubs', () => {
   it('boot-path promise members resolve benignly', async () => {
     const s = buildStubApi()
     await expect(s.announcements.fetch()).resolves.toEqual([])
+    await expect(s.announcements.popups()).resolves.toEqual([])
+    await expect(s.announcements.popupImage('a'.repeat(64))).resolves.toBeNull()
     // UpdateCard reads `p.mandatory` with no null guard, so the stub must return a real
     // UpdatePolicy — a `null` here was a TypeError on every Server Edition page load.
     await expect(s.updates.getPolicy()).resolves.toEqual({ minSupported: null, mandatory: false })
@@ -96,6 +100,17 @@ describe('bridge stubs', () => {
     // null error would render "0 of 0 devices" and an empty key as fact in Settings → License.
     await expect(s.license.detail()).rejects.toMatchObject({ code: E_UNSUPPORTED })
     await expect(s.license.releaseOthers()).rejects.toMatchObject({ code: E_UNSUPPORTED })
+  })
+
+  it('the project limit is inactive on the Server Edition: no gate, no claim', async () => {
+    // The Server Edition has no gate (docs/project-limit.md, Three surfaces). `state` answers the
+    // dormant default so every open stays synchronous, and `claim` answers `disabled` instead of
+    // rejecting — a gate that somehow reached it reads a typed refusal, never a thrown
+    // E_UNSUPPORTED it has no branch for.
+    const s = buildStubApi()
+    await expect(s.projectLimit.state()).resolves.toEqual(INACTIVE_PROJECT_LIMIT)
+    await expect(s.projectLimit.claim()).resolves.toEqual({ ok: false, error: 'disabled', state: INACTIVE_PROJECT_LIMIT })
+    expect((await s.projectLimit.state()).active).toBe(false)
   })
 
   it('shell.openExternal opens a new browser tab; reveal/openPath are documented no-ops', () => {

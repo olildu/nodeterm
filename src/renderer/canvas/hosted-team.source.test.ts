@@ -73,7 +73,7 @@ describe('hosted team glue in Canvas', () => {
   it('share events follow the host live: keep the screen, reconcile the joiner from the store either way', () => {
     const body = between('const mountRemoteMirror = useCallback(', 'const confirmAndMount = useCallback(')
     // The api is read once, right after the mount; the event's load never re-resolves it through a tab.
-    const capture = body.indexOf('const bound = sessionForProject(tab.projectId)')
+    const capture = body.indexOf('const bound = boundSessionForProject(tab.projectId)')
     const listen = body.indexOf('api.hosted.onSharedChanged((p) => {')
     expect(capture).toBeGreaterThan(-1)
     expect(listen).toBeGreaterThan(capture)

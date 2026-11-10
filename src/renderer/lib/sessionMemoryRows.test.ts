@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { resolveSessionRows, totalMb } from './sessionMemoryRows'
+import { appGroupLabel, formatCpuTime, hostOverheadLabel, resolveSessionRows, totalMb } from './sessionMemoryRows'
 import type { SessionMemoryRow } from '@shared/types'
 
 const row = (nodeId: string, mb: number): SessionMemoryRow => ({
@@ -75,5 +75,31 @@ describe('totalMb', () => {
       totalMb: 500
     }
     expect(totalMb(resolveSessionRows([withChildren], [], {}))).toBe(500)
+  })
+
+  it("adds the session host's measured cost; an unmeasured host adds nothing", () => {
+    const views = resolveSessionRows([row('a', 100)], [], {})
+    const host = { pid: 9, selfMb: 60, consoleMb: 8, consoleCount: 2, totalMb: 68 }
+    expect(totalMb(views, host)).toBe(168)
+    expect(totalMb(views, undefined)).toBe(100)
+    expect(hostOverheadLabel(host)).toBe('nodeterm session host (2 consoles)')
+    expect(hostOverheadLabel({ ...host, consoleCount: 1 })).toBe('nodeterm session host (1 console)')
+  })
+})
+
+describe('"nodeterm itself" labels', () => {
+  it('names each group, with a count only when there is more than one', () => {
+    expect(appGroupLabel({ kind: 'gpu', count: 1 })).toBe('GPU')
+    expect(appGroupLabel({ kind: 'renderer', count: 2 })).toBe('Renderers ×2')
+    expect(appGroupLabel({ kind: 'renderer', count: 1 })).toBe('Renderer')
+    expect(appGroupLabel({ kind: 'main', count: 1 })).toBe('Main process')
+    expect(appGroupLabel({ kind: 'helper', count: 3 })).toBe('Helpers ×3')
+  })
+
+  it('prints CPU TIME, not a rate', () => {
+    expect(formatCpuTime(42.4)).toBe('42s')
+    expect(formatCpuTime(720)).toBe('12m')
+    expect(formatCpuTime(3725)).toBe('1h 02m')
+    expect(formatCpuTime(-1)).toBe('0s')
   })
 })

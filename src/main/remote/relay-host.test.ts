@@ -577,7 +577,7 @@ describe('relay host — nothing is served before mutual approval', () => {
     })
     const s = openHostAgainstFakeRelay() // E2EE is up, approval is NOT given
     expect(s.pending).toHaveLength(1) // the SAS is known: ask the human
-    expect(s.session.sas()).toMatch(/^\d{3} \d{3}$/)
+    expect(s.session.sas()).toMatch(/^\d{3} \d{3} \d{4}$/)
 
     s.peerSendsTunnelText(
       JSON.stringify({ t: 'req', id: 1, method: 'pty:create', args: [{ cols: 80, rows: 24 }] })

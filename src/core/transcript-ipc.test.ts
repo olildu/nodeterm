@@ -277,6 +277,16 @@ describe('registerTranscriptIpc — transcript presence', () => {
 // Paged chat reads — the trailing optional `page` argument. Absent = the legacy read (every test
 // above), present = one byte window plus the paging fields.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
+const thinkingLine = (thinking: string, text?: string) => ({
+  type: 'assistant',
+  message: {
+    content: [
+      { type: 'thinking', thinking, signature: 'EqQBCkgIBhABGAIiQL' },
+      ...(text ? [{ type: 'text', text }] : [])
+    ]
+  }
+})
+
 describe('registerTranscriptIpc — paged chat reads', () => {
   const paged = (page: unknown, nodeId?: string, agentId?: string) =>
     f.handlers[IPC.chatReadTranscript](
@@ -311,6 +321,57 @@ describe('registerTranscriptIpc — paged chat reads', () => {
     const pagedRes = await readChatTranscript(q, { maxBytes: 65536 }, {})
     expect(pagedRes.model).toBe('claude-opus-5-5')
     expect(pagedRes.effort).toBe('xhigh')
+  })
+
+  it('emits thinking summaries only when the page asks for them', async () => {
+    writeTranscript(
+      lines(
+        userLine('go'),
+        thinkingLine('So far nothing is flagged.'),
+        thinkingLine('', 'the answer'),
+        { type: 'assistant', message: { content: [{ type: 'redacted_thinking', data: 'c2VjcmV0' }] } }
+      )
+    )
+    registerTranscriptIpc()
+
+    const withThinking = await paged({ maxBytes: 65536, thinking: true })
+    const without = await paged({ maxBytes: 65536 })
+
+    expect(withThinking.messages.map((m) => m.parts)).toEqual([
+      [{ kind: 'text', text: 'go' }],
+      [{ kind: 'thinking', text: 'So far nothing is flagged.' }],
+      [{ kind: 'text', text: 'the answer' }]
+    ])
+    expect(without.messages.map((m) => m.parts)).toEqual([[{ kind: 'text', text: 'go' }], [{ kind: 'text', text: 'the answer' }]])
+  })
+
+  it('emits image parts only when the page asks for rich, and either flag alone keeps the other off', async () => {
+    writeTranscript(
+      lines(
+        {
+          type: 'user',
+          message: {
+            content: [
+              { type: 'text', text: 'see' },
+              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0' } }
+            ]
+          }
+        },
+        thinkingLine('looking at it', 'a cat')
+      )
+    )
+    registerTranscriptIpc()
+    const parts = async (page: object) => (await paged({ maxBytes: 65536, ...page })).messages.map((m) => m.parts)
+    const image = { kind: 'image', mediaType: 'image/png', data: 'iVBORw0' }
+    const thought = { kind: 'thinking', text: 'looking at it' }
+
+    expect(await parts({ thinking: true, rich: true })).toEqual([
+      [{ kind: 'text', text: 'see' }, image],
+      [thought, { kind: 'text', text: 'a cat' }]
+    ])
+    expect(await parts({ rich: true })).toEqual([[{ kind: 'text', text: 'see' }, image], [{ kind: 'text', text: 'a cat' }]])
+    expect(await parts({ thinking: true })).toEqual([[{ kind: 'text', text: 'see' }], [thought, { kind: 'text', text: 'a cat' }]])
+    expect(await parts({})).toEqual([[{ kind: 'text', text: 'see' }], [{ kind: 'text', text: 'a cat' }]])
   })
 
   it('the legacy (unpaged) result gains no model/effort keys', async () => {
@@ -437,6 +498,18 @@ describe('registerTranscriptIpc — paged chat reads', () => {
       expect(res.messages.map((m) => m.role)).toEqual(['assistant'])
       expect(JSON.stringify(res.messages)).toContain('on the HOST')
       expect(res.olderCursor).toBe(body.indexOf(0x0a) + 1)
+    })
+
+    it('honours the thinking flag on the host window too', async () => {
+      const body = Buffer.from(lines(thinkingLine('checking the host'), assistantLine('done')))
+      registerTranscriptIpc({ readRemotePage: async () => ({ ok: true, data: body, start: 0 }) })
+
+      const res = await paged({ maxBytes: 70000, thinking: true }, 'nt-1')
+
+      expect(res.messages.map((m) => m.parts[0])).toEqual([
+        { kind: 'thinking', text: 'checking the host' },
+        { kind: 'text', text: 'done' }
+      ])
     })
 
     it('a failed host read is not-found — never an empty conversation, never the local disk', async () => {

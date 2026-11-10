@@ -6,6 +6,7 @@
 //
 // Kept pure (no I/O) so it can be unit-tested; the disk read/write wrapper lives in
 // `approved-devices.ts`.
+import { isLowOrderPublicKey } from './e2ee'
 
 /** The persisted shape of every relay pin store (<userData>/remote-approved-{phones,guests,hosts}.json). */
 export interface ApprovedDevices {
@@ -34,14 +35,27 @@ export function parseApprovedDevices(raw: unknown): ApprovedDevices {
   return { pubkeys: out }
 }
 
-/** True when `pubkeyB64` has been pinned before. Empty input is never pinned. */
-export function isPinned(store: ApprovedDevices, pubkeyB64: string): boolean {
-  return pubkeyB64.length > 0 && store.pubkeys.includes(pubkeyB64)
+/**
+ * A low-order X25519 key in ANY base64 spelling Node would decode (deliberately lenient here: the
+ * question is "could this string name such a key", not "is it well formed"). No device holds a
+ * secret for one — its shared secret is a public constant — so it is never pinned and never counts
+ * as pinned, even if an older build (or a hand edit) put one in the file. The relay handshake
+ * refuses it first (e2ee.ts deriveSharedKey); this is the store's own belt.
+ */
+function isLowOrderKeyB64(pubkeyB64: string): boolean {
+  const bytes = Buffer.from(pubkeyB64, 'base64')
+  return bytes.length === 32 && isLowOrderPublicKey(Uint8Array.from(bytes))
 }
 
-/** Return a store with `pubkeyB64` pinned. Idempotent; returns the same object when already present. */
+/** True when `pubkeyB64` has been pinned before. Empty input and a low-order key are never pinned. */
+export function isPinned(store: ApprovedDevices, pubkeyB64: string): boolean {
+  return pubkeyB64.length > 0 && store.pubkeys.includes(pubkeyB64) && !isLowOrderKeyB64(pubkeyB64)
+}
+
+/** Return a store with `pubkeyB64` pinned. Idempotent; returns the same object when already present
+ *  — or when the key is empty or low-order (refused: see isLowOrderKeyB64). */
 export function pinDevice(store: ApprovedDevices, pubkeyB64: string): ApprovedDevices {
-  if (pubkeyB64.length === 0 || store.pubkeys.includes(pubkeyB64)) return store
+  if (pubkeyB64.length === 0 || store.pubkeys.includes(pubkeyB64) || isLowOrderKeyB64(pubkeyB64)) return store
   return { pubkeys: [...store.pubkeys, pubkeyB64] }
 }
 

@@ -22,14 +22,17 @@ import { platform } from './platform'
 import { parseGrokChat } from './grok-chat'
 import type { RemoteGrokChat } from './remote-grok-chat'
 import { readGeminiChatTranscript } from './gemini-chat'
+import { readAntigravityChatTranscript } from './antigravity-chat'
 import { chatMessagesFromCodex, locateCodexRollout, parseCodexChatWindow } from './codex-chat'
 import { chatMessagesFromCopilot, locateCopilotTranscript, parseCopilotChatWindow } from './copilot-chat'
 import { readOpencodeChat, type OpencodeExportRun } from './opencode-chat'
+import { readCursorChat } from './cursor-chat'
 import { locateGrok } from './handoff/locate'
 import { capabilityAgentId } from '../shared/agents/config'
 import {
   parseChatMessages,
   parseChatWindow,
+  claudeChatRecordParser,
   parseTranscriptLines,
   type ChatWindowParse,
   readChatWindow,
@@ -188,6 +191,17 @@ async function readChatPage(
   page: ChatTranscriptPage,
   deps: TranscriptIpcDeps
 ): Promise<ChatTranscriptResult> {
+  // Thinking summaries and rich parts only when asked (the ⌘M panel asks; the phone does not), on
+  // BOTH legs. Neither flag set = the bare parser, so the phone's page is byte-for-byte unchanged.
+  const parse =
+    page.thinking || page.rich
+      ? (buf: Buffer, bufStart: number) =>
+          parseChatWindow(
+            buf,
+            bufStart,
+            claudeChatRecordParser({ thinking: page.thinking === true, rich: page.rich === true })
+          )
+      : parseChatWindow
   const readRemotePage = deps.readRemotePage
   if (readRemotePage) {
     const remote = await readRemotePage(q, page)
@@ -195,10 +209,15 @@ async function readChatPage(
       if (!remote.ok) return remote.absent ? notFoundPage() : unreadablePage()
       // A growth re-read that suddenly says "not remote" (null) is a failed read too — never a
       // reason to go read THIS machine's disk halfway through a remote page.
-      return parseGrowingWindow(page, remote, async (p) => {
-        const r = await readRemotePage(q, p)
-        return r && r.ok ? r : null
-      })
+      return parseGrowingWindow(
+        page,
+        remote,
+        async (p) => {
+          const r = await readRemotePage(q, p)
+          return r && r.ok ? r : null
+        },
+        parse
+      )
     }
   }
   // A node its caller KNOWS is remote (an SSH project's node, whether or not a pty is attached):
@@ -210,7 +229,7 @@ async function readChatPage(
   const w = await readChatWindow(p, page)
   // Resolved but unreadable (deleted between resolve and read): not-found, like a failed remote.
   if (!w) return notFoundPage()
-  return parseGrowingWindow(page, w, async (pg) => (await readChatWindow(p, pg)) ?? null)
+  return parseGrowingWindow(page, w, async (pg) => (await readChatWindow(p, pg)) ?? null, parse)
 }
 
 /**
@@ -391,6 +410,9 @@ export async function readChatTranscript(
   // reads gemini's file too. Its own locator, keyed strictly on the session id in the file header —
   // never claude's resolver, never a cwd — and local-only (`CHAT_LOCAL_ONLY`).
   if (agentId && capabilityAgentId(agentId) === 'gemini') return readGeminiChatTranscript({ sessionId, remoteOnly }, page)
+  if (agentId && capabilityAgentId(agentId) === 'antigravity') {
+    return readAntigravityChatTranscript({ sessionId, remoteOnly }, page)
+  }
   // Codex — the builtin or a custom agent whose base harness it is — is routed BEFORE the claude
   // path for the same reason as grok: a codex thread id never resolves under claude's tree, and the
   // cwd fallback would then answer with somebody else's claude session.
@@ -414,6 +436,10 @@ export async function readChatTranscript(
   if (agentId && capabilityAgentId(agentId) === 'opencode') {
     return readOpencodeChat({ sessionId, remoteOnly }, page, deps.opencodeExport)
   }
+  // Cursor keeps chats in a SQLite store (`~/.cursor/chats/<md5 cwd>/<id>/store.db`), found strictly by
+  // its whole-UUID id, never claude's resolver, whose cwd fallback would answer with a stranger's
+  // session. Local only (`CHAT_LOCAL_ONLY`). See core/cursor-chat.ts.
+  if (agentId && capabilityAgentId(agentId) === 'cursor') return readCursorChat({ sessionId, cwd, remoteOnly }, page)
   if (page) return readChatPage({ sessionId, cwd, accountId, nodeId, ...(remoteOnly ? { remoteOnly } : {}) }, page, deps)
   const remote = deps.readRemote ? await deps.readRemote({ sessionId, cwd, accountId, nodeId }) : null
   // A resolved-but-unreadable remote file is NOT "no conversation yet" — the read failed

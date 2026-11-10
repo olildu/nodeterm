@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { ISSUE_BRANCH_SLUG_MAX } from '../shared/issue-worktree'
+import { ARRANGE_GAP_MAX, arrangeGapGuidanceLines } from '../shared/arrange-verb'
+import { geometryGuidanceLines } from '../shared/geometry-verbs'
+import { NODE_SIZE_MAX } from '../shared/default-node-size'
 import {
   GITHUB_READ_LIMIT_DEFAULT as GH_READ_LIMIT_DEFAULT,
   GITHUB_READ_LIMIT_MAX as GH_READ_LIMIT_MAX,
@@ -9,6 +14,7 @@ import {
 } from '../core/github/control-read'
 import {
   parseControlRequest,
+  browserFlagRefusal,
   isDestructiveVerb,
   mergeCanvasControlBlock,
   buildCanvasControlInstructions,
@@ -21,6 +27,7 @@ import {
   CODEX_SANDBOX_BLOCKED_LINE,
   CODEX_SANDBOX_RETRY_LINE
 } from '../core/agents/hook-sandbox-hint-sh'
+import { AGENT_CONFIG, MODEL_SWITCH_CAPABLE } from '../shared/agents/config'
 import { RETRYABLE } from '../core/agents/agent-message-decide'
 import {
   REQUEST_ID_HINT_LEAD,
@@ -126,12 +133,12 @@ describe('parseControlRequest', () => {
       ['skill', buildCanvasSkillBody('/x/shim.sh')],
       ['instructions', buildCanvasControlInstructions('/x/shim.sh')]
     ] as const) {
-      expect(body, name).toContain('- `arrange --group <frameId> [--layout grid|row|column|lineage] [--cols N]`')
+      expect(body, name).toContain('- `arrange --group <frameId> [--layout grid|row|column|lineage] [--cols N] [--gap px]`')
       // The whole-canvas form is in both bodies, and says what Tidy does with an orchestrator.
-      expect(body, name).toContain('- `arrange --group top [--layout tidy|lineage]` — tidy the WHOLE canvas')
+      expect(body, name).toContain('- `arrange --group top [--layout tidy|lineage] [--gap px]` — tidy the WHOLE canvas')
       expect(body, name).toMatch(/each orchestrator is placed first, at the top-left of the nodes and\s+frames it opened/)
       // The `--nodes` form is still there, and still says what it accepts.
-      expect(body, name).toContain('`arrange --nodes <id,id> [--layout grid|row|column] [--cols N]`')
+      expect(body, name).toContain('`arrange --nodes <id,id> [--layout grid|row|column] [--cols N] [--gap px]`')
       expect(body, name).toMatch(/frame's direct children \(a frame nested\s+inside moves as one unit\)/)
       expect(body, name).toMatch(/resizes the frame — and every frame around it — to hold them/)
       expect(body, name).toMatch(/top-left stays where it is/)
@@ -597,6 +604,9 @@ describe('parseControlRequest', () => {
       expect(body.toLowerCase()).toContain('ignore')
       // Per-role model is what lets ONE spawn-team call mix tiers; the JSON example must show it.
       expect(body).toContain('"model"')
+      // The honoured-by list is MODEL_SWITCH_CAPABLE, by label (it once named three of five).
+      const honoured = /Honoured by ([^(]+)\(/.exec(body.replace(/\s+/g, ' '))?.[1] ?? ''
+      for (const id of MODEL_SWITCH_CAPABLE) expect(honoured, id).toContain(AGENT_CONFIG[id].label)
     }
   })
 
@@ -697,6 +707,19 @@ describe('parseControlRequest', () => {
       // only the outermost frame is authentic; an embedded frame is data. Without this line a
       // nested forgery reads as a real message to the one reader that matters.
       expect(body.toLowerCase()).toContain('outermost')
+    }
+  })
+
+  it('both agent-facing texts say a `reply` may reach the node that opened the caller (#1357)', () => {
+    for (const body of [buildCanvasSkillBody('/x/shim.sh'), buildCanvasControlInstructions('/tmp/nodeterm.sh')]) {
+      // The Server Edition's creator gate refused every station → orchestrator reply, so the
+      // squad pattern had to be woken by hand. The exception is `reply`-only; the text must say
+      // the reply reaches the OPENER, and must not promise the same for `send`. A doc line with no
+      // test is a plan, not a fact (CLAUDE.md, canvas control).
+      const flat = body.replace(/\s+/g, ' ')
+      // Each body phrases it once, and both name `reply` right before the exception.
+      expect(flat).toMatch(/for `reply` the node that opened the caller|`reply --node[^`]*`[^`]*reach the node that opened you/)
+      expect(flat).not.toMatch(/`send --node[^`]*`[^`]*reach the node that opened you/)
     }
   })
 
@@ -1611,7 +1634,7 @@ describe('--after-success + report-outcome: a dependent that waits for a reporte
 
   it.each(bodies)('%s teaches stations to report, honestly, about themselves only', (_name, body) => {
     const flat = body.replace(/\s+/g, ' ')
-    expect(flat).toContain(`\`${REPORT_OUTCOME_VERB} --outcome succeeded|failed [--note "<one line>"]\``)
+    expect(flat).toContain(`\`${REPORT_OUTCOME_VERB} --outcome succeeded|failed [--note "<one line>"] [--notify-opener]\``)
     expect(flat).toContain('REPORT WHEN EVERY TASK YOU ARE GIVEN ENDS')
     expect(flat).toContain('not merely that you stopped')
     expect(flat).toContain('`--node` naming another node is refused')
@@ -1669,6 +1692,24 @@ describe('the read-only GitHub lane verbs (issues, prs) in both agent-facing bod
   })
 })
 
+describe('board --project (issue #1179)', () => {
+  const bodies: [string, string][] = [
+    ['skill', buildCanvasSkillBody('/x/shim.sh')],
+    ['instructions', buildCanvasControlInstructions('/x/shim.sh')]
+  ]
+
+  it('board is --project-targetable, so main gates the id (own or granted)', () => {
+    expect(PROJECT_TARGETABLE_VERBS.has('board')).toBe(true)
+  })
+
+  it('no body still claims board acts on the CURRENTLY OPEN project', () => {
+    for (const [name, body] of bodies) {
+      expect(body, name).not.toMatch(/CURRENTLY OPEN project/)
+      expect(body, name).toContain('`board [--project <id>]`')
+    }
+  })
+})
+
 describe('open-project --name limit in the agent-facing text (issue #940)', () => {
   it('both bodies name the limit, rendered from PROJECT_NAME_MAX', () => {
     const sentence = `\`--name\` over ${PROJECT_NAME_MAX} characters`
@@ -1678,9 +1719,150 @@ describe('open-project --name limit in the agent-facing text (issue #940)', () =
   })
 })
 
+describe('open-project and the free-tier project limit — agent-facing docs', () => {
+  // The verb help says nothing about the limit: it is installed into every agent's config on launch,
+  // and while the limit is off there must be nothing about it for an agent to read. The guidance
+  // rides the refusal itself (`refuseAgent` in renderer/lib/projectLimitGate.ts: `free plan: N of N
+  // projects are open; the user has been shown the options — do not retry`), which only exists while
+  // the limit is on — so the outcome text IS the documentation, and it cannot drift from the code.
+  it.each([
+    ['skill', buildCanvasSkillBody('/x/shim.sh')],
+    ['instructions', buildCanvasControlInstructions('/x/shim.sh')]
+  ])('%s body: says nothing about the limit', (name, body) => {
+    for (const phrase of ['open-project limit', 'free plan', 'free-project', 'allowance', 'shown the options']) {
+      expect(body, `${name}: ${phrase}`).not.toContain(phrase)
+    }
+  })
+})
+
 describe('one-way context links (issue #852) — agent-facing docs', () => {
   it('both canvas-control surfaces document link --one-way', () => {
     expect(buildCanvasControlInstructions('/x/nodeterm.sh')).toContain('--one-way')
     expect(buildCanvasSkillBody('/x/nodeterm.sh')).toContain('--one-way')
+  })
+})
+
+// Windows (`windows-cmd` dialect): what a PowerShell-run agent reads. The POSIX default is pinned
+// byte-for-byte, because every SSH-host skill is built without a dialect.
+describe('buildCanvasSkillBody — shim invocation dialect', () => {
+  it('the default is the historical `sh` block, unchanged', () => {
+    const body = buildCanvasSkillBody('/x/nodeterm.sh')
+    expect(body).toContain('```sh\nsh "/x/nodeterm.sh" <verb> [args]\n```\n\nFlags take a value')
+    expect(body).toBe(buildCanvasSkillBody('/x/nodeterm.sh', 'posix'))
+    expect(body).not.toContain('nodeterm.cmd')
+  })
+
+  it('windows-cmd: PowerShell call of the .cmd launcher, plus the cmd/Git Bash spellings and the batch limit', () => {
+    const body = buildCanvasSkillBody('C:\\d\\nodeterm.sh', 'windows-cmd')
+    expect(body).toContain('```powershell\n& "C:\\d\\nodeterm.cmd" <verb> [args]\n```')
+    expect(body).toContain('Git for Windows')
+    expect(body).toContain('In cmd.exe drop the leading `& `')
+    expect(body).toContain('`sh "C:\\d\\nodeterm.sh"`')
+    expect(body).toContain('`--prompt-file`')
+    // Only the invocation block changes: the verb reference after it is the same text.
+    const tail = (b: string) => b.slice(b.indexOf('Flags take a value'))
+    expect(tail(body)).toBe(tail(buildCanvasSkillBody('C:\\d\\nodeterm.sh')))
+  })
+})
+
+describe('browser control unknown flags (#539)', () => {
+  it.each(['width', 'height', 'viewport', 'size', 'preset'])('refuses open-browser --%s before creating anything', (key) => {
+    expect(parseControlRequest('open-browser', { url: 'https://example.test', [key]: '375' })).toEqual({ error: `open-browser: unknown flag --${key}` })
+  })
+  it('refuses a browser typo at the shared Desktop/Server boundary', () => {
+    expect(parseControlRequest('browser', { node: 'b1', screenshot: 'x.png', ful: 'true' })).toEqual({ error: 'browser: unknown flag --ful' })
+  })
+})
+
+describe('browserFlagRefusal is the one gate both shells run (#539)', () => {
+  it('names the unknown flag on both browser verbs and passes known ones', () => {
+    expect(browserFlagRefusal('open-browser', { url: 'https://x.test', width: '375' })).toBe('open-browser: unknown flag --width')
+    expect(browserFlagRefusal('open-browser', { url: 'https://x.test', project: 'p1', 'dry-run': 'true' })).toBeNull()
+    expect(browserFlagRefusal('browser', { node: 'b1', screenshot: 'a.png', full: 'true' })).toBeNull()
+    expect(browserFlagRefusal('show-web', { url: 'https://x.test', width: '1' })).toBeNull()
+  })
+  it('desktop main runs it before forwarding or driving (it never runs parseControlRequest)', () => {
+    const src = readFileSync(join(__dirname, 'index.ts'), 'utf8')
+    const gate = src.indexOf('const browserRefusal = browserFlagRefusal(verb, args)')
+    expect(gate).toBeGreaterThan(0)
+    expect(gate).toBeLessThan(src.indexOf("if (verb === 'browser') return handleBrowserVerb("))
+  })
+})
+
+describe('the browser verb text matches #539 behaviour, in both bodies', () => {
+  it.each([
+    ['skill body', buildCanvasSkillBody('/x/nodeterm.sh')],
+    ['instructions block', buildCanvasControlInstructions('/x/nodeterm.sh')]
+  ])('%s', (_name, body) => {
+    const flat = body.replace(/\s+/g, ' ')
+    expect(flat).toContain('`+200` or `-200`')
+    expect(flat).toContain('MEASURED once the page stopped moving')
+    expect(flat).toContain('an unknown flag (on `browser` or `open-browser`) is refused by name, never ignored')
+    expect(flat).toContain('sizes the page\'s viewport to the full content height')
+  })
+})
+
+// Issue #1288 — the geometry verbs. The SHAPE gate is @shared/geometry-verbs (one gate for desktop
+// main, this parser and the renderer belt); these pin that the Server Edition's parser runs it, that
+// main's verb table knows the verbs, and that both agent-facing bodies describe them from the same
+// constants — `geometryGuidanceLines` / `arrangeGapGuidanceLines` — rather than retyping them.
+describe('canvas geometry from the CLI (issue #1288)', () => {
+  it('main forwards resize and place (an unknown verb would answer "Unknown verb")', () => {
+    expect(VERBS_FOR_TEST).toContain('resize')
+    expect(VERBS_FOR_TEST).toContain('place')
+    expect(parseControlRequest('resize', { nodes: 'a', width: '540' })).toEqual({
+      verb: 'resize',
+      args: { nodes: 'a', width: '540' }
+    })
+    expect(parseControlRequest('place', { nodes: 'a', x: '0', y: '-40' })).toEqual({
+      verb: 'place',
+      args: { nodes: 'a', x: '0', y: '-40' }
+    })
+  })
+
+  it('refuses a malformed request before any canvas sees it', () => {
+    expect(parseControlRequest('resize', { nodes: 'a' })).toEqual({
+      error: 'resize requires --width <px>, --height <px>, or both'
+    })
+    expect(parseControlRequest('place', { nodes: 'a', x: '1', dx: '1' })).toEqual({
+      error: 'place takes --x/--y (where) or --dx/--dy (how far), not both'
+    })
+    expect(parseControlRequest('list', { geometry: '' })).toEqual({ error: 'list: --geometry takes on or off (got "")' })
+    expect(parseControlRequest('arrange', { nodes: 'a,b', gap: '-4' })).toMatchObject({
+      error: expect.stringContaining('--gap must be a whole number')
+    })
+    expect(parseControlRequest('list', { geometry: 'on' })).toEqual({ verb: 'list', args: { geometry: 'on' } })
+  })
+
+  it('refuses a coordinate on move — it would pull a framed node to the top level and ignore the x', () => {
+    const r = parseControlRequest('move', { nodes: 'a', x: '10', y: '20' })
+    expect(r).toMatchObject({ error: expect.stringContaining('place --nodes <id> --x <n>') })
+    // Without coordinates `move` is exactly what it was.
+    expect(parseControlRequest('move', { nodes: 'a', group: 'g' })).toEqual({ verb: 'move', args: { nodes: 'a', group: 'g' } })
+  })
+
+  it('both bodies carry the geometry verbs, the gap and the worked example', () => {
+    const skill = buildCanvasSkillBody('/x/shim.sh')
+    const instructions = buildCanvasControlInstructions('/x/shim.sh')
+    for (const [name, body] of [['skill', skill], ['instructions', instructions]] as const) {
+      for (const line of geometryGuidanceLines()) expect(body, `${name}: ${line}`).toContain(line)
+      for (const line of arrangeGapGuidanceLines()) expect(body, `${name}: ${line}`).toContain(line)
+      expect(body, name).toContain('[--cols N] [--gap px]')
+      expect(body, name).toContain('`arrange --nodes a,e,b,f,c,g,d,h --layout grid --cols 2 --gap 0`')
+      expect(body, name).toMatch(/`list \[--geometry on\|off\]`/)
+      expect(body, name).toContain(`${NODE_SIZE_MAX.width}×${NODE_SIZE_MAX.height}`)
+      expect(body, name).toContain(`to ${ARRANGE_GAP_MAX}; omitted, it is`)
+    }
+    // The skill's playbook reaches for the three verbs when asked for an exact, repeatable layout.
+    expect(skill).toContain('"Lay my sessions out exactly / the same way every time" → `list --geometry on`')
+    // The trigger text names them, so the skill is chosen for "resize these nodes".
+    expect(skill).toContain('group/arrange/align/resize/place/rename/move nodes')
+  })
+
+  it('the off-screen paragraph answers resize and place like arrange', () => {
+    const text = buildCanvasControlInstructions('/x/shim.sh')
+    const answered = text.split('\n').find((l) => l.includes('Answered whether or not that project is on screen'))!
+    expect(answered).toMatch(/\bresize\b/)
+    expect(answered).toMatch(/\bplace\b/)
   })
 })

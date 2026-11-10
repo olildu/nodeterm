@@ -119,6 +119,19 @@ describe('GET /download', () => {
     expect(body.length).toBeGreaterThan(20)
   })
 
+  it('a folder whose name starts with "-" is archived as a name, never parsed as a tar option (S7)', async () => {
+    const cookie = await login()
+    const odd = path.join(dir, '--transform=s.a.b.')
+    fs.mkdirSync(odd)
+    fs.writeFileSync(path.join(odd, 'a.txt'), 'a')
+    const token = tickets.issue(odd, true)
+    const res = await fetch(`${base}/download?t=${token}`, { headers: { cookie } })
+    // Without `--`, GNU tar took the name as an option, had no file operand left, and failed (500).
+    expect(res.status).toBe(200)
+    const body = new Uint8Array(await res.arrayBuffer())
+    expect([body[0], body[1]]).toEqual([0x1f, 0x8b])
+  })
+
   it('rejects a non-GET method', async () => {
     const cookie = await login()
     const token = tickets.issue(path.join(dir, 'notes.md'), false)

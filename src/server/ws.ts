@@ -17,9 +17,11 @@ import { WebSocketServer, type WebSocket } from 'ws'
 import type { Auth } from './auth'
 import type { ServerPlatform } from './platform-server'
 import { sessionTokenFromCookie } from './http'
-import { proxyAuthAllowed, type TrustProxyConfig } from './proxy-trust'
+import { noteProxyRefusal, proxyAuthDecision, type TrustProxyConfig } from './proxy-trust'
+import { sameOriginRequest } from './origin'
 import { parseRpcMessage } from '../shared/rpc'
 import { presenceHub } from '../core/presence/hub'
+import { WS_CLIENT_FRAME_MAX } from '../shared/ws-frame'
 
 /**
  * Heartbeat period. Every WS_HEARTBEAT_MS the server pings each socket; a socket that answered
@@ -51,7 +53,14 @@ export const WS_HEARTBEAT_MS = 30_000
  * That leaves ~an order of magnitude of headroom over the largest legitimate frame while cutting
  * the worst case a single frame can cost the process by ~12×.
  */
-export const WS_MAX_PAYLOAD = 8 * 1024 * 1024
+export const WS_MAX_PAYLOAD = WS_CLIENT_FRAME_MAX
+
+/**
+ * Close code for a socket whose session was signed out (S3): `/auth/logout`, "Sign out everywhere",
+ * or the session's 30-day TTL running out. An application code (4000–4999) so it cannot be
+ * mistaken for a network drop in a log.
+ */
+export const WS_CLOSE_SIGNED_OUT = 4401
 
 export interface WsServerOpts {
   platform: ServerPlatform
@@ -68,42 +77,60 @@ export interface WsServerOpts {
   heartbeatMs?: number
   /** Reverse-proxy SSO trust (issue #29) — same object the HTTP handler gets. */
   trustProxy?: TrustProxyConfig
+  /** NODETERM_PUBLIC_ORIGIN — an `Origin` equal to it passes the same-origin check (see origin.ts). */
+  publicOrigin?: string
 }
 
 /**
- * Decide whether an upgrade request is allowed. Returns true only when the request is
- * authenticated — a valid session cookie OR reverse-proxy header trust (issue #29) —
- * AND, if an Origin header is present, its host matches the Host header (the cross-site
- * WS hijacking check applies to both auth paths). A malformed Origin URL is treated as a
- * rejection (never throws).
+ * Decide whether an upgrade request is allowed. Allowed only when the request is authenticated — a
+ * valid session cookie OR reverse-proxy header trust (issue #29; with the proxy secret when one is
+ * configured, S2) — AND it passes the same-origin check (origin.ts; the cross-site WS hijacking
+ * check applies to both auth paths). A malformed Origin is a rejection (never throws).
+ *
+ * Returns the session token the socket rides on when it was authenticated by its cookie — the
+ * socket is closed when that session is signed out or expires (S3). A proxy-authenticated socket
+ * carries no token: its identity is the proxy's, not a cookie's.
  */
 function upgradeAllowed(
   req: http.IncomingMessage,
   auth: Auth,
-  trustProxy?: TrustProxyConfig
-): boolean {
+  trustProxy: TrustProxyConfig | undefined,
+  publicOrigin: string | undefined
+): { ok: false } | { ok: true; token: string | null } {
   const token = sessionTokenFromCookie(req.headers['cookie'])
-  const proxyAuthed =
-    trustProxy !== undefined && proxyAuthAllowed(trustProxy, req.headers, req.socket.remoteAddress)
-  if (!proxyAuthed && !auth.validateSession(token)) return false
-
-  const origin = req.headers['origin']
-  if (typeof origin === 'string' && origin.length > 0) {
-    let originHost: string
-    try {
-      originHost = new URL(origin).host
-    } catch {
-      // Malformed Origin → reject, don't throw.
-      return false
-    }
-    if (originHost !== req.headers['host']) return false
-  }
-  return true
+  const decision =
+    trustProxy !== undefined ? proxyAuthDecision(trustProxy, req.headers, req.socket.remoteAddress) : 'none'
+  noteProxyRefusal(decision)
+  const proxyAuthed = decision === 'trusted'
+  if (!proxyAuthed && !auth.validateSession(token)) return { ok: false }
+  if (!sameOriginRequest(req.headers, publicOrigin)) return { ok: false }
+  return { ok: true, token: proxyAuthed || token === undefined ? null : token }
 }
 
 export function attachWsServer(server: http.Server, opts: WsServerOpts): WebSocketServer {
-  const { platform, auth, onClientGone, heartbeatMs = WS_HEARTBEAT_MS, trustProxy } = opts
+  const { platform, auth, onClientGone, heartbeatMs = WS_HEARTBEAT_MS, trustProxy, publicOrigin } = opts
   const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD })
+
+  // The session each cookie-authenticated socket rides on (S3). A socket used to be checked once at
+  // upgrade and never again, so signing out — or the session expiring — left an open tab fully
+  // connected. Now a revoke closes the affected sockets at once, and the heartbeat re-checks the
+  // rest every round (that is what catches the 30-day expiry, which emits nothing).
+  const tokenOf = new Map<WebSocket, string>()
+  const signedOut = new WeakSet<WebSocket>()
+  const endIfSignedOut = (ws: WebSocket): boolean => {
+    const token = tokenOf.get(ws)
+    if (token === undefined || auth.validateSession(token)) return false
+    tokenOf.delete(ws)
+    // Drop anything it sends from here on — the close handshake can take a moment, and a frame
+    // that arrives in it must not reach dispatch.
+    signedOut.add(ws)
+    ws.close(WS_CLOSE_SIGNED_OUT, 'signed out')
+    return true
+  }
+  const offRevoke = auth.onSessionsRevoked(() => {
+    for (const ws of [...tokenOf.keys()]) endIfSignedOut(ws)
+  })
+  server.on('close', () => offRevoke())
 
   // The one teardown for a connection that is GONE — whether by a clean 'close', or because its sink
   // proved dead (the registry evicted it after consecutive throwing sends and called this back).
@@ -133,6 +160,7 @@ export function attachWsServer(server: http.Server, opts: WsServerOpts): WebSock
   const alive = new WeakSet<WebSocket>()
   const heartbeat = setInterval(() => {
     for (const ws of wss.clients) {
+      if (endIfSignedOut(ws)) continue
       if (!alive.has(ws)) {
         ws.terminate()
         continue
@@ -151,7 +179,8 @@ export function attachWsServer(server: http.Server, opts: WsServerOpts): WebSock
     const pathname = new URL(req.url || '/', 'http://x').pathname
     if (pathname !== '/ws') return
 
-    if (!upgradeAllowed(req, auth, trustProxy)) {
+    const allowed = upgradeAllowed(req, auth, trustProxy, publicOrigin)
+    if (!allowed.ok) {
       // Guard the raw socket: writing to an already-dead peer emits 'error', and an
       // unhandled 'error' on a socket (EventEmitter) throws → crashes the process.
       socket.on('error', () => {})
@@ -161,6 +190,9 @@ export function attachWsServer(server: http.Server, opts: WsServerOpts): WebSock
     }
 
     wss.handleUpgrade(req, socket, head, (ws) => {
+      if (allowed.token !== null) tokenOf.set(ws, allowed.token)
+      // Signed out between the upgrade check and now: never attach it.
+      if (endIfSignedOut(ws)) return
       wss.emit('connection', ws, req)
     })
   })
@@ -187,6 +219,7 @@ export function attachWsServer(server: http.Server, opts: WsServerOpts): WebSock
     presenceHub.join(uiId, 'browser')
 
     ws.on('message', (data: unknown, isBinary: boolean) => {
+      if (signedOut.has(ws)) return
       // Any inbound frame proves the peer is there, pong or not.
       alive.add(ws)
       // Binary client→server frames are ignored in Phase 2 (pty input rides JSON casts).
@@ -214,7 +247,10 @@ export function attachWsServer(server: http.Server, opts: WsServerOpts): WebSock
       console.warn('[nodeterm-server] ws socket error', (e && e.code) || e)
     })
 
-    ws.on('close', () => teardown(uiId))
+    ws.on('close', () => {
+      tokenOf.delete(ws)
+      teardown(uiId)
+    })
   })
   return wss
 }

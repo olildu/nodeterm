@@ -101,7 +101,7 @@ function violations(sources: Record<string, string>): string[] {
 describe('src/shared/watch-link stays isomorphic (it is vendored into nodeterm-web)', () => {
   it('the vendored set is what this guard reads', () => {
     // Not vacuous: the files the web repo copies, all of them seen here.
-    expect(vendored()).toEqual(['bytes.ts', 'client.ts', 'hkdf.ts', 'keys.ts', 'link.ts', 'protocol.ts', 'wire.ts'])
+    expect(vendored()).toEqual(['bytes.ts', 'client.ts', 'hkdf.ts', 'keys.ts', 'link.ts', 'protocol.ts', 'unlock-seal.ts', 'wire.ts'])
   })
 
   it('no source imports outside the directory, and every type-only import says `type`', () => {

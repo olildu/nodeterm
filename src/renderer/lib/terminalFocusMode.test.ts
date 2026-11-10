@@ -4,6 +4,7 @@ import { join } from 'path'
 import { DEFAULT_SETTINGS } from '@shared/types'
 import {
   focusLossOutcome,
+  reclaimOnRelease,
   bodyPressAcknowledges,
   outsidePressReleases,
   reclaimTarget,
@@ -99,14 +100,32 @@ describe('terminal focus mode (#757)', () => {
     const ev = (over: Partial<Parameters<typeof focusLossOutcome>[0]>) =>
       focusLossOutcome({
         nodeRoot,
+        nodeChrome: null,
         lost,
         gained: null,
         activeElement: body,
         windowFocused: true,
         pressedInOwnNode: false,
+        pressedInReadableText: false,
         lostIsCoveredXterm: false,
         ...over
       })
+
+    it('keeps when focus moved into a field beside the root but inside the node (comments flyout)', () => {
+      const composer = { id: 'comments-composer' }
+      // The wrapper is the chrome: a header press focuses the very element passed as nodeChrome.
+      const nodeChrome: { id: string; contains: (n: unknown) => boolean } = {
+        id: 'react-flow-node-wrapper',
+        contains: (n) => n === nodeChrome || n === composer || nodeRoot.contains(n)
+      }
+      // The press landed in the node's wrapper, which used to read as "own chrome" → reclaim → the
+      // xterm took the keyboard back and the composer could never be typed into.
+      expect(ev({ nodeChrome, gained: composer, activeElement: composer, pressedInOwnNode: true })).toBe('keep')
+      // A press on the header/border still sends focus to the wrapper itself, and that still reclaims.
+      expect(ev({ nodeChrome, gained: nodeChrome, activeElement: nodeChrome, pressedInOwnNode: true })).toBe('reclaim')
+      // Another card is still elsewhere.
+      expect(ev({ nodeChrome, gained: elsewhere, activeElement: elsewhere })).toBe('release')
+    })
 
     it('releases when focus moved to something outside the node (another card, a field)', () => {
       expect(ev({ gained: elsewhere, activeElement: elsewhere })).toBe('release')
@@ -128,6 +147,17 @@ describe('terminal focus mode (#757)', () => {
       expect(ev({ gained: ownWrapper, activeElement: ownWrapper, pressedInOwnNode: true })).toBe('reclaim')
       // A non-focusable wrapper sends focus to <body> instead; same press, same answer.
       expect(ev({ gained: null, activeElement: body, pressedInOwnNode: true })).toBe('reclaim')
+    })
+
+    it('defers the reclaim to the end of the press when it landed on readable text (⌘M chat selection)', () => {
+      // Reclaiming now would move the selection into the composer and cancel the drag.
+      expect(ev({ gained: null, activeElement: body, pressedInOwnNode: true, pressedInReadableText: true })).toBe(
+        'reclaim-on-release'
+      )
+      // The flag alone (no press on this node in this task) changes nothing.
+      expect(ev({ gained: null, activeElement: body, pressedInReadableText: true })).toBe('release')
+      // Focus moving to another element inside the node still wins.
+      expect(ev({ gained: header, activeElement: header, pressedInOwnNode: true, pressedInReadableText: true })).toBe('keep')
     })
 
     it('keeps it when the WINDOW lost focus (Cmd+Tab away): the terminal still owns the keyboard', () => {
@@ -248,6 +278,13 @@ describe('terminal focus mode (#757)', () => {
       for (const k of ['focus', 'hover', 'pointer', 'click', 'follows', 'x11']) {
         expect(src).toMatch(new RegExp(`focusFollowsPointer: \\{[^}]*'${k}'`))
       }
+    })
+  })
+  describe('reclaimOnRelease', () => {
+    it('gives the keyboard back only for a plain click, and only to an element still in the node', () => {
+      expect(reclaimOnRelease({ selectionEmpty: true, lostStillInNode: true })).toBe(true)
+      expect(reclaimOnRelease({ selectionEmpty: false, lostStillInNode: true })).toBe(false)
+      expect(reclaimOnRelease({ selectionEmpty: true, lostStillInNode: false })).toBe(false)
     })
   })
 })

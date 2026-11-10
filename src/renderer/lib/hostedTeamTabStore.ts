@@ -2,7 +2,7 @@
 // registry. Kept out of Canvas so the placeholder and the removal run under a test against the
 // real store.
 
-import { useProjects } from '../state/projects'
+import { addRelayTab, useProjects } from '../state/projects'
 import { bindProjectToSession, unbindProject } from '../session/session'
 import { openSuccessor, type TeamTabOps } from './hostedTeamTabs'
 
@@ -20,14 +20,9 @@ export function teamTabStoreOps(teamOf: (projectId: string) => string | undefine
     adoptProject: (p) => useProjects.getState().adoptProject(p),
     // A relay tab like the team's others (`remote`): the save filter drops it, so a restart never
     // finds one on disk (a boot reconnect would otherwise add a second beside it), and whatever asks
-    // whether a project is a relay tab (the codex probe) says yes. Added like any project first, so
-    // it takes the store's name cap and does not take the screen.
-    addPlaceholder: (label) => {
-      const store = useProjects.getState()
-      const relay = { ...store.addProject(label), remote: true }
-      store.replaceProject(relay)
-      return relay
-    },
+    // whether a project is a relay tab (the codex probe) says yes. `addRelayTab` takes the store's
+    // name cap and does not take the screen.
+    addPlaceholder: (label) => addRelayTab(label),
     // The STORE delete, never Canvas's `deleteProject` (which ends the host's sessions through the
     // relay transport): a hosted tab leaves this desktop only. When the removed tab was active, the
     // store hands the active slot to whatever slid into it; only when that is a closed project (or

@@ -9,6 +9,7 @@ import {
   canResumeWith,
   capabilityAgentId,
   resumeCommand,
+  submitsSeparately,
   type AgentId
 } from '../../shared/agents/config'
 import { isShellCommand } from '@shared/agents/pane'
@@ -30,6 +31,7 @@ import {
  *  Each value is the CLI's own DOCUMENTED PRIMARY, and is sent BARE:
  *    - grok:   `/quit` (its `/exit` is an alias).
  *    - gemini: `/quit` (alias `/exit`), measured in its bundled `docs/reference/commands.md:325`.
+ *    - cursor: `/quit`, measured in its TUI.
  *
  *  Bare is a safety rule, not a style: gemini's `/quit` also takes a `--delete` flag that exits AND
  *  *permanently deletes* the session's history and temporary files — the very conversation the
@@ -39,6 +41,9 @@ const EXIT_SEQUENCES: Record<string, string> = {
   codex: '/quit',
   grok: '/quit',
   gemini: '/quit',
+  // cursor: `/quit` (measured 2026.09.28: exits clean, fires sessionEnd). Its TUI, like opencode's,
+  // leaves text+Enter from ONE write unsubmitted, so the Enter is a separate write below.
+  cursor: '/quit',
   copilot: '/exit',
   opencode: '/exit'
 }
@@ -142,10 +147,26 @@ export function clearEnvEligibility(
   return { ok: true }
 }
 
-export type RestartOutcome = 'restarted' | 'exit-timeout' | 'not-eligible'
+/** `'host-unsupported'`: the kill a model switch / "Restart on subscription" needs went to a
+ *  Windows session host that predates `terminateOwnerV1`. Nothing was signalled or written; the
+ *  remedy (restart the app so a current host serves new sessions) differs from `'not-eligible'`'s. */
+export type RestartOutcome = 'restarted' | 'exit-timeout' | 'not-eligible' | 'host-unsupported'
 
 export const RESTART_EXIT_TIMEOUT_MS = 6000
 export const RESTART_POLL_MS = 250
+/** Gap between the split exit writes (Ctrl-U, exit text, Enter) for a TUI that batches input. */
+export const EXIT_KEY_GAP_MS = 150
+
+/**
+ * The fewest READABLE post-exit samples the exit phase takes before it may report `'exit-timeout'`.
+ * A tmux pane answers in ~4 ms, so the 6 s window holds ~24 samples and this floor never binds. A
+ * Windows session-host pane is a process-table walk through PowerShell — up to ~1.5 s cold — and
+ * there the wall-clock window alone could close after two or three samples, reporting a CLI that
+ * quit at 4 s as one that refused. While the pane keeps ANSWERING (slowly), each owed sample gets at
+ * least `max(window left, timeoutMs / 2)`; a pane that stops answering ends the run exactly as
+ * before. Bounded: at most this many samples are owed, and nothing is ever killed.
+ */
+export const RESTART_MIN_EXIT_SAMPLES = 4
 
 /**
  * How much longer a user-asked RESTART keeps watching after RESTART_EXIT_TIMEOUT_MS, as long as
@@ -286,7 +307,7 @@ export async function performExitPhase(d: {
   // would then be reported as an exit timeout.
   //
   // ASSUMPTION, unverified on a real build: Ctrl-U is "clear line" inside every TUI that still
-  // gets a typed exit (today only gemini) — it is in every readline/ZLE prompt, and it is
+  // gets a typed exit (today gemini and cursor) — it is in every readline/ZLE prompt, and it is
   // what command-delivery.ts already relies on for its rewrites. Each agent added to that table
   // inherits this assumption; only a device check retires it, per agent. If a TUI binds Ctrl-U to
   // something else this becomes one stray keystroke before the exit command — no worse than
@@ -308,6 +329,11 @@ export async function performExitPhase(d: {
   // does nothing.
   const ctrlCs = CTRL_C_QUITS[capabilityAgentId(d.agentId)] ?? 0
   if (!ctrlCs) d.io.write(KILL_LINE)
+  // A separate-submit TUI (cursor) still gets a typed exit, and DROPS the exit line when it lands in
+  // the same input burst as the Ctrl-U: measured on 2026.10.01 in tmux, Ctrl-U+`/quit` then Enter
+  // 150 ms later left an empty composer and a running CLI, 10 of 10; a gap after the Ctrl-U too
+  // exited 10 of 10. Its TUI also leaves text+CR from one burst unsubmitted, so the CR is split off.
+  const separate = !ctrlCs && submitsSeparately(d.agentId)
   if (ctrlCs) {
     for (let i = 0; i < ctrlCs; i++) {
       if (i > 0) {
@@ -316,6 +342,13 @@ export async function performExitPhase(d: {
       }
       d.io.write(CTRL_C)
     }
+  } else if (separate) {
+    await new Promise((r) => setTimeout(r, EXIT_KEY_GAP_MS))
+    if (gone()) return 'not-eligible'
+    d.io.write(exit)
+    await new Promise((r) => setTimeout(r, EXIT_KEY_GAP_MS))
+    if (gone()) return 'not-eligible'
+    d.io.write('\r')
   } else {
     d.io.write(exit + '\r')
   }
@@ -323,16 +356,25 @@ export async function performExitPhase(d: {
   // Equal to `deadline` when no late window was asked for, so every bound below is unchanged.
   const lateDeadline = deadline + Math.max(0, d.lateExitMs ?? 0)
   let last: string | null = null
+  // RESTART_MIN_EXIT_SAMPLES: readable samples so far, and whether the previous one was readable.
+  // The pre-flight's reading counts as "readable" for the first poll's budget, not as a sample.
+  let samples = 0
+  let readable = true
   for (;;) {
     await new Promise((r) => setTimeout(r, pollMs))
     // Each query is bounded by the window it runs in: a query wedged inside the base window still
     // lapses at `deadline` (and its null ends the run there), exactly as without a late window.
     const until = Date.now() <= deadline ? deadline : lateDeadline
-    const pane = await queryPaneWithin(d.paneCommand, Math.max(0, until - Date.now()))
+    const left = Math.max(0, until - Date.now())
+    // A pane that has been answering, just slowly, is owed its minimum samples even past the window.
+    const owedSample = readable && samples < RESTART_MIN_EXIT_SAMPLES
+    const pane = await queryPaneWithin(d.paneCommand, owedSample ? Math.max(left, timeoutMs / 2) : left)
     if (gone()) return 'not-eligible' // stop polling a pane that no longer exists
+    readable = pane !== null
+    if (readable) samples++
     // Two ways to know the CLI let go of the pane. The allowlist is the confident one and is
     // taken immediately. The other — "the foreground command is no longer what it was before the
-    // exit" — covers the shells the allowlist cannot know (`nu`, `xonsh`, `pwsh`, anything the
+    // exit" — covers the shells the allowlist cannot know (`xonsh`, `elvish`, anything the
     // user set as `defaultShell`), where waiting for a listed shell would time out with the agent
     // already quit and never resumed. It is required on two CONSECUTIVE polls: a single changed
     // reading can be a momentary foreground child of a still-running CLI, and typing the resume
@@ -343,7 +385,13 @@ export async function performExitPhase(d: {
     // Past the base window, keep going only inside the late window and only while the pane is
     // still readable — i.e. the CLI we asked to quit is visibly still there (or a changed reading
     // is waiting for its confirming second poll). A pane we can no longer see is not "slow".
-    if (Date.now() >= deadline && (Date.now() > lateDeadline || pane === null)) return 'exit-timeout'
+    if (
+      Date.now() >= deadline &&
+      (Date.now() > lateDeadline || pane === null) &&
+      // Still readable and under the floor: one more (slow) sample before giving up.
+      !(pane !== null && samples < RESTART_MIN_EXIT_SAMPLES)
+    )
+      return 'exit-timeout'
   }
 }
 
@@ -393,6 +441,13 @@ export async function performResumePhase(d: {
    * would put a phantom in the bulk summary.
    */
   isLive?: () => boolean
+  /**
+   * Called once the resume line has been delivered, right before `'resumed'` is reported. The node
+   * uses it to withdraw its recorded exit (`sessionEnded`): our own exit fired that `sessionEnd`,
+   * and cursor fires no `sessionStart` on `--resume`, so nothing else would clear it before the
+   * next turn and the chat composer and phone would keep refusing the live CLI as "exited".
+   */
+  onResumed?: () => void
 }): Promise<ResumePhaseOutcome> {
   // The eligibility GATE (see performExitPhase): `canResumeWith` validates the session id without
   // building the command. The typed line is the caller's `d.command`; for a builtin with no
@@ -446,7 +501,9 @@ export async function performResumePhase(d: {
   })
   // The session can have died while the line was being verified — the delivery is then cancelled by
   // the teardown and nothing reached the pane, so don't claim a resume.
-  return gone() ? 'not-eligible' : 'resumed'
+  if (gone()) return 'not-eligible'
+  d.onResumed?.()
+  return 'resumed'
 }
 
 /**
@@ -484,6 +541,8 @@ export async function performRestartResume(d: {
    * io then silently no-ops and reporting `'restarted'` would put a phantom in the bulk summary.
    */
   isLive?: () => boolean
+  /** See `performResumePhase`. */
+  onResumed?: () => void
 }): Promise<RestartOutcome> {
   const exited = await performExitPhase({
     agentId: d.agentId,
@@ -506,7 +565,8 @@ export async function performRestartResume(d: {
     deliveryTimeoutMs: d.deliveryTimeoutMs,
     killLine: d.killLine,
     onDelivery: d.onDelivery,
-    isLive: d.isLive
+    isLive: d.isLive,
+    onResumed: d.onResumed
   })
   return resumed === 'resumed' ? 'restarted' : resumed
 }
@@ -837,7 +897,7 @@ export function summarizeBulkRestart(
   outcomes: RestartOutcome[],
   skipped: { working: number; noSession: number }
 ): string {
-  const notEligible = outcomes.filter((o) => o === 'not-eligible').length
+  const notEligible = outcomes.filter((o) => o === 'not-eligible' || o === 'host-unsupported').length
   return summarizeOutcomes(outcomes, {
     working: skipped.working,
     noSession: skipped.noSession + notEligible

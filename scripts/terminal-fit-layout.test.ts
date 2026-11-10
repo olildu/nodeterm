@@ -92,4 +92,4 @@ it.skipIf(!existsSync(chrome)).each([1, 1.25, 1.5, 2])('at DPR %s fits complete 
   } finally {
     rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
   }
-}, 40000)
+}, 90_000) // cold esbuild bundle + Chrome start, often beside another real-browser suite on CI

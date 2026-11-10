@@ -1,10 +1,14 @@
 import { describe, it, expect } from 'vitest'
 import { encodeOffer, decodeOffer, type PairingOffer } from '../../src/main/remote/pairing'
+import { genKeyPair, publicKeyToB64 } from '../../src/main/remote/e2ee'
+import { lowOrderKeysB64 } from '../../src/core/relay/low-order-keys.test-support'
 
+// A REAL X25519 public key: the offer is what the client pins, so decodeOffer refuses anything that
+// is not one (wrong length, non-canonical base64, a low-order point).
 const sample: PairingOffer = {
   relayEndpoint: 'wss://relay.nodeterm.dev/socket',
   pairingToken: 'tok_abc123',
-  hostPublicKeyB64: 'aGVsbG8td29ybGQtcHVibGljLWtleQ=='
+  hostPublicKeyB64: publicKeyToB64(genKeyPair().publicKey)
 }
 
 describe('pairing', () => {
@@ -53,5 +57,12 @@ describe('pairing', () => {
     expect(withEndpoint('wss://relay.nodeterm.dev')).not.toBeNull()
     expect(withEndpoint('ws://127.0.0.1:8137')).not.toBeNull()
     expect(withEndpoint('ws://localhost:8137')).not.toBeNull()
+  })
+
+  it('refuses a host key that is not a usable X25519 key: wrong length, non-canonical, low-order', () => {
+    const withKey = (hostPublicKeyB64: string) => decodeOffer(encodeOffer({ ...sample, hostPublicKeyB64 }))
+    expect(withKey('aGVsbG8td29ybGQtcHVibGljLWtleQ==')).toBeNull() // 22 bytes
+    expect(withKey('!!!' + sample.hostPublicKeyB64)).toBeNull() // Node would decode it to the key
+    for (const weak of lowOrderKeysB64()) expect(withKey(weak), weak).toBeNull()
   })
 })

@@ -215,8 +215,8 @@ export function createTeamTabs(ops: TeamTabOps): TeamTabs {
         try {
           ops.bind(id, t.sessionId)
         } catch (error) {
-          // The session was disposed while the workspace loaded; an unbound tab would resolve to the
-          // local session.
+          // The session was disposed while the workspace loaded. An unbound tab would resolve to the
+          // offline relay session: a dead tab with no session behind it, so it is dropped instead.
           ops.removeTab(id, host)
           failure = { error }
           sessionGone = true

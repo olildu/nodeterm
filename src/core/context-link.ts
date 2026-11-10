@@ -17,7 +17,7 @@
 import fs from 'fs'
 import path from 'path'
 import { platform } from './platform'
-import { writeManagedHookFileAtomic } from './agents/hooks/install-helper'
+import { syncWindowsShLauncher, writeManagedHookFileAtomic } from './agents/hooks/install-helper'
 import { IPC } from '../shared/ipc'
 import type { ContextLinkInfo, ContextLinkMap } from '../shared/types'
 import { type PtyManager } from './pty-manager'
@@ -40,7 +40,14 @@ import {
   type ContextLinkVerb
 } from './context-link-render'
 import { hookServer } from './agents/hook-server'
-import { locateClaude, locateCodex, locateGemini, locateGrok } from './handoff/locate'
+import {
+  locateAntigravity,
+  locateClaude,
+  locateCodex,
+  locateGemini,
+  locateGrok
+} from './handoff/locate'
+import { cursorTranscriptText, locateCursorChat } from './cursor-chat'
 
 export { setNodeTranscript } from './context-link-core'
 
@@ -63,6 +70,8 @@ function writeCliFiles(): void {
   fs.mkdirSync(d, { recursive: true })
   // Temp + rename, never a truncating write: agents execute this file (see canvas-control.ts).
   writeManagedHookFileAtomic(cliShimPath(), buildContextShimScript(codexThreadIdentityRoot()), undefined, 0o755)
+  // Windows: `context.cmd` beside it for PowerShell-run agents (see canvas-control.ts).
+  syncWindowsShLauncher(d, 'context.sh')
   // Sweep the retired Electron-as-Node CLI off upgraders' disks: the shim no longer execs it,
   // and it would sit there pointing at a binary path that moves with every app update.
   try {
@@ -97,7 +106,22 @@ export interface ContextLinkDeps {
 // start mid-line, which only costs that one line (it fails to parse and is dropped).
 const REMOTE_TRANSCRIPT_MAX_BYTES = 2 * 1024 * 1024
 
-const LINK_LOCATORS = { claude: locateClaude, codex: locateCodex, gemini: locateGemini, grok: locateGrok }
+// cursor's locator takes (id, cwd?), NOT the shared (id, accountId?), wrapped so an account id can
+// never be read as a cwd. It locates strictly by the whole-UUID chat id.
+const LINK_LOCATORS = {
+  claude: locateClaude,
+  codex: locateCodex,
+  gemini: locateGemini,
+  grok: locateGrok,
+  antigravity: locateAntigravity,
+  cursor: (sessionId: string) => locateCursorChat(sessionId)
+}
+
+/** Agents whose "transcript path" is not a text file: the path names a store the agent's own reader
+ *  turns into transcript text. Everything else is read as utf-8. */
+const TRANSCRIPT_TEXT_READERS: Record<string, (p: string) => Promise<string | null>> = {
+  cursor: cursorTranscriptText
+}
 
 // The link documents, by node id — the same objects written to disk, kept in memory because they
 // are what authorizes a read (a node may only ever name a link inside ITS OWN document).
@@ -178,6 +202,8 @@ async function fetchTranscript(node: LinkDocEntry): Promise<string | null> {
       ? await deps.readRemoteFile(node.id, node.transcriptPath, REMOTE_TRANSCRIPT_MAX_BYTES)
       : null
   }
+  const read = node.agent ? TRANSCRIPT_TEXT_READERS[node.agent] : undefined
+  if (read) return read(node.transcriptPath)
   try {
     return await fs.promises.readFile(node.transcriptPath, 'utf-8')
   } catch {
@@ -320,5 +346,7 @@ export function initContextLink(ptyManager: PtyManager, platformDeps: ContextLin
     return
   }
   platform().handle(IPC.contextLinkSetLinks, (map: ContextLinkMap) => setContextLinks(map))
-  platform().handle(IPC.contextLinkInfo, () => ({ shimPath: cliShimPath() }))
+  // `platform` is THIS core's: the renderer words the connect-time note for the machine whose shim
+  // it names (a Windows core's non-claude agents run the `.cmd` launcher), never the viewer's.
+  platform().handle(IPC.contextLinkInfo, () => ({ shimPath: cliShimPath(), platform: process.platform }))
 }

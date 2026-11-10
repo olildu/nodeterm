@@ -229,4 +229,51 @@ describe('SystemResourcePill', () => {
     expect(panel).not.toBeNull()
     expect(panel?.classList.contains('sessmem-panel')).toBe(true)
   })
+
+  describe('swap and kernel pressure (display-only)', () => {
+    const pillText = (): string => host.querySelector('.sysres-pill')?.textContent ?? ''
+    const title = (): string => host.querySelector('.sysres-pill')?.getAttribute('title') ?? ''
+    const icon = (): string => host.querySelector<HTMLElement>('.sysres-pill__icon')?.style.color ?? ''
+
+    it('shows swap in use beside the RAM figure, and used-of-total in the title', () => {
+      // A measured Mac: 7.7 GB of 9 GB swapped while the pill read only "86%".
+      mount({ ...MEM, display: { swapUsedMb: 7854, swapTotalMb: 9216 } })
+      expect(pillText()).toContain('7.7 GB swap')
+      expect(title()).toContain('swap 7.7 GB of 9.0 GB used')
+    })
+
+    it('no swap figure at all when it was not measured — never "0 GB swap"', () => {
+      mount(MEM)
+      expect(pillText()).not.toMatch(/swap/i)
+      expect(title()).not.toMatch(/swap/i)
+      act(() => root.unmount())
+      // Half a reading is no reading.
+      mount({ ...MEM, display: { swapUsedMb: 100 } })
+      expect(pillText()).not.toMatch(/swap/i)
+    })
+
+    it('a measured zero stays out of the pill and is only stated in the title', () => {
+      mount({ ...MEM, display: { swapUsedMb: 0, swapTotalMb: 2048 } })
+      expect(pillText()).not.toMatch(/swap/i)
+      expect(title()).toContain('swap 0 B of 2.0 GB used')
+      act(() => root.unmount())
+      // No swap provisioned at all: nothing to describe, in the title either.
+      mount({ ...MEM, display: { swapUsedMb: 0, swapTotalMb: 0 } })
+      expect(title()).not.toMatch(/swap/i)
+    })
+
+    it('the kernel level RAISES the tint at 25% used…', () => {
+      mount({ ...MEM, display: { pressureLevel: 'warn' } })
+      expect(icon()).toBe('var(--warn)')
+      expect(title()).toContain('memory pressure warn')
+      act(() => root.unmount())
+      mount({ ...MEM, display: { pressureLevel: 'critical' } })
+      expect(icon()).toBe('var(--danger)')
+    })
+
+    it('…and never lowers it: "normal" does not calm a 98%-used machine', () => {
+      mount({ totalMb: 64000, availableMb: 1000, display: { pressureLevel: 'normal' } })
+      expect(icon()).toBe('var(--danger)')
+    })
+  })
 })

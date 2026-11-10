@@ -4,6 +4,7 @@
 // with a fixed on-the-wire contract shared with the nodeterm iOS app — keep them here, pure.
 
 import { CONTROL_RE } from '../core/relay/team-admin'
+import { SSH_HOST_KEY_FINGERPRINT_RE, SSH_HOST_KEYS_MAX } from './ssh-host-key-fingerprint'
 
 /**
  * The relay block optionally embedded in the QR payload (and the /pair HTTP response). Present
@@ -44,6 +45,25 @@ export interface PairingPayloadInput {
    * every other platform's payload byte-identical.
    */
   ssh?: false
+  /**
+   * This host's SSH host-key fingerprints (`SHA256:<unpadded base64>`, `ssh-keygen -lf` spelling),
+   * ordered ed25519, ecdsa, rsa (ssh-host-key-fingerprint.ts). The phone REFUSES an SSH connect
+   * whose key is not one of these, so the reader hands over every key sshd serves or none at all
+   * (never a subset). Only well-formed entries are carried, at most SSH_HOST_KEYS_MAX; omitted when
+   * none — and ALWAYS omitted with `ssh:false` (no SSH on that host), so that payload stays
+   * byte-identical.
+   */
+  sshHostKeys?: readonly string[]
+}
+
+/** The fingerprints the payload may carry: well-formed, distinct, at most SSH_HOST_KEYS_MAX. */
+function payloadSshHostKeys(keys: readonly string[] | undefined): string[] {
+  const out: string[] = []
+  for (const k of keys ?? []) {
+    if (out.length >= SSH_HOST_KEYS_MAX) break
+    if (typeof k === 'string' && SSH_HOST_KEY_FINGERPRINT_RE.test(k) && !out.includes(k)) out.push(k)
+  }
+  return out
 }
 
 /**
@@ -51,8 +71,9 @@ export interface PairingPayloadInput {
  * contract the phone parses:
  *   {"v":1,"host":"…","port":22,"user":"…","token":"…","pairPort":N,"nodeterm":true,"name":"…"}
  * When a host key is supplied it is appended as `"hostKey":"…"` after `name`; when a relay block is
- * supplied it is appended as `"relay":{…}` after that. With neither, the payload is byte-for-byte
- * the legacy LAN-only shape.
+ * supplied it is appended as `"relay":{…}` after that; then `"sshHostKeys":[…]` (never together with
+ * `ssh:false`); then `"ssh":false`. With none of them, the payload is byte-for-byte the legacy
+ * LAN-only shape.
  */
 export function buildPairingPayload(input: PairingPayloadInput): string {
   const base = {
@@ -67,7 +88,9 @@ export function buildPairingPayload(input: PairingPayloadInput): string {
   }
   const withKey = input.hostKey ? { ...base, hostKey: input.hostKey } : base
   const withRelay = input.relay ? { ...withKey, relay: input.relay } : withKey
-  return JSON.stringify(input.ssh === false ? { ...withRelay, ssh: false } : withRelay)
+  if (input.ssh === false) return JSON.stringify({ ...withRelay, ssh: false })
+  const sshHostKeys = payloadSshHostKeys(input.sshHostKeys)
+  return JSON.stringify(sshHostKeys.length > 0 ? { ...withRelay, sshHostKeys } : withRelay)
 }
 
 /**

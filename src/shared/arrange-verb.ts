@@ -26,6 +26,37 @@ export type GroupArrangeLayout = (typeof GROUP_ARRANGE_LAYOUTS)[number]
 export const TOP_ARRANGE_LAYOUTS = ['tidy', 'lineage'] as const
 export type TopArrangeLayout = (typeof TOP_ARRANGE_LAYOUTS)[number]
 
+/** The space every packing leaves between two items when the caller names none, in px. */
+export const ARRANGE_GAP_DEFAULT = 40
+
+/**
+ * The widest `arrange --gap` accepted, in px: ten times the default. Wider than that is not
+ * spacing, it is two separate layouts, and a typo (`--gap 4000` for `40`) should come back as a
+ * refusal rather than as a canvas scattered across a screen and a half. Above it the call is
+ * REFUSED by name, never clamped — a clamped gap is a layout the caller did not ask for and cannot
+ * see in the reply.
+ */
+export const ARRANGE_GAP_MAX = 400
+
+/**
+ * `--gap` as a number of px, or the sentence that refuses it. A whole number from 0 (items
+ * touching) to `ARRANGE_GAP_MAX`; absent = `undefined`, which every transform reads as its
+ * `ARRANGE_GAP_DEFAULT`. A negative gap is refused rather than read as "overlap a little": every
+ * packing here promises no overlap.
+ */
+export function parseArrangeGap(raw: string | undefined): { gap: number | undefined } | { error: string } {
+  if (raw === undefined) return { gap: undefined }
+  const s = raw.trim()
+  if (!/^\d+$/.test(s)) {
+    return { error: `arrange: --gap must be a whole number of pixels from 0 to ${ARRANGE_GAP_MAX} (got "${raw}")` }
+  }
+  const gap = Number(s)
+  if (gap > ARRANGE_GAP_MAX) {
+    return { error: `arrange: --gap ${gap} is wider than the ${ARRANGE_GAP_MAX} px maximum — nothing was arranged` }
+  }
+  return { gap }
+}
+
 /**
  * `--group` values that name the canvas's top level instead of a frame — the same words `move`
  * reads as "out of every frame", so the two verbs agree about what `top` means.
@@ -56,6 +87,9 @@ export function arrangeArgsRefusal(args: Record<string, string>): string | null 
   if (hasNodes && hasGroup) {
     return 'arrange takes --nodes <id,id> or --group <frameId>, not both — name the frame to arrange its own items, or list sibling nodes'
   }
+  // Every form packs with a gap, so `--gap` is checked once, before the forms split.
+  const gap = parseArrangeGap(args.gap)
+  if ('error' in gap) return gap.error
   const layout = args.layout
   if (hasGroup && isTopLevelGroupArg(args.group)) {
     if (layout && !(TOP_ARRANGE_LAYOUTS as readonly string[]).includes(layout)) {
@@ -73,25 +107,39 @@ export function arrangeArgsRefusal(args: Record<string, string>): string | null 
 }
 
 /**
+ * The `--gap` paragraph, with its numbers taken from the constants `parseArrangeGap` checks. Part
+ * of `arrangeGroupGuidanceLines`, so it lands in both generated bodies with the rest of `arrange`.
+ */
+export function arrangeGapGuidanceLines(): string[] {
+  return [
+    `- \`--gap <px>\` (every \`arrange\` form) is the space left between two packed items: a whole number`,
+    `  from 0 (touching) to ${ARRANGE_GAP_MAX}; omitted, it is ${ARRANGE_GAP_DEFAULT}. Above ${ARRANGE_GAP_MAX} the call is refused, not`,
+    '  clamped. It is applied exactly, grid snapping on or off. It is NOT a frame\'s inner padding: a',
+    '  frame still keeps its margin around what it holds.'
+  ]
+}
+
+/**
  * The agent-facing description of `arrange --group`, rendered into BOTH generated bodies (the
  * SKILL.md and the marker block) so the two cannot describe different products, with the layout
  * list taken from the constant the parser checks.
  */
 export function arrangeGroupGuidanceLines(): string[] {
   return [
-    `- \`arrange --group <frameId> [--layout ${GROUP_ARRANGE_LAYOUTS.join('|')}] [--cols N]\` — organize a frame by`,
+    `- \`arrange --group <frameId> [--layout ${GROUP_ARRANGE_LAYOUTS.join('|')}] [--cols N] [--gap px]\` — organize a frame by`,
     '  naming IT instead of listing its children: lays out the frame\'s direct children (a frame nested',
     '  inside moves as one unit), then resizes the frame — and every frame around it — to hold them, so',
     '  nothing overflows. The frame\'s top-left stays where it is. `--layout lineage` stacks one row per',
     '  level of who opened whom among those children; it is refused, with the reason, when no opened-by',
     '  or `--after` connection joins two of them. Pass `--nodes` or `--group`, never both. This is the',
     '  one call to make after `group`, or after opening stations into a frame.',
-    `- \`arrange --group top [--layout ${TOP_ARRANGE_LAYOUTS.join('|')}]\` — tidy the WHOLE canvas, exactly as the`,
+    `- \`arrange --group top [--layout ${TOP_ARRANGE_LAYOUTS.join('|')}] [--gap px]\` — tidy the WHOLE canvas, exactly as the`,
     '  user\'s Tidy canvas command does: every top-level node and frame (a frame moves as one unit) is',
     '  packed without overlap, and each orchestrator is placed first, at the top-left of the nodes and',
     '  frames it opened, with the team it opened packed directly to its right (opened-by only; an',
     '  `--after` wait does not move anything). Nodes nobody opened are packed after the teams.',
     '  `--layout lineage` instead stacks one row per level of opened-by and `--after`. Call it once',
-    '  after spawning teams, not after every open.'
+    '  after spawning teams, not after every open.',
+    ...arrangeGapGuidanceLines()
   ]
 }

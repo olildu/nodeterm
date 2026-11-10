@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { IPC } from './ipc'
 import { HOST_ONLY_REFUSAL, isHostOnlyChannel } from './host-control'
-import { WATCH_CHAT_CAST, WATCH_EVENT, WATCH_INPUT_CAST, WATCH_RELEASE_CAST, WATCH_UNLOCK_CAST } from './watch-link/protocol'
+import { WATCH_CHAT_CAST, WATCH_EVENT, WATCH_HISTORY_CAST, WATCH_INPUT_CAST, WATCH_RELEASE_CAST, WATCH_UNLOCK_CAST } from './watch-link/protocol'
 
 /**
  * The ONE list both shells consult. It exists so the desktop's relay admission and any future
@@ -42,11 +42,32 @@ describe('isHostOnlyChannel', () => {
     expect(isHostOnlyChannel(IPC.agentBoardCommentDeliver)).toBe(true)
   })
 
+  it('covers every simulator channel — a relay peer must not drive the host’s devices', () => {
+    for (const ch of (Object.values(IPC) as unknown[]).filter((c): c is string => typeof c === 'string' && c.startsWith('simulator:'))) {
+      expect(isHostOnlyChannel(ch)).toBe(true)
+    }
+    expect(isHostOnlyChannel(IPC.simulatorInput)).toBe(true)
+    expect(isHostOnlyChannel(IPC.simulatorAction)).toBe(true)
+  })
+
   it('covers both station-notice request channels', () => {
     // A guest may not report a pane verdict about the host's nodes…
     expect(isHostOnlyChannel(IPC.stationNoticeDropped)).toBe(true)
     // …nor list every project's failed stations: a guest scoped to one project must not read the rest.
     expect(isHostOnlyChannel(IPC.stationNoticeList)).toBe(true)
+  })
+
+  it('a relay peer cannot invoke projectLimit:state / projectLimit:claim (inbound requests)', () => {
+    // A claim spends the HOST's per-device allowance on the host's machine hash, and the state names
+    // the host's Pro and DNT facts. This list only gates what a peer SENDS: the outbound
+    // `projectLimit:changed` push is a separate rule (sent to this machine's windows only, never via
+    // platform().broadcast), so it is deliberately not asserted here — a prefix match on it would
+    // protect nothing.
+    expect(isHostOnlyChannel(IPC.projectLimitState)).toBe(true)
+    expect(isHostOnlyChannel(IPC.projectLimitClaim)).toBe(true)
+    expect(isHostOnlyChannel('projectLimit:claim')).toBe(true)
+    // A namespace, not a list: a request verb added later is refused the day it is added.
+    expect(isHostOnlyChannel('projectLimit:something-new')).toBe(true)
   })
 
   it('leaves the read-only/lifecycle channels alone — the gate is on ACTION, not on the namespace', () => {
@@ -85,7 +106,7 @@ describe('isHostOnlyChannel', () => {
     expect(isHostOnlyChannel('watch:meta')).toBe(false)
     // Every viewer message, Control's included (unlock, input, release, the per-viewer control state
     // and the typing set).
-    const viewer = [...Object.values(WATCH_EVENT), WATCH_CHAT_CAST, WATCH_UNLOCK_CAST, WATCH_INPUT_CAST, WATCH_RELEASE_CAST]
+    const viewer = [...Object.values(WATCH_EVENT), WATCH_CHAT_CAST, WATCH_HISTORY_CAST, WATCH_UNLOCK_CAST, WATCH_INPUT_CAST, WATCH_RELEASE_CAST]
     for (const ch of viewer) {
       expect(ch.startsWith('watch:'), ch).toBe(true)
       expect(isHostOnlyChannel(ch), ch).toBe(false)

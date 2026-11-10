@@ -45,7 +45,8 @@ vi.mock('../core/device-id', () => ({ getDeviceId: () => 'test-host-device-id' }
 import os from 'os'
 import { createPairingService, type PairingRelayDeps } from './pairing-service'
 import { rewriteKeyComment, type DeviceEntry } from './pairing-core'
-import { genKeyPair, publicKeyToB64 } from './remote/e2ee'
+import nacl from 'tweetnacl'
+import { encrypt, genKeyPair, publicKeyToB64 } from './remote/e2ee'
 import type { Settings } from '../shared/types'
 
 const HOME = os.homedir()
@@ -280,6 +281,31 @@ describe('revokeDevice', () => {
   })
 })
 
+describe('the QR carries this host\'s SSH host-key fingerprints', () => {
+  const FP = 'SHA256:4hkcemIeUAnjVwt5EwB/CU/rymSk1jz+o5uJWjj16e4'
+  it('as `sshHostKeys`, from the reader, so the phone pins its first SSH connect', async () => {
+    const service = createPairingService(undefined, { readSshHostKeys: async () => [FP] })
+    try {
+      const started = await service.start(() => {})
+      expect(JSON.parse(started.payload).sshHostKeys).toEqual([FP])
+    } finally {
+      service.stop()
+    }
+  })
+
+  it('omits the field when the reader finds none or fails (the phone falls back to TOFU, as before)', async () => {
+    for (const readSshHostKeys of [async () => [], async () => Promise.reject(new Error('EACCES'))]) {
+      const service = createPairingService(undefined, { readSshHostKeys })
+      try {
+        const started = await service.start(() => {})
+        expect(JSON.parse(started.payload)).not.toHaveProperty('sshHostKeys')
+      } finally {
+        service.stop()
+      }
+    }
+  })
+})
+
 describe('pairing POST vs revoke', () => {
   // The pairing POST mutates the same two files: it APPENDS to authorized_keys and upserts into
   // agent.json. Overlapping a revoke, an unserialized pairing either appends onto the inode the
@@ -410,6 +436,27 @@ describe('pairing remembers the phone’s relay device id', () => {
 
       const { deviceId } = JSON.parse(respText) as { deviceId: string }
       expect(paired(deviceId).relayDeviceId).toBe('phone-relay-1')
+    } finally {
+      service.stop()
+    }
+  })
+
+  it('refuses a sealed /pair whose epk is a low-order key (a public-constant shared key), pairing nothing', async () => {
+    const service = createPairingService(relayDeps())
+    try {
+      const started = await service.start(() => {})
+      const { token, pairPort, hostKey } = JSON.parse(started.payload) as { token: string; pairPort: number; hostKey: string }
+      expect(hostKey).toBe(publicKeyToB64(hostKeys.publicKey))
+      // Sealed under HSalsa20(0): the key ANY secret derives with a low-order epk — no secret needed.
+      const constant = nacl.box.before(new Uint8Array(32), nacl.randomBytes(32))
+      const plain = Buffer.from(JSON.stringify({ token, publicKey: freshEd25519Line(), deviceName: 'Weak' }))
+      const box = encrypt(Uint8Array.from(plain), constant)
+      const text = await post(pairPort, {
+        epk: Buffer.from(new Uint8Array(32)).toString('base64'),
+        box: Buffer.from(box).toString('base64')
+      })
+      expect(text).toBe('bad epk')
+      expect(devices().map((d) => d.name)).not.toContain('Weak')
     } finally {
       service.stop()
     }

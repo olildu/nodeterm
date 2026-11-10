@@ -86,6 +86,12 @@ describe('deleteConfirmCopy', () => {
     expect(c.confirmLabel).toBe('Delete')
   })
 
+  it('a project stored in app data: says the canvas goes with it (#1145)', () => {
+    const c = deleteConfirmCopy({ ...project({ nodes: [{ id: 't1' }] }), storeInAppData: true })
+    expect(c.message).toContain('not deleted, but the canvas, project settings, board log and whiteboards it kept in app data are.')
+    expect(c.message).not.toContain('.nodeterm/project.json')
+  })
+
   it('ssh delete: names the host the sessions end on (label preferred)', () => {
     const c = deleteConfirmCopy(project({ nodes: [{ id: 't1' }], ssh: { label: 'prod' } }))
     expect(c.message).toContain('ends its 1 terminal session on prod')

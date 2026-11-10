@@ -8,9 +8,10 @@
  * real tmux in `agent-message.realtty.test.ts` — this file assumes both and tests only what the
  * service adds.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import {
   deliverFromControl,
+  ptyPaneProbeDeps,
   renderMessageOutcome,
   onMessagingAgentEvent,
   createDeliveryQueue,
@@ -127,6 +128,18 @@ describe('deliverFromControl', () => {
     expect(owns).toHaveBeenCalledWith('a1', 'b1')
     expect(deps.rec.paneOwnerCalls).toEqual([])
     expect(deps.rec.sent).toEqual([])
+  })
+
+  it('lets a reply, and only a reply, reach the node that opened the caller (#1357)', async () => {
+    // b1 opened a1; a1 opened nothing.
+    const owns = vi.fn((source: string, target: string) => source === 'b1' && target === 'a1')
+    const sent = await deliverFromControl(req(), fakeDeps({ callerOwnsTarget: owns }))
+    expect(sent.outcome).toEqual({ kind: 'notPermitted', reason: 'caller-not-owner' })
+
+    const deps = fakeDeps({ callerOwnsTarget: owns })
+    const replied = await deliverFromControl(req({ verb: 'reply' }), deps)
+    expect(replied.outcome.kind).toBe('delivered')
+    expect(deps.rec.sent).toHaveLength(1)
   })
 
   it('refuses a cross-project target and a self-send, resolved off the store', async () => {
@@ -574,5 +587,59 @@ describe('a target that has not started yet (launch held off screen)', () => {
     const { deps } = unstarted({ heldLaunch: () => false })
     const { outcome } = await deliverFromControl(req(), deps)
     expect(outcome).toEqual({ kind: 'notPermitted', reason: 'unproven-target-owner' })
+  })
+})
+
+describe('deliverFromControl — the pane-read budget reaches both probes', () => {
+  // A Windows pane read (PowerShell console/CIM) takes ~2.4 s. Driven through the shells' own
+  // wiring helper and the whole control -> runDelivery -> deliverAgentMessage chain, so dropping
+  // the budget at ANY hop turns the first case into `targetPaneUnreadable`.
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  function slowPty(budgetMs: number): {
+    pty: Parameters<typeof ptyPaneProbeDeps>[0]
+    reads: string[]
+    budgetAsks: string[]
+  } {
+    const reads: string[] = []
+    const budgetAsks: string[] = []
+    return {
+      reads,
+      budgetAsks,
+      pty: {
+        paneOwner: async (nodeId) => {
+          reads.push(nodeId)
+          await new Promise((r) => setTimeout(r, 3000))
+          return { tty: '/dev/pts/9', panePid: 100, paneId: '%1', command: 'claude', argv: ['claude'], pids: [200] }
+        },
+        paneProbeTimeoutMs: (nodeId) => {
+          budgetAsks.push(nodeId)
+          return budgetMs
+        }
+      }
+    }
+  }
+
+  it('with the Windows budget, a 3 s read is delivered — both reads aimed at the target', async () => {
+    const { pty, reads, budgetAsks } = slowPty(8000)
+    const deps = fakeDeps(ptyPaneProbeDeps(pty))
+    const pending = deliverFromControl(req(), deps)
+    await vi.advanceTimersByTimeAsync(10_000)
+    const { outcome } = await pending
+    expect(outcome.kind).toBe('delivered')
+    expect(deps.rec.sent).toHaveLength(1)
+    expect(reads).toEqual(['b1', 'b1']) // pre-write and post-write
+    expect(budgetAsks).toContain('b1')
+  })
+
+  it('under the 2 s default the same read is refused as unreadable, and nothing is sent', async () => {
+    const { pty } = slowPty(2000)
+    const deps = fakeDeps(ptyPaneProbeDeps(pty))
+    const pending = deliverFromControl(req(), deps)
+    await vi.advanceTimersByTimeAsync(10_000)
+    const { outcome } = await pending
+    expect(outcome.kind).toBe('targetPaneUnreadable')
+    expect(deps.rec.sent).toHaveLength(0)
   })
 })

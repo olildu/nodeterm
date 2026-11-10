@@ -4,7 +4,12 @@
 // Kept free of React/store imports so the connection matrix is unit-testable.
 import type { Edge } from '@xyflow/react'
 import { oneLine } from '@shared/one-line'
+import { readsLinkedContextSkill } from '@shared/agents/config'
 import type { BridgeLink } from '@shared/types'
+import { shimCommand, shimDialectFor } from '@shared/agents/shim-invocation'
+import { capabilityAgentId, readsScreenDialogs } from '@shared/agents/config'
+import type { EmptyPromptRefusal } from '@shared/text-delivery'
+import { chatSendRefusal, type ChatGateStatus, type ChatSendRefusal } from './chatSendGate'
 import {
   classifyLink,
   planBridges,
@@ -126,6 +131,12 @@ export function linkIdsCoveredByRopes(
   return links.filter((l) => pairs.has(pairKey(l.source, l.target))).map((l) => l.id)
 }
 
+/** Does this agent load nodeterm's `get-linked-context` skill? See LINKED_CONTEXT_SKILL_AGENTS; an
+ *  unknown agent gets the skill wording, as it always did. */
+export function usesLinkedContextSkill(agentId: string | undefined): boolean {
+  return !agentId || readsLinkedContextSkill(agentId)
+}
+
 /** Longest note text pushed inline; longer notes are truncated with a pointer to the skill. */
 const NOTE_PUSH_MAX = 2000
 
@@ -143,7 +154,7 @@ export function buildNotePushMessage(title: string, text: string, agentId?: stri
   if (!text.trim()) return null
   const flat = oneLine(text.replace(/\s*\r?\n\s*/g, ' ⏎ '))
   const pointer =
-    !agentId || agentId === 'claude'
+    usesLinkedContextSkill(agentId)
       ? 'read the full note with the get-linked-context skill'
       : 'read the full note with the nodeterm linked-context CLI — see the get-linked-context section in your global agent instructions'
   const body =
@@ -165,16 +176,19 @@ export function buildNotePushMessage(title: string, text: string, agentId?: stri
 export function buildContextLinkNote(
   agentId: string | undefined,
   otherTitle: string,
-  shimPath: string
+  shimPath: string,
+  /** `process.platform` of the core whose shim this is (`contextLink.info()`); undefined for a
+   *  remote node or an older core ⇒ the POSIX line. On win32 a non-claude agent gets the `.cmd`. */
+  hostPlatform?: string
 ): string {
   const other = oneLine(otherTitle)
   // Both variants must self-defuse: the note is injected + submitted as a prompt, and an
   // agent that reads it as a task launches an unsolicited investigation of the linked node
   // (observed with gemini). "No action needed" keeps it a notification.
-  if (!agentId || agentId === 'claude') {
+  if (usesLinkedContextSkill(agentId)) {
     return `[nodeterm] You are now linked to "${other}". Use the get-linked-context skill to read its context when you need it. No action needed now — just acknowledge briefly.`
   }
-  return `[nodeterm] You are now linked to "${other}". When you need its context (and only then) run: sh "${shimPath}" list — then summary | transcript | terminal --node <id>. Details are in the get-linked-context section of your global agent instructions. No action needed now — acknowledge briefly and do not run these commands yet.`
+  return `[nodeterm] You are now linked to "${other}". When you need its context (and only then) run: ${shimCommand(shimPath, shimDialectFor(agentId, hostPlatform))} list — then summary | transcript | terminal --node <id>. Details are in the get-linked-context section of your global agent instructions. No action needed now — acknowledge briefly and do not run these commands yet.`
 }
 
 /**
@@ -196,3 +210,67 @@ export {
   buildBackgroundLinkMaps,
   type LinkNodeInfo
 } from '@shared/context-link-map'
+
+/**
+ * Why a link note (the context-link discovery note, a sticky pushed over a note link) was NOT typed
+ * into a node — issue #1144. Either the renderer's state gate refused (`ChatSendRefusal`: busy, a
+ * permission/question dialog, no CLI in the pane) or core's composer gate did
+ * (`EmptyPromptRefusal`: a draft in the input, no readable composer, …).
+ */
+export type LinkNoteSkip = Exclude<ChatSendRefusal, null> | EmptyPromptRefusal
+
+/**
+ * The renderer half of the link-note gate, decided before anything crosses to core. The note is
+ * unsolicited text typed into someone's session, so it goes only where it cannot hurt:
+ * - never into a `working` agent (it would land mid-turn), never into `waiting`/`blocked` (the
+ *   Enter would ANSWER the permission prompt or question), never into a pane the CLI has left (it
+ *   would run as a shell command) — the ⌘M composer's own gate, `chatSendRefusal`;
+ * - only into an agent whose composer we can READ (`readsScreenDialogs`), because "the input is
+ *   empty" must be proven on screen, not assumed — the reporter's draft was sitting in an idle
+ *   agent's input. Core proves it (`pty.sendToEmptyPrompt`) and refuses otherwise.
+ *
+ * A refused note is DROPPED, not queued: the link itself is the capability (the linked agent reads
+ * on demand with the get-linked-context skill), the note only advertises it, and a note delivered
+ * minutes later would be the same unsolicited prompt arriving at a moment nobody chose. The caller
+ * says what was skipped and why (`linkNoteSkippedNotice`).
+ */
+export function linkNoteRefusal(agentId: string, s: ChatGateStatus): LinkNoteSkip | null {
+  const state = chatSendRefusal(agentId, s)
+  if (state !== null) return state
+  return readsScreenDialogs(capabilityAgentId(agentId)) ? null : 'unsupported'
+}
+
+const SKIP_REASON: Record<LinkNoteSkip, string> = {
+  working: 'it is busy',
+  dialog: 'it is waiting for your answer',
+  'no-prompt': 'its input box is not on screen',
+  draft: 'its input already has text in it',
+  asleep: 'its agent is not running',
+  paused: 'its agent is not running',
+  dropped: 'its agent is not running',
+  exited: 'its agent is not running',
+  unsupported: 'nodeterm cannot check that its input is empty',
+  unknown: 'its screen could not be read',
+  'not-submitted': 'the note was typed but not submitted — check its input',
+  failed: 'the write failed'
+}
+
+/** Did a skip possibly leave bytes in the pane, or fail outright? Those are errors, the rest info. */
+const isErrorSkip = (r: LinkNoteSkip): boolean => r === 'not-submitted' || r === 'failed'
+
+/**
+ * One strip for every endpoint that was not told, so drawing a link never passes in silence and two
+ * endpoints never race for the strip. `null` when every note was delivered.
+ */
+export function linkNoteSkippedNotice(
+  kind: 'context' | 'note',
+  skips: readonly { title: string; reason: LinkNoteSkip }[]
+): { kind: 'info' | 'error'; text: string } | null {
+  if (skips.length === 0) return null
+  const who = skips.map((s) => `"${oneLine(s.title)}" (${SKIP_REASON[s.reason] ?? 'skipped'})`).join(', ')
+  const text =
+    kind === 'context'
+      ? `Linked. Not announced to ${who}. The link works anyway: an agent can read it with the get-linked-context skill.`
+      : `Note linked. Not sent to ${who}. The note is still readable through the link.`
+  return { kind: skips.some((s) => isErrorSkip(s.reason)) ? 'error' : 'info', text }
+}

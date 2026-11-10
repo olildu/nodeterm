@@ -32,7 +32,8 @@ import {
   limitLabel,
   limitShortLabel,
   primaryLimit,
-  providerLabel
+  providerLabel,
+  providerPillSegments
 } from '@shared/usage-limits'
 import { systemAccountDisplay } from '../state/workspace'
 
@@ -113,7 +114,7 @@ function DefaultAccountMark({
 }
 
 /** Why the bars above are old — only for numbers kept through a failed read. */
-function HeldNote({ u }: { u: ClaudeUsage | null | undefined }) {
+function HeldNote({ u }: { u: ClaudeUsage | ProviderUsage | null | undefined }) {
   const text = u ? heldUsageText(u) : null
   return text ? <div className="usage-popover__held">{text}</div> : null
 }
@@ -325,16 +326,18 @@ function ProviderBlock({ u, mode, hostKey }: { u: ProviderUsage; mode: 'used' | 
       {u.limits.map((l) => (
         <LimitRow key={limitKey(l)} limit={l} mode={mode} />
       ))}
+      {/* Numbers the service kept because the latest read failed (a Codex 429, issue #1168). */}
+      <HeldNote u={u} />
       {/* One line per distinct reason (issue #912): two views failing the same way are one
           failure of this provider, not two paragraphs of the same sentence. */}
-      {usageDiagnosticLines(label, u.diagnostics).map((line) => (
+      {usageDiagnosticLines(label, u.diagnostics, u.provider).map((line) => (
         <div className="usage-popover__empty" key={line}>
           {line}
         </div>
       ))}
       {u.limits.length === 0 && !u.diagnostics?.length && (
         <div className="usage-popover__empty">
-          {u.status === 'error' ? 'Could not read usage.' : 'No usage data.'}
+          {u.status === 'error' ? usageFailureText(u) : 'No usage data.'}
         </div>
       )}
     </div>
@@ -744,15 +747,20 @@ export function UsageIndicator({
         ))}
         {/* One segment per enabled provider, carrying only its worst limit — a provider's full
             breakdown belongs in the popover, not in a pill that has to fit beside the canvas. */}
+        {/* Cursor is the exception: all three buckets (providerPillSegments). */}
         {enabled.map((p, i) => {
-          const worst = primaryLimit(p.limits)
-          if (!worst) return null
+          const segments = providerPillSegments(p, labelFor(p.provider))
+          if (segments.length === 0) return null
           return (
             <span key={providerRowKey(p)} className="usage-pill__provider">
-              {(limits.length > 0 || i > 0) && <span className="usage-pill__sep">·</span>}
-              <span className="usage-pill__num">
-                {percentNumber(worst.usedPercent, percentMode)}% {labelFor(p.provider)}
-              </span>
+              {segments.map(({ limit: l, label }, j) => (
+                <span key={limitKey(l)}>
+                  {(limits.length > 0 || i > 0 || j > 0) && <span className="usage-pill__sep">·</span>}
+                  <span className="usage-pill__num">
+                    {percentNumber(l.usedPercent, percentMode)}% {label}
+                  </span>
+                </span>
+              ))}
             </span>
           )
         })}
@@ -769,7 +777,9 @@ export function UsageIndicator({
       onMouseLeave={closeSoon}
     >
       {open && (
-        <div className="usage-popover">
+        // `nowheel`: same reason as the session-memory panel — inside `.flow-wrap`, a plain wheel
+        // would zoom the canvas ("Scroll wheel zooms") instead of scrolling the account list.
+        <div className="usage-popover nowheel">
           <div className="usage-popover__head">
             <span className="usage-popover__title">✦ Usage</span>
             {/* Tracks whichever snapshot the panel is actually showing — the local poll's, or

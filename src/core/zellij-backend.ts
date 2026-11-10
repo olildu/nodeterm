@@ -21,6 +21,7 @@
  *    the session by name, the way the tmux paths use `has-session` / `capture-pane`.
  */
 import type { TextDeliveryResult } from '../shared/text-delivery'
+import { sleep } from '../shared/sleep'
 
 /** `(args) → stdout/stderr`, rejecting on a non-zero exit with `stdout`/`stderr` on the error —
  *  i.e. promisified `execFile`'s contract, already bound to the zellij binary and its env. */
@@ -223,8 +224,6 @@ export async function zellijSessionState(run: ZellijRun, name: string): Promise<
 /** A zombie verdict needs this many consecutive pane-less reads, this far apart (~1.2 s total). */
 export const ZOMBIE_CONFIRM_READS = 5
 export const ZOMBIE_CONFIRM_GAP_MS = 300
-
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
 /** Resolve the target pane, or null. */
 async function paneOf(run: ZellijRun, name: string): Promise<string | null> {

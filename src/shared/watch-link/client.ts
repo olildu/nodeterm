@@ -1,15 +1,17 @@
 // The browser half of a live link: the CLIENT role of src/core/relay/relay-socket.ts (handshake,
 // sealed frames, keepalive) plus the trust gate's client obligation (send our own trust:confirm,
 // open only once the host's arrives). After the handshake it sends only its own trust:confirm,
-// keepalives, and the viewer's casts: chat (`sendChat`) and, on a Control link, unlock / input /
-// release. Whether a cast is accepted is the link host's decision, and an obligation on it: chat only
+// keepalives, and the viewer's casts: read-back (`requestHistory`), chat (`sendChat`) and, on a
+// Control link, unlock (sealed to the connection's unlock key when its host offers one,
+// ./unlock-seal.ts) / input / release. Whether a cast is accepted is the link host's decision, and an obligation on it: chat only
 // on a Commenter or Control link, input only from a viewer that unlocked with the link's password.
 // Nothing on this side enforces that; `sendInput`'s size cap only keeps an oversized cast off the wire.
 import nacl from 'tweetnacl'
 import { b64ToBytes, bytesToB64, concatBytes, utf8 } from './bytes'
 import { hkdfSha256 } from './hkdf'
 import type { WatchLinkKeys } from './keys'
-import { INPUT_MAX, WATCH_CHAT_CAST, WATCH_INPUT_CAST, WATCH_RELEASE_CAST, WATCH_UNLOCK_CAST } from './protocol'
+import { INPUT_MAX, WATCH_CHAT_CAST, WATCH_EVENT, WATCH_HISTORY_CAST, WATCH_INPUT_CAST, WATCH_RELEASE_CAST, WATCH_UNLOCK_CAST, readHistoryRequest } from './protocol'
+import { readUnlockKey, sealUnlock } from './unlock-seal'
 import {
   NONCE_BYTES, RELAY_SESSION_INFO, ROLE_CLIENT, ROLE_HOST, TAG_RPC, TAG_TUNNEL_BIN, TAG_TUNNEL_TEXT,
   decodePtyFrame, openBox, parseTunnelJson, readHeader, sealBox, withHeader
@@ -44,8 +46,15 @@ export interface WatchClientEvents {
  * own the client never reaches a terminal event: no `onOpen`, `onDenied` or `onClose`.
  */
 export interface WatchClient {
+  /** Ask for a page of the agent's conversation since the link was shared: the newest, or the one
+   *  before `before` (a page's `olderCursor`). The answer is a `watch:history` event. A cursor the host
+   *  would refuse is refused here (false, nothing sent). */
+  requestHistory(before?: number): boolean
   sendChat(name: string, text: string): boolean
-  /** Ask to type, with the link's password. The answer is a `watch:control` event, not a return value. */
+  /** Ask to type, with the link's password. The answer is a `watch:control` event, not a return value.
+   *  Sealed to this connection's unlock key once a meta on it offered one (`WatchMeta.unlockKey`), and
+   *  from then on never sent in the clear on this connection; in the clear only to a host that offered
+   *  none (one from before sealing). */
   unlock(name: string, password: string): boolean
   /** Typed bytes, sent as given. Refused here (false, nothing sent) when empty, not a string, or longer
    *  than `INPUT_MAX` UTF-16 units. */
@@ -104,6 +113,9 @@ export function connectWatchClient(opts: {
   let opened = false
   let warnedUnknown = false
   let keepalive: unknown = null
+  /** The key this connection's host offered to seal an unlock to: the latest one a meta carried. Once
+   *  set it is never cleared, so an unlock on this connection is never sent in the clear again. */
+  let unlockKey: Uint8Array | null = null
 
   function sendSealed(tag: number, body: Uint8Array): boolean {
     if (!sessionKey || state === 'closed') return false
@@ -194,6 +206,10 @@ export function connectWatchClient(opts: {
       } else if (m.t === 'cast' && m.method === 'trust:denied') {
         events.onDenied(typeof m.args[0] === 'string' ? m.args[0] : 'denied')
       } else if (m.t === 'ev' && opened) {
+        if (m.channel === WATCH_EVENT.meta) {
+          const key = readUnlockKey((m.args[0] as { unlockKey?: unknown } | null | undefined)?.unlockKey)
+          if (key) unlockKey = key
+        }
         events.onEvent(m.channel, m.args)
       }
       return
@@ -216,8 +232,24 @@ export function connectWatchClient(opts: {
   }
 
   return {
+    requestHistory(before) {
+      const arg = before === undefined ? {} : { before }
+      if (readHistoryRequest(arg) === null) return false
+      return cast(WATCH_HISTORY_CAST, [arg])
+    },
     sendChat: (name, text) => cast(WATCH_CHAT_CAST, [{ name, text }]),
-    unlock: (name, password) => cast(WATCH_UNLOCK_CAST, [{ name, password }]),
+    unlock(name, password) {
+      if (!unlockKey) return cast(WATCH_UNLOCK_CAST, [{ name, password }])
+      let arg: ReturnType<typeof sealUnlock>
+      try {
+        arg = sealUnlock(name, password, unlockKey)
+      } catch {
+        // JSON.stringify cannot fail on two strings, and the key is 32 bytes; nothing goes out in the
+        // clear if it somehow does.
+        return false
+      }
+      return cast(WATCH_UNLOCK_CAST, [arg])
+    },
     sendInput(data) {
       if (typeof data !== 'string' || data.length === 0 || data.length > INPUT_MAX) return false
       return cast(WATCH_INPUT_CAST, [{ data }])

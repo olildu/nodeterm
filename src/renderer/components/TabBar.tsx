@@ -2,7 +2,8 @@ import { useEffect, useMemo, useRef, useState, type DragEvent } from 'react'
 import { createPortal } from 'react-dom'
 import { useProjects } from '../state/projects'
 import { isOmniKanbanEnabled, toggleBoardView, useViewMode, viewFor } from '../state/viewMode'
-import { useAgentStatus } from '../state/agentStatus'
+import { useAgentStatusSig, type AgentStatusLookup } from '../session/agent-status-lookup'
+import { usePauseCounts } from '../state/pauseCounts'
 import { useSettings } from '../state/settings'
 import { accountsForProject, sshAccountsHint, systemAccountDisplay } from '../state/workspace'
 import { useSshConn } from '../state/sshConn'
@@ -17,6 +18,7 @@ import { runPendingUpdate, usePendingUpdate } from '../state/pendingUpdate'
 import { ProjectGlyph } from './ProjectGlyph'
 import { useTooltip } from './Tooltip'
 import { projectTabTooltip } from '../lib/projectTabTooltip'
+import { useDragAutoScroll } from '../lib/dragAutoScroll'
 import {
   ALL_PERMISSION_MODES,
   PERMISSION_MODE_LABELS,
@@ -25,6 +27,10 @@ import {
 import { bypassSandboxCaveat, permissionModeAgentsLabel } from '@shared/agents/approval-mode'
 import { codexApprovalCaps } from '@renderer/state/codexCli'
 import { PROJECT_NAME_MAX, clampProjectName } from '@shared/project-name'
+import { CONFIRM_WAIVABLE_VERBS, WAIVABLE_VERB_ACTIONS, otherWaiverHint } from '@shared/control-confirm'
+import { projectWaiverRow, setControlConfirmWaivedForProject } from '../state/controlConfirmGate'
+import { useControlConfirm } from '../state/controlConfirm'
+import { isBrowserRuntime } from '../bridge/runtime'
 
 interface TabBarProps {
   onSwitch: (id: string) => void
@@ -38,6 +44,8 @@ interface TabBarProps {
   onOpenWelcome: () => void
   onRename: (id: string, name: string) => void
   onSetFolder: (id: string) => void
+  /** Issue #1145: move a local folder project's canvas into app data, or back into its folder. */
+  onMoveStorage?: (id: string, to: 'appData' | 'folder') => void
   /** Close (hide) the project without destroying it, reopenable from the start screen. */
   onCloseProject: (id: string) => void
   /** Open the Remote access dialog (host/share + connect). Shown for every project. */
@@ -54,6 +62,51 @@ interface TabBarProps {
   /** Why the share cannot start for this project right now (the row is then disabled with it as
    *  its tooltip), or null when it can. */
   shareBlockedReason?: (projectId: string) => string | null
+  /** Pause every agent session in the project (Canvas `pauseNodes`: one confirm, busy ones after
+   *  their current turn). */
+  onPauseProject: (id: string) => void
+  /** Drop the project's "pause after the current turn" marks. */
+  onCancelPendingPauses: (id: string) => void
+  /** Resume every PAUSED session of the ACTIVE project (offered only there). */
+  onResumeAllProject: (id: string) => void
+}
+
+/**
+ * The unread count of every project that has one, as ONE primitive — the tab dots' selector shape,
+ * so a working/waiting flip of any agent does not re-render the tab bar. Each node is asked through
+ * ITS project (`lookup(project.id, node.id)`): a team tab's unread lives in its relay session's
+ * store, and its node ids are the handed-off SSH project's too, so counting one store for every tab
+ * put one project's dot on the other's tab. Written with `JSON.stringify` (`[[projectId, count]…]`),
+ * never a raw join — ids come from git-shared, hand-editable project files. `''` when nothing is
+ * unread. Counts `p.nodes` entries, exactly as the dot always did.
+ */
+export function unreadSigFor(
+  projects: readonly { id: string; nodes: readonly { id: string }[] }[],
+  lookup: AgentStatusLookup
+): string {
+  const entries: Array<[string, number]> = []
+  for (const p of projects) {
+    let count = 0
+    for (const n of p.nodes) if (lookup(p.id, n.id)?.unread) count++
+    if (count > 0) entries.push([p.id, count])
+  }
+  return entries.length ? JSON.stringify(entries) : ''
+}
+
+/** Parse `unreadSigFor` back into projectId → unread count (projects with none are absent). */
+export function parseUnreadSig(sig: string): ReadonlyMap<string, number> {
+  const out = new Map<string, number>()
+  if (!sig) return out
+  try {
+    const entries: unknown = JSON.parse(sig)
+    if (!Array.isArray(entries)) return out
+    for (const e of entries) {
+      if (Array.isArray(e) && typeof e[0] === 'string' && typeof e[1] === 'number') out.set(e[0], e[1])
+    }
+  } catch {
+    /* our own output; an unparseable one reads as nothing unread */
+  }
+  return out
 }
 
 /**
@@ -85,13 +138,17 @@ export function TabBar({
   onOpenWelcome,
   onRename,
   onSetFolder,
+  onMoveStorage,
   onCloseProject,
   onRemoteAccess,
   onSetDefaultAccount,
   onSetDefaultPermissionMode,
   onOpenProjectSettings,
   onShareWithTeam,
-  shareBlockedReason
+  shareBlockedReason,
+  onPauseProject,
+  onCancelPendingPauses,
+  onResumeAllProject
 }: TabBarProps) {
   // Select the raw array and filter in a memo, a `.filter()` inside the selector returns a
   // fresh array every store snapshot, which re-rendered the TabBar on EVERY projects change.
@@ -105,14 +162,16 @@ export function TabBar({
   const perProjectKanban = useViewMode((s) => !!activeId && viewFor(s, activeId) === 'kanban')
   const kanbanActive = isGlobal || perProjectKanban
   const highlightedId = useViewMode((s) => s.highlightedSwimlaneId)
-  // Unread dots need only the unread id set — subscribing to the whole status map re-rendered
-  // the TabBar on every working/waiting flip of any agent. Primitive signature → rare updates.
-  const unreadIds = useAgentStatus((s) => {
-    let ids = ''
-    for (const [id, st] of Object.entries(s.byId)) if (st?.unread) ids += `${id}|`
-    return ids
-  })
-  const unreadSet = useMemo(() => new Set(unreadIds.split('|').filter(Boolean)), [unreadIds])
+  // Unread dots need only each tab's unread count — subscribing to the whole status map re-rendered
+  // the TabBar on every working/waiting flip of any agent. Primitive signature → rare updates. Each
+  // tab counts from ITS project's session store (`unreadSigFor`).
+  const projectIds = useMemo(() => projects.map((p) => p.id), [projects])
+  const unreadSig = useAgentStatusSig(projectIds, (lookup) => unreadSigFor(projects, lookup))
+  const unreadCounts = useMemo(() => parseUnreadSig(unreadSig), [unreadSig])
+  // ⏸ badge + the "Cancel pending pauses" row. Computed HERE, not in Canvas: this component
+  // already holds the projects array, and Canvas subscribing to it would re-render the whole canvas
+  // on every node serialization.
+  const pauseCounts = usePauseCounts(projects)
   const [menuId, setMenuId] = useState<string | null>(null)
   // `flipBase` is the ANCHOR's top edge: when the menu would overflow the bottom of the window,
   // it opens upward from the caret button instead (see useMenuFlip below).
@@ -135,6 +194,13 @@ export function TabBar({
   const [acctOpen, setAcctOpen] = useState(false)
   // Whether the caret menu's "Default permission mode" group is expanded (same idiom as acctOpen).
   const [modeOpen, setModeOpen] = useState(false)
+  const [agentActsOpen, setAgentActsOpen] = useState(false)
+  // Per-project agent confirm rows read the live gate (`projectWaiverRow`) at render. These
+  // subscriptions are what re-render the menu when any input of that decision changes: the
+  // persisted waivers, the app-run ones, and the global permission mode (`globalMode` below; a
+  // project's own mode arrives with the projects store).
+  useSettings((s) => s.settings.controlConfirmWaivers)
+  useControlConfirm((s) => s.sessionWaived)
   const claudeAccounts = useSettings((s) => s.settings.claudeAccounts)
   // The mode a project without an override falls back to, shown in the "Use global (…)" entry.
   const globalMode = useSettings((s) => s.settings.claudePermissionMode)
@@ -177,6 +243,7 @@ export function TabBar({
     setMenuPos(null)
     setAcctOpen(false)
     setModeOpen(false)
+    setAgentActsOpen(false)
   }
 
   const openMenu = (id: string, anchor: HTMLElement) => {
@@ -232,6 +299,9 @@ export function TabBar({
   // The strip scrolls without a visible scrollbar (see .tabbar__tabs), so keep it navigable:
   // a plain mouse wheel scrolls it horizontally, and the active tab is brought into view.
   const tabsRef = useRef<HTMLDivElement>(null)
+  // While a tab is dragged the strip scrolls itself near (or past) its left/right edge, so a tab
+  // can travel from the far end to the front in one drag.
+  useDragAutoScroll(tabsRef, 'x', dragId !== null)
   const pendingUpdate = usePendingUpdate((s) => s.pending)
   useEffect(() => {
     tabsRef.current
@@ -278,9 +348,11 @@ export function TabBar({
             title={
               pendingUpdate.kind === 'downloaded'
                 ? `nodeterm v${pendingUpdate.version} is ready, restart to update`
-                : pendingUpdate.kind === 'manual'
-                  ? `nodeterm v${pendingUpdate.version} is available, download it to update`
-                  : 'This version is no longer supported, update to continue'
+                : pendingUpdate.kind === 'available'
+                  ? `nodeterm v${pendingUpdate.version} is available, click to download it`
+                  : pendingUpdate.kind === 'manual'
+                    ? `nodeterm v${pendingUpdate.version} is available, download it to update`
+                    : 'This version is no longer supported, update to continue'
             }
             onClick={() => runPendingUpdate(pendingUpdate)}
           >
@@ -332,7 +404,7 @@ export function TabBar({
           {projects.map((p) => {
             const active = isGlobal ? (highlightedId ? p.id === highlightedId : p.id === activeId) : p.id === activeId
             const swimlaneHighlight = isGlobal && p.id === highlightedId
-            const unreadCount = p.nodes.filter((n) => unreadSet.has(n.id)).length
+            const unreadCount = unreadCounts.get(p.id) ?? 0
             return (
               <div
                 key={p.id}
@@ -438,6 +510,16 @@ export function TabBar({
 
                 {multiSession && <TabSessionLabel projectId={p.id} />}
 
+                {pauseCounts[p.id] && (
+                  <span
+                    className="tab__paused"
+                    title={`${pauseCounts[p.id].paused} paused${pauseCounts[p.id].pending ? `, ${pauseCounts[p.id].pending} pausing after their current turn` : ''}`}
+                  >
+                    ⏸ {pauseCounts[p.id].paused}
+                    {pauseCounts[p.id].pending ? ` · ${pauseCounts[p.id].pending} pending` : ''}
+                  </span>
+                )}
+
                 {unreadCount > 0 && (
                   <span className="tab__badge" title={`${unreadCount} unread`}>
                     {unreadCount}
@@ -528,6 +610,20 @@ export function TabBar({
             >
               Set folder…
             </button>
+            {onMoveStorage &&
+              menuProject.cwd &&
+              !menuProject.ssh &&
+              !menuProject.remote &&
+              !menuProject.unavailable && (
+                <button
+                  onClick={() => {
+                    onMoveStorage(menuProject.id, menuProject.storeInAppData ? 'folder' : 'appData')
+                    closeMenu()
+                  }}
+                >
+                  {menuProject.storeInAppData ? 'Store canvas in folder' : 'Store canvas in app data'}
+                </button>
+              )}
             <button
               onClick={() => {
                 onRemoteAccess()
@@ -662,6 +758,59 @@ export function TabBar({
                 ))}
               </div>
             )}
+            {
+              // Agent canvas-control confirms, per project: the SAME machine-local waiver the
+              // dialog's "Don't ask again for agents in …" grants (settings.json, never the
+              // git-shared project.json), reachable before any dialog has appeared. ✓ means agents
+              // in this project do it WITHOUT asking — the EFFECTIVE answer, read through the gate's
+              // own table (`projectWaiverRow`), so an app-run, machine-wide or Bypass waiver shows
+              // here too instead of the row promising a dialog that will not come.
+              // Desktop only: in the browser Server Edition canvas control is headless and gated by
+              // creator ownership, not by these waivers (@shared/control-confirm), so the rows would
+              // change nothing. A relay tab is another machine's project and its confirms are that
+              // machine's to waive.
+              !menuProject.remote &&
+                !isBrowserRuntime() && (
+                  <>
+                    <button
+                      className={`tab-menu__group${agentActsOpen ? ' open' : ''}`}
+                      onClick={() => setAgentActsOpen((v) => !v)}
+                    >
+                      Agents may, without asking
+                      <span className="tab-menu__caret">▸</span>
+                    </button>
+                    {agentActsOpen && (
+                      <div className="tab-menu__sub">
+                        {[...CONFIRM_WAIVABLE_VERBS].map((verb) => {
+                          const row = projectWaiverRow(verb, menuProject.id)
+                          // Another waiver still applies without this project's grant, so the row
+                          // cannot make agents ask again — name it and where it is revoked.
+                          const elsewhere = row.otherVia !== null
+                          return (
+                            <button
+                              key={verb}
+                              disabled={elsewhere && !row.granted}
+                              title={
+                                elsewhere
+                                  ? otherWaiverHint(row.otherVia!)
+                                  : row.granted
+                                    ? `Agents in "${menuProject.name}" do this without a confirm dialog (this computer only). Click to ask again.`
+                                    : `Agents in "${menuProject.name}" ask you first. Click to let them do this without asking (this computer only).`
+                              }
+                              onClick={() => {
+                                setControlConfirmWaivedForProject(verb, menuProject.id, !row.granted)
+                              }}
+                            >
+                              <span className="tab-menu__check">{row.skips ? '✓' : ''}</span>
+                              {WAIVABLE_VERB_ACTIONS[verb] ?? verb}
+                            </button>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </>
+                )
+            }
             <button
               onClick={() => {
                 onOpenProjectSettings(menuProject.id)
@@ -670,6 +819,56 @@ export function TabBar({
             >
               Project settings…
             </button>
+            {/* The id a `nodeterm://open?project=<id>` link names (another app's config maps its
+                repositories to these ids). A relay tab's id belongs to the host, which a link here
+                cannot open. */}
+            {!menuProject.remote && (
+              <button
+                onClick={() => {
+                  window.nodeTerminal.clipboard.writeText(menuProject.id)
+                  closeMenu()
+                }}
+              >
+                Copy project id
+              </button>
+            )}
+            <button
+              onClick={() => {
+                onPauseProject(menuProject.id)
+                closeMenu()
+              }}
+            >
+              Pause project
+            </button>
+            {(pauseCounts[menuProject.id]?.pending ?? 0) > 0 && (
+              <button
+                onClick={() => {
+                  onCancelPendingPauses(menuProject.id)
+                  closeMenu()
+                }}
+              >
+                Cancel pending pauses
+              </button>
+            )}
+            {/* Chromium shows no `title` for a DISABLED button (it receives no pointer events), so
+                the reason sits on a wrapper the pointer can reach; the disabled button lets the
+                pointer through to it (`.tab-menu__reason > button:disabled`). */}
+            <span
+              className="tab-menu__reason"
+              title={menuProject.id !== activeId ? 'Open the project to resume' : undefined}
+            >
+              <button
+                // Resume needs each node's mounted terminal (it re-launches the CLI into the pane
+                // and guards the typing), and only the active project's nodes are mounted.
+                disabled={menuProject.id !== activeId}
+                onClick={() => {
+                  onResumeAllProject(menuProject.id)
+                  closeMenu()
+                }}
+              >
+                Resume all
+              </button>
+            </span>
             <button
               onClick={() => {
                 onCloseProject(menuProject.id)

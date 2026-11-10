@@ -32,6 +32,7 @@ import { IPC } from '../../shared/ipc'
 import type { UiSink } from '../ui-sink-registry'
 import type { AccessDecision, RelayHostHooks } from './relay-host'
 import {
+  createPresenceFilter,
   filterOutboundBinary,
   filterOutboundEvent,
   narrowResponseForRole,
@@ -40,6 +41,7 @@ import {
   type AccessContext,
   type SubagentOwners
 } from './access-policy'
+import { shareRootProblem } from './share-root'
 
 export interface ScopedGuestDeps {
   /** EVERY project that holds this node id, from the persisted canvases ([] = none). */
@@ -60,6 +62,11 @@ export interface ScopedGuestDeps {
   realpath?(p: string): string | null
   /** Does the path exist AS AN ENTRY (lstat — a dangling symlink counts)? Injected for tests. */
   lexists?(p: string): boolean
+  /** The host user's home directory (`shareRootProblem`). Absent = `os.homedir()`. */
+  homeDir?: string
+  /** The nodes whose current AGENT session is this id (the agent-status mirror). Lets a
+   *  `context:update` without a `nodeId` be attributed; absent = such an update is never delivered. */
+  nodesOfAgentSession?(agentSessionId: string): readonly string[]
 }
 
 type Check = (args: unknown[], s: Scope) => AccessDecision
@@ -72,6 +79,7 @@ const PATH_OUTSIDE = 'Only files inside the shared project folder are reachable.
 const NO_ROOT = 'This shared project has no folder on the host.'
 const HOST_DATA = "The host app's own data folder is not reachable."
 const NOT_SCOPED = 'That is not available in a shared-project session.'
+const TOO_MANY_NEW = 'Too many new nodes in this session. Reconnect to add more.'
 
 const defaultRealpath = (p: string): string | null => {
   try {
@@ -89,23 +97,71 @@ const defaultLexists = (p: string): boolean => {
   }
 }
 
+/**
+ * A node id THIS guest introduced over `canvas:mut` while no project held it (the host renderer saves
+ * on a debounce, so a brand-new terminal's first `pty:create` routinely arrives before the node is
+ * on disk).
+ *  - `pending`: introduced, but its terminal is not proven to be the guest's own. It reaches
+ *    `canvas:mut` and a `pty:create` that may only SPAWN (`newOnly`) — never a node-keyed pty verb,
+ *    never the outbound stream, and that holds even after the host has saved the node into the
+ *    shared project: being on the canvas is the guest's own doing, not evidence of ownership.
+ *  - `created`: this session's own `pty:create` for it spawned a FRESH session (the response said
+ *    so: `fresh: true`, see `noteCreate`). From then on it is a node of the shared project.
+ *
+ * Why pending is not enough (security audit F1, 2026-10): `canvas:mut` is a cast, admitted before
+ * the reflector validates anything, so ANY id no project holds could be recorded — a PREFIX of
+ * another project's node id (tmux then prefix-matched the longer, live session on every bare
+ * `-t`), an orphan session's exact id, or an id an unreadable project's file holds. For an SSH
+ * project's guest, whose own terminals never run locally, that reached the host's LOCAL sessions.
+ * Exact tmux targets (tmux-naming.ts `exactPaneTarget`) close the prefix half; this closes the
+ * "claim a live session by naming it" half: a pending id unlocks only a spawn of its own.
+ */
+type Introduced = 'pending' | 'created'
+
+/** How many ids one session may introduce. A memory bound, not a security one (a pending id grants
+ *  nothing but its own spawn); past it, new ids are refused until the guest reconnects. */
+export const INTRODUCED_MAX = 256
+
 /** Everything a check needs about ONE session, built once per session. */
 interface Scope {
   projectId: string
   deps: Required<Pick<ScopedGuestDeps, 'realpath' | 'lexists'>> & ScopedGuestDeps
-  /** Node ids this guest introduced into the shared project over `canvas:mut` that no persisted
-   *  canvas holds yet (the host renderer saves on a debounce, so a brand-new terminal's first
-   *  `pty:create` routinely arrives before the node is on disk). Only ids NO project holds are
-   *  recorded, so this can never adopt another project's node. */
-  newNodes: Set<string>
+  /** See `Introduced`. Bounded at INTRODUCED_MAX; insertion order = age. */
+  introduced: Map<string, Introduced>
 }
 
-/** Every project holding `id`, with this session's own fresh nodes counted as the shared project's. */
+const NO_PROJECTS: readonly string[] = Object.freeze([])
+
+/**
+ * Every project holding `id` as far as THIS session may act on it. A pending id holds nothing (see
+ * `Introduced`) whatever the persisted canvases say; a created one counts as the shared project's
+ * until a save puts it on disk.
+ */
 function projectsOf(id: string, s: Scope): readonly string[] {
+  const mine = s.introduced.get(id)
+  if (mine === 'pending') return NO_PROJECTS
   const held = s.deps.projectsOfNode(id)
   if (held.length > 0) return held
-  return s.newNodes.has(id) ? [s.projectId] : held
+  return mine === 'created' ? [s.projectId] : held
 }
+
+/** A pending id this guest may still spawn its own terminal for: introduced here, and no OTHER
+ *  project has taken the id since (a git pull can put it in one). */
+function pendingHere(id: unknown, s: Scope): id is string {
+  return (
+    typeof id === 'string' &&
+    s.introduced.get(id) === 'pending' &&
+    s.deps.projectsOfNode(id).every((p) => p === s.projectId)
+  )
+}
+
+/**
+ * The alphabet a guest-introduced node id may use: the ids the app itself mints (`nextId`,
+ * `uuid()`), never a character `sessionName` rewrites. `nt-` + id is then the session name with no
+ * substitution, so two different ids cannot name one tmux session (`a.b` and `a_b` both map to
+ * `nt-a_b`). Ids that already exist in a project are not judged by it.
+ */
+const INTRODUCIBLE_ID = /^[A-Za-z0-9-]{1,128}$/
 
 /** A node is in scope only when EVERY project holding its id is the shared one: node ids travel in
  *  git-shared project files, so an id copied into another project must not ride this session. */
@@ -254,9 +310,17 @@ const ptyCreate: Check = (a, s) => {
   const o = a[0]
   if (!o || typeof o !== 'object' || Array.isArray(o)) return no(NODE_OUTSIDE)
   const opts = { ...(o as Record<string, unknown>) }
-  if (!nodeInScope(opts.persistKey, s)) return no(NODE_OUTSIDE)
+  // A node this guest introduced and has not yet proven: the create may only SPAWN a fresh session
+  // (`newOnly`: core refuses a join, a reattach and any session that already exists under that
+  // name). Its response, read in `noteCreate`, is what promotes the id to `created`.
+  const pending = pendingHere(opts.persistKey, s)
+  if (!pending && !nodeInScope(opts.persistKey, s)) return no(NODE_OUTSIDE)
+  if (pending) opts.newOnly = true
   if (opts.ownerProjectId !== undefined && opts.ownerProjectId !== s.projectId) return no(OUTSIDE)
   delete opts.sshRemote
+  // The local-login exemption from the SSH-project refusal is this machine's own UI's mark, never
+  // a guest's (issue #1186).
+  delete opts.localOnSshCanvas
   if (s.deps.projectIsRemote?.(s.projectId)) opts.requireRemote = true
   const root = rootOf(s)
   if (opts.cwd === undefined || opts.cwd === null || opts.cwd === '') {
@@ -271,9 +335,10 @@ const ptyCreate: Check = (a, s) => {
 
 /**
  * `canvas:mut` (projectId, mutation): only into the shared project, and only for a node that is in
- * scope or that NO project holds yet (a node the guest is creating — recorded, so its `pty:create`
- * is accepted before the host's debounced save lands). An upsert of another project's node id is
- * refused: applied, it would put that id in the shared project and hand this session its terminal.
+ * scope or that NO project holds yet (a node the guest is creating — recorded as PENDING, so its
+ * `pty:create` is accepted, as a spawn only, before the host's debounced save lands; see
+ * `Introduced`). An upsert of another project's node id is refused: applied, it would put that id in
+ * the shared project and hand this session its terminal.
  */
 const canvasMut: Check = (a, s) => {
   if (a[0] !== s.projectId) return no(OUTSIDE)
@@ -283,8 +348,12 @@ const canvasMut: Check = (a, s) => {
   const id = mut.op === 'remove' ? mut.id : mut.node?.id
   if (typeof id !== 'string' || !id) return no(OUTSIDE)
   if (nodeInScope(id, s)) return OK
-  if (mut.op === 'upsert' && s.deps.projectsOfNode(id).length === 0) {
-    s.newNodes.add(id)
+  // Its own new node, still pending: moving or removing it is a canvas edit like any other.
+  if (pendingHere(id, s)) return OK
+  if (mut.op === 'upsert' && s.deps.projectsOfNode(id).length === 0 && !s.introduced.has(id)) {
+    if (!INTRODUCIBLE_ID.test(id)) return no(NODE_OUTSIDE)
+    if (s.introduced.size >= INTRODUCED_MAX) return no(TOO_MANY_NEW)
+    s.introduced.set(id, 'pending')
     return OK
   }
   return no(NODE_OUTSIDE)
@@ -319,6 +388,9 @@ export const SCOPED: Readonly<Record<string, Check>> = Object.freeze({
   [IPC.ptyReadScrollback]: nodeArg0,
   [IPC.ptySendText]: nodeArg0,
   [IPC.ptySendChatPrompt]: nodeArg0,
+  [IPC.ptySendToEmptyPrompt]: nodeArg0,
+  [IPC.ptyReadChatScreen]: nodeArg0,
+  [IPC.ptyInterruptChat]: nodeArg0,
   [IPC.ptyTmuxStatus]: pass,
   [IPC.ptyPaneCommand]: nodeArg0,
   [IPC.ptyPaneCwd]: nodeArg0,
@@ -338,6 +410,10 @@ export const SCOPED: Readonly<Record<string, Check>> = Object.freeze({
   // Writes into this app's own uploads dir under an app-chosen name (a pasted screenshot's bytes).
   [IPC.filesSaveUpload]: pass,
   [IPC.filesSaveCanvasImage]: projectArg0,
+  // A whiteboard is addressed by (projectId, nodeId) and the core derives the path in that
+  // project, so the project argument is the whole scope check, as for a canvas image.
+  [IPC.filesSaveWhiteboard]: projectArg0,
+  [IPC.filesReadWhiteboard]: projectArg0,
 
   // Git: the working directory realpath-jailed to the project root, plus per-verb argument checks.
   [IPC.gitStatus]: gitCwd(),
@@ -407,8 +483,9 @@ export const SCOPED: Readonly<Record<string, Check>> = Object.freeze({
   [IPC.githubIssuesPullChecks]: projectArg0,
   [IPC.githubProjectAvatar]: projectArg0,
 
-  // Agent status actions, per node. The subagent snapshot's RESPONSE is narrowed below.
+  // Agent status actions, per node. The two snapshots' RESPONSES are narrowed below.
   [IPC.agentSubagentSnapshot]: pass,
+  [IPC.agentStatusSnapshot]: pass,
   [IPC.agentHibernated]: nodeField0,
   [IPC.agentAnswerPermission]: nodeField0,
   [IPC.agentAckDone]: nodeArg0,
@@ -434,6 +511,18 @@ export const SCOPED: Readonly<Record<string, Check>> = Object.freeze({
 export const SCOPED_REFUSED: ReadonlySet<string> = new Set<string>([
   // A whole-workspace write from a peer would replace the host's other projects.
   IPC.workspaceSave,
+  // Moving a project's storage writes and deletes host files (issue #1145); host-only.
+  IPC.workspaceReleaseFolderFiles,
+  IPC.workspacePrepareFolderStorage,
+  IPC.workspaceProjectStorage,
+  // Host-only (shared/host-control.ts): a peer's launch claim would make the host's own viewers
+  // stand down from a launch (#1173). A relay tab never sends it.
+  IPC.workspaceClaimLaunch,
+  // Host-only for every peer (shared/host-control.ts): it would type a launch on the host and read
+  // a host-local prompt file into it. A relay tab never sends it.
+  IPC.ptyExecuteLaunch,
+  // Types into a pane by node id; HOST_ONLY, and relay-api.ts stubs it.
+  IPC.ptySendPaneKeys,
   // Project settings / setup / trust: relay-api.ts keeps these LOCAL; the setup ones are host-only.
   IPC.projectSettingsRead,
   IPC.projectSettingsWriteShared,
@@ -505,12 +594,44 @@ function makeScope(projectId: string, deps: ScopedGuestDeps): Scope {
   return {
     projectId,
     deps: { ...deps, realpath: deps.realpath ?? defaultRealpath, lexists: deps.lexists ?? defaultLexists },
-    newNodes: new Set()
+    introduced: new Map()
   }
+}
+
+/**
+ * A `pty:create` this session asked for came back. Promote its node from pending to created only on
+ * the core's own word that it SPAWNED the session: `fresh: true`, no `unavailable`, no
+ * `freshUnverified`, and a session id the pty manager maps to that node. Anything else (a refusal,
+ * a join, a guess) leaves it pending. Exported for the test.
+ */
+export function noteCreate(result: unknown, s: Scope): void {
+  if (result === null || typeof result !== 'object') return
+  const r = result as { sessionId?: unknown; fresh?: unknown; unavailable?: unknown; freshUnverified?: unknown }
+  if (r.fresh !== true || r.unavailable !== undefined || r.freshUnverified === true) return
+  if (typeof r.sessionId !== 'string' || !r.sessionId) return
+  const node = s.deps.nodeOfSession(r.sessionId)
+  if (node !== undefined && pendingHere(node, s)) s.introduced.set(node, 'created')
+}
+
+/**
+ * Why this scope must not be served at all, or null. A shared project whose folder is the disk root,
+ * the home directory or an ancestor of either (or of this app's data dir) would hand the guest every
+ * file under it, `~/.ssh` included (security audit F4). The invite UI refuses such a project and so
+ * does the seat mint (relay-host-service `addSeat`); this is the gate the UI is not: every request
+ * of such a session is refused. An SSH project (no local folder) has nothing to judge.
+ */
+function scopeProblem(s: Scope): string | null {
+  return shareRootProblem(s.deps.projectCwd(s.projectId), {
+    home: s.deps.homeDir,
+    dataDir: s.deps.hostDataDir,
+    realpath: s.deps.realpath
+  })
 }
 
 function decideWith(method: string, args: unknown[], s: Scope): AccessDecision {
   if (typeof method !== 'string' || !Object.hasOwn(SCOPED, method)) return no(NOT_SCOPED)
+  const problem = scopeProblem(s)
+  if (problem) return no(problem)
   return SCOPED[method](Array.isArray(args) ? args : [], s)
 }
 
@@ -536,7 +657,9 @@ function viewCtx(s: Scope): AccessContext {
     projectCwds: () => (typeof root === 'string' && root ? [root] : []),
     hostDataDir: s.deps.hostDataDir,
     realpath: s.deps.realpath,
-    isFile: () => false
+    isFile: () => false,
+    ...(s.deps.homeDir !== undefined ? { homeDir: s.deps.homeDir } : {}),
+    ...(s.deps.nodesOfAgentSession ? { nodesOfAgentSession: (sid: string) => s.deps.nodesOfAgentSession!(sid) } : {})
   }
 }
 
@@ -569,7 +692,7 @@ export function filterScopedEvent(json: string, s: Scope, owners: SubagentOwners
 /**
  * The hooks that make a Team Access session bound to `projectId` a boundary. Every peer message is
  * judged by `SCOPED` (inbound), `filterScopedEvent` / terminal-frame attribution (outbound), and the
- * subagent snapshot is narrowed to the shared project's nodes.
+ * subagent and agent-status snapshots are narrowed to the shared project's nodes.
  */
 export function scopedGuestHooks(projectId: string, deps: ScopedGuestDeps): RelayHostHooks {
   const s = makeScope(projectId, deps)
@@ -577,6 +700,9 @@ export function scopedGuestHooks(projectId: string, deps: ScopedGuestDeps): Rela
     access: (_session, _kind, method, args) => decideWith(method, args, s),
     wrapSink: (_session, sink: UiSink): UiSink => {
       const owners: SubagentOwners = new Map()
+      // Presence is rewritten per peer: only peers on the shared project, no node reference outside
+      // it (access-policy.ts `createPresenceFilter`, security audit (a)).
+      const presence = createPresenceFilter()
       const safe = (judge: () => boolean): boolean => {
         try {
           return judge()
@@ -586,10 +712,21 @@ export function scopedGuestHooks(projectId: string, deps: ScopedGuestDeps): Rela
       }
       return {
         sendText: (json) => {
-          // Admitted events are sent with project documents' exec fields removed (held launch
-          // commands, session programs, ssh options): the guest reads the shared project's canvas,
-          // not the command lines this machine holds for it.
-          if (safe(() => filterScopedEvent(json, s, owners))) sink.sendText(redactOutboundEvent(json))
+          let out: string | null = null
+          const deliver = safe(() => {
+            const p = presence.handle(json, () => viewCtx(s))
+            if (p !== undefined) {
+              out = p
+              return p !== null
+            }
+            if (!filterScopedEvent(json, s, owners)) return false
+            // Admitted events are sent with project documents' exec fields removed (held launch
+            // commands, session programs, ssh options): the guest reads the shared project's canvas,
+            // not the command lines this machine holds for it.
+            out = redactOutboundEvent(json)
+            return true
+          })
+          if (deliver && out !== null) sink.sendText(out)
         },
         sendBinary: (buf) => {
           if (safe(() => filterOutboundBinary(buf, viewCtx(s)))) sink.sendBinary(buf)
@@ -597,7 +734,10 @@ export function scopedGuestHooks(projectId: string, deps: ScopedGuestDeps): Rela
         bufferedAmount: () => sink.bufferedAmount?.() ?? 0
       }
     },
-    narrowResponse: (_session, method, result) => narrowResponseForRole(method, result, viewCtx(s))
+    narrowResponse: (_session, method, result) => {
+      if (method === IPC.ptyCreate) noteCreate(result, s)
+      return narrowResponseForRole(method, result, viewCtx(s))
+    }
   }
 }
 

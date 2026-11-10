@@ -162,6 +162,11 @@
   --radius: 8px;
   --radius-sm: 6px;
   --radius-lg: 12px;
+  /* The rendered-Markdown views' font (Settings → Appearance). App.tsx overrides these on <html>
+     from settings; these are the defaults (@shared/markdown-font) for an un-hydrated store. */
+  --md-font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+  --md-font-size: 13px;
+  --md-code-font-family: Menlo, Monaco, "Courier New", monospace;
   font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro', 'Helvetica Neue',
     sans-serif;
   font-size: 13px;
@@ -197,6 +202,28 @@
 
 :root[data-nt-window='idle'] {
   --nt-anim-state: paused;
+}
+
+/* React Flow's own infinite animation joins the gate here. `@xyflow/react/dist/style.css`
+   (imported at the top of this file) runs `dashdraw 0.5s linear infinite` on every `animated`
+   edge — working subagent and loop edges, and the driven-browser rope — and on an animated
+   connection line. That sheet never reads `--nt-anim-state`, so inheriting the variable did
+   nothing and both the idle gate and the covered-canvas gate missed it. MEASURED (dev build, one
+   synthetic edge with React Flow's real classes on a silent 12-terminal canvas, idle gate set,
+   3 alternating 30 s rounds): Liquid Glass 79 % of a core in the GPU process + 36 % renderer and
+   +340 MB GPU footprint; dark 31.5 % + 29 %; with this rule both fell to the no-edge baseline
+   (0.5 % GPU, 3.3 % renderer). The selectors are copied verbatim from xyflow's sheet, so the
+   specificity is identical and this wins on order alone (it comes after the @import); it sets ONLY
+   the play-state, so the shorthand, the dash and the interaction path's `animation: none` are
+   untouched. `styles.animation-gate.test.ts` scans xyflow's sheet too, and fails if an upgrade adds
+   an infinite animation under a selector not listed here.
+
+   This covers idle and covered only. A FOCUSED window still pays the full per-edge cost for as
+   long as an edge works; a cheaper working-edge style is a separate design call, and the driven
+   rope keeps flowing while focused by decision (see CLAUDE.md § Idle energy). */
+.react-flow__edge.animated path,
+.react-flow__connection .animated {
+  animation-play-state: var(--nt-anim-state);
 }
 
 /* ---- Light appearance ----------------------------------------------------------------------
@@ -390,7 +417,8 @@ body,
 }
 
 /* Title-bar "Update" button (Figma-style): right after the traffic lights, deliberately loud and
-   not dismissible, shown only while an update is staged / owed (state/pendingUpdate.ts). */
+   not dismissible, shown from the moment a newer version is known until it is installed
+   (state/pendingUpdate.ts). */
 .tabbar__update {
   display: inline-flex;
   align-items: center;
@@ -631,6 +659,16 @@ body,
   background: none;
 }
 
+/* Bulk pause: "⏸ 3 · 1 pending" after the tab name. Muted text, no fill — a paused project is a
+   resting state, not something asking for attention like the unread badge beside it. */
+.tab__paused {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 /* Unread-completion count badge on a project tab. */
 .tab__badge {
   display: inline-flex;
@@ -794,6 +832,17 @@ body,
 .tab-menu button:disabled {
   color: var(--muted);
   cursor: not-allowed;
+}
+
+/* A menu row whose disabled reason lives on a wrapper: a disabled button takes no pointer events
+   in Chromium, so neither its own `title` nor the cursor would ever show. */
+.tab-menu__reason {
+  display: block;
+  cursor: not-allowed;
+}
+
+.tab-menu__reason > button:disabled {
+  pointer-events: none;
 }
 
 .tab-menu button.danger:hover:not(:disabled) {
@@ -1017,6 +1066,24 @@ body,
   border: 1px solid var(--border);
   border-radius: 12px;
   box-shadow: 0 12px 36px rgba(0, 0, 0, calc(0.55 * var(--shadow-k)));
+}
+
+/* The add menu lists every node kind and agent (860px+ on a stock setup), so on a short window its
+   top ran up under the tab bar and off the screen, where those rows could not be clicked. It is
+   capped to the space between the tab bar and the dock, and its rows scroll inside an inner list:
+   scrolling the menu box itself would scroll its glass `::before` layer away with the rows. 54px
+   is the dock's measured height, 16px the menu's gap above the dock plus a margin below the tab
+   bar. The agent flyouts are portaled out of the list (Dock.tsx). */
+.dock-add-menu {
+  max-height: calc(100vh - var(--tabbar-h) - var(--float-gap) - 54px - 16px);
+}
+.dock-menu__list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .dock-menu button {
@@ -1605,8 +1672,8 @@ body,
    way, the scripted gesture 36 s vs 28 s); without it, 0. camera-moving.test.ts pins its absence. */
 /* The blur is re-rasterised for every glass node on every frame of a pan/zoom (their backdrop
    moves under them). With Keep blur while moving OFF (settings.glassBlurWhileMoving), Canvas marks
-   the flow wrapper while the camera moves; the tint stays, and the tint alone is what keeps text at
-   4.5:1, so only the frosting pauses. With it on (the default) the class is never set. */
+   the flow wrapper while the camera moves; the tint stays, plus left of the Readable tick the
+   backdrop squeeze (Liquid Glass block), so text keeps 4.5:1 and only the frosting pauses. With it on (the default) the class is never set. */
 .canvas-moving .term-node.term-node--glass {
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
@@ -2808,6 +2875,18 @@ body,
   -webkit-font-smoothing: auto;
 }
 
+/* xterm's DOM renderer sets an INLINE `width` (the grid) and `overflow: hidden` on every row. A
+   glyph's ink runs a fraction past its advance (Menlo's `m`, `w`), so the last column of a full row
+   lost its right edge — measured at DPR 1, canvas zoom 1.38: a 616px row held a 617px span and the
+   `m` of "t/m" was cut. Only the HORIZONTAL clip is lifted: the vertical one keeps underlines and
+   descenders out of the next row (`clip`, unlike `hidden`, does not turn the other axis's `visible`
+   into `auto`). The overhang lands in the host's right padding; `.term-node` still clips, so nothing
+   paints outside the node. !important because an inline style beats any selector. */
+.xterm-rows > div {
+  overflow-x: visible !important;
+  overflow-y: clip !important;
+}
+
 /* Shared glyph renderer (experimental, `glyphgrid`): a glyph-attached terminal becomes a
    transparent WINDOW onto the one GPU canvas, which sits between the React Flow background and the
    nodes (z-index 0 against the renderer's 4 — it cannot simply be raised above them, or a
@@ -3150,8 +3229,8 @@ body,
   min-height: 0;
   overflow: auto;
   padding: 12px 16px;
-  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-  font-size: 13px;
+  font-family: var(--md-font-family);
+  font-size: var(--md-font-size);
   line-height: 1.6;
   color: var(--text);
   /* Allow text selection / copy (React Flow nodes are non-selectable by default). */
@@ -3167,14 +3246,16 @@ body,
   line-height: 1.3;
 }
 
+/* Heading sizes are proportions of the body size (20 / 17 / 15 px at the default 13), so they
+   follow the Markdown font size setting. */
 .term-md__content h1 {
-  font-size: 20px;
+  font-size: 1.54em;
 }
 .term-md__content h2 {
-  font-size: 17px;
+  font-size: 1.31em;
 }
 .term-md__content h3 {
-  font-size: 15px;
+  font-size: 1.15em;
 }
 
 .term-md__content p,
@@ -3188,8 +3269,9 @@ body,
 }
 
 .term-md__content code {
-  font-family: Menlo, Monaco, monospace;
-  font-size: 12px;
+  /* The terminal's font, at 0.92 of the Markdown size (12px at the default 13). */
+  font-family: var(--md-code-font-family);
+  font-size: 0.92em;
   background: rgba(var(--tint-rgb), 0.08);
   padding: 1px 5px;
   border-radius: 5px;
@@ -3219,14 +3301,47 @@ body,
   max-width: 100%;
 }
 
-.term-md__content table {
+/* Tables in rendered Markdown — the ⌘M output view, the editor preview and the ⌘M chat view (its
+   messages and plan/question cards all render through `.term-chat__text`). Gridlines strong enough
+   to read (`--border` is a 10% separator, which made cells blur together), a tinted header row,
+   and a horizontal scroll inside the table for one wider than the view, so the thread never
+   scrolls sideways. A column's `:---:` alignment arrives as an `align` attribute, which an author
+   `text-align` would override — so only a header WITHOUT one is set (to the start edge, matching
+   its cells, instead of the browser's centred default). Sticky notes (on the canvas and in the
+   kanban card modal — both render through `.sticky-node__md`) share the group (issue #1179). */
+.term-md__content table,
+.term-chat__text table,
+.sticky-node__md table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
   border-collapse: collapse;
+  margin: 0 0 10px;
 }
 
 .term-md__content th,
-.term-md__content td {
-  border: 1px solid var(--border);
-  padding: 4px 8px;
+.term-md__content td,
+.term-chat__text th,
+.term-chat__text td,
+.sticky-node__md th,
+.sticky-node__md td {
+  border: 1px solid rgba(var(--tint-rgb), 0.22);
+  padding: 4px 10px;
+  vertical-align: top;
+}
+
+.term-md__content th,
+.term-chat__text th,
+.sticky-node__md th {
+  background: rgba(var(--tint-rgb), 0.06);
+  font-weight: 600;
+}
+
+.term-md__content th:not([align]),
+.term-chat__text th:not([align]),
+.sticky-node__md th:not([align]) {
+  text-align: start;
 }
 
 /* Chat panel — replaces the markdown overlay on chat-capable agent nodes (Cmd+M). */
@@ -3260,6 +3375,26 @@ body,
   line-height: 1.4;
   color: var(--muted);
   border-bottom: 1px solid rgba(var(--tint-rgb), 0.06);
+}
+/* Holds the scroller and the floating "scroll to latest" button, which must not scroll with it. */
+.term-chat__thread {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+/* The Live chat drawer's "N new messages ↓" pill (.live-chat__more): same position and shape. */
+.term-chat__thread .confirm__btn.term-chat__to-latest {
+  position: absolute;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1;
+  padding: 3px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  white-space: nowrap;
 }
 .term-chat__msgs {
   flex: 1 1 auto;
@@ -3326,7 +3461,8 @@ body,
    ASSISTANT's is plain full-width text on the panel with no bubble, roomy line height and paragraph
    spacing, and a quiet action row under each turn (ChatTurnActions). */
 .term-chat__msg {
-  font-size: 13px;
+  font-family: var(--md-font-family);
+  font-size: var(--md-font-size);
   line-height: 1.5;
   word-break: break-word;
   min-width: 0;
@@ -3369,6 +3505,12 @@ body,
    they are one answer, and the thread's gap is for the space BETWEEN turns. */
 .term-chat__msg--assistant + .term-chat__msg--assistant {
   margin-top: -8px;
+}
+/* Every part of this message is drawn in a tool block above it (ChatPanel): it is only its turn's
+   action row, with no body of its own to pad. */
+.term-chat__msg--folded {
+  padding: 0;
+  min-height: 0;
 }
 .term-chat__actions {
   display: flex;
@@ -3415,17 +3557,78 @@ body,
   padding: 0 4px;
   white-space: nowrap;
 }
+/* The clock time under a user message (its bubble's last line), quiet like the action row's. */
+.term-chat__time--user {
+  display: block;
+  margin-top: 4px;
+  padding: 0;
+  font-size: 11px;
+  color: var(--muted);
+  text-align: right;
+}
+/* A day divider (lib/chatThread.ts `dayDividers`): a quiet centered caption before the first
+   message of each local calendar day. */
+.term-chat__day {
+  flex: 0 0 auto;
+  text-align: center;
+  font-size: 11px;
+  color: rgba(var(--tint-rgb), 0.35);
+}
 .term-chat__text > :first-child {
   margin-top: 0;
 }
 .term-chat__text > :last-child {
   margin-bottom: 0;
 }
+.term-chat__text code {
+  font-family: var(--md-code-font-family);
+  font-size: 0.92em;
+}
 .term-chat__text pre {
   background: rgba(0, 0, 0, 0.35);
   padding: 8px;
   border-radius: 6px;
   overflow-x: auto;
+}
+/* A code block with its Copy button (nodes/CodeBlockCopy.tsx): the wrapper is the positioned box,
+   because the <pre> scrolls sideways and would carry the button with it. The wrapper takes the
+   <pre>'s block margin so the thread's first/last-child margin rules still apply. */
+.term-chat__code {
+  position: relative;
+  margin: 1em 0;
+}
+.term-chat__code > pre {
+  margin: 0;
+}
+/* A syntax-colored block (nodes/CodeHighlight.tsx): its text is split across Monaco's token spans,
+   which must not collapse the code's spaces or line breaks. */
+.term-chat__text pre code[data-highlighted] {
+  white-space: pre;
+}
+/* Same control as the per-turn Copy (.term-chat__action), in the block's top-right corner. Hidden
+   until the block is hovered or the button is keyboard-focused, and kept while it says "Copied".
+   A solid backing so the code underneath does not show through it. */
+.term-chat__code-copy {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.term-chat__code:hover .term-chat__code-copy,
+.term-chat__code-copy:focus-visible,
+.term-chat__code-copy[data-copied] {
+  opacity: 1;
+}
+.term-chat__code-copy:hover {
+  background: var(--bg);
+  border-color: rgba(var(--tint-rgb), 0.3);
 }
 .term-chat__text a {
   color: var(--accent);
@@ -3484,6 +3687,116 @@ body,
   font-family: ui-monospace, monospace;
   font-size: 11px;
   opacity: 0.85;
+}
+/* An interrupted turn (an `interrupt` part): Claude's own TUI line, quiet and hanging off what came
+   before it, never a user bubble. */
+.term-chat__interrupt {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: -2px;
+  padding-left: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.term-chat__interrupt-hook {
+  font-family: ui-monospace, monospace;
+}
+/* An Edit / Write call (nodes/ChatToolDiff.tsx): the chip's summary ends in the `+N −M` counts, and
+   it opens to the line diff. The block is a one-column grid sized to its widest line (at least the
+   chip's width), so a line's tint spans the whole row even while the block is scrolled sideways;
+   code keeps its indentation (`pre`, never wrapped), and a long Write scrolls inside its own box. */
+.term-chat__diff-counts {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  font-family: ui-monospace, monospace;
+  color: var(--muted);
+}
+.term-chat__diff {
+  display: grid;
+  grid-template-columns: minmax(max-content, 1fr);
+  margin: 6px 0 0;
+  padding: 4px 0;
+  max-height: 360px;
+  overflow: auto;
+  white-space: pre;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  background: var(--surface-sunken);
+  border-radius: 6px;
+}
+.term-chat__diff-line {
+  padding: 0 8px;
+}
+.term-chat__diff-line--ctx {
+  color: var(--muted);
+}
+.term-chat__diff-line--add {
+  color: var(--success);
+  background: color-mix(in srgb, var(--state-success) 12%, transparent);
+}
+.term-chat__diff-line--del {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--state-error) 12%, transparent);
+}
+/* A run of consecutive tool calls folded into one block (nodes/ChatToolGroup.tsx), closed by
+   default. Closed, it is one chip-sized line: a chevron, the count, the tools used. Open, the same
+   chips follow, indented under a hairline so they read as belonging to the line above. */
+.term-chat__tool-group {
+  margin: 4px 0;
+  font-size: 12px;
+}
+.term-chat__tool-group > summary {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 4px 8px;
+  cursor: pointer;
+  list-style: none;
+  background: rgba(var(--tint-rgb), 0.04);
+  border: 1px solid rgba(var(--tint-rgb), 0.08);
+  border-radius: 8px;
+}
+.term-chat__tool-group > summary::-webkit-details-marker {
+  display: none;
+}
+/* The chevron is drawn, not a glyph: '▸' at this size renders as a dot. */
+.term-chat__tool-group > summary::before {
+  content: '';
+  flex: 0 0 auto;
+  align-self: center;
+  width: 5px;
+  height: 5px;
+  margin: 0 2px 0 1px;
+  border-right: 1.5px solid var(--muted);
+  border-bottom: 1.5px solid var(--muted);
+  transform: rotate(-45deg);
+  transition: transform 0.12s ease;
+}
+.term-chat__tool-group[open] > summary::before {
+  transform: rotate(45deg);
+}
+/* Same sizing rule as the chip's name/argument pair: the count never wraps, the names take the rest
+   and ellipsize. */
+.term-chat__tool-group-count {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--accent);
+}
+.term-chat__tool-group-names {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+.term-chat__tool-group-body {
+  margin: 4px 0 0 10px;
+  padding-left: 8px;
+  border-left: 1px solid rgba(var(--tint-rgb), 0.12);
 }
 /* The agent's OWN dialog is on the pane's screen (ChatPanel's `screenBlock`): the sentence saying
    where to answer it, then the dialog's lines as the terminal shows them. Shaped like a tool card
@@ -3797,8 +4110,8 @@ body,
   width: 100%;
   resize: none;
   padding: 4px 6px;
-  font-family: inherit;
-  font-size: 13px;
+  font-family: var(--md-font-family);
+  font-size: var(--md-font-size);
   color: var(--text-strong);
   background: transparent;
   border: none;
@@ -3806,6 +4119,38 @@ body,
 }
 .term-chat__composer-input:focus {
   outline: none;
+}
+/* The command highlight (lib/chatComposerHighlight.ts): while the draft holds a known `/command`, the
+   textarea's text goes transparent (its caret, selection and input stay) and a layer behind it draws
+   the same text, with the command in the accent color, as Claude Code's TUI colors it. The layer must
+   lay text out exactly like the textarea: same box, font, padding and wrapping, and nothing that
+   changes a glyph's width (no bold, no padding on the command). */
+.term-chat__composer-field {
+  position: relative;
+}
+.term-chat__composer-highlight {
+  position: absolute;
+  inset: 0;
+  box-sizing: border-box;
+  padding: 4px 6px;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  font-family: var(--md-font-family);
+  font-size: var(--md-font-size);
+  line-height: normal;
+  color: var(--text-strong);
+  pointer-events: none;
+}
+.term-chat__composer-command {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-radius: 3px;
+}
+.term-chat__composer-input--over {
+  position: relative;
+  color: transparent;
+  caret-color: var(--text-strong);
 }
 .term-chat__composer-input:disabled {
   opacity: 0.5;
@@ -3906,20 +4251,151 @@ body,
 .term-chat__refresh:hover {
   background: rgba(var(--tint-rgb), 0.1);
 }
-/* Reasoning, collapsed by default and dimmed so it never reads as the answer. */
+/* The latest todo list (a TodoWrite card): its disabled checkboxes are the markers, so no bullets. */
+.term-chat__todo ul {
+  list-style: none;
+  padding-left: 0;
+  margin: 0;
+}
+.term-chat__todo li {
+  margin: 2px 0;
+}
+.term-chat__todo input[type='checkbox'] {
+  margin: 0 6px 0 0;
+  vertical-align: -1px;
+  accent-color: var(--accent);
+}
+/* Claude's thinking summary between tool calls (a <details>, closed by default): a dimmed line —
+   chevron + "Thought for 12s" — so it never reads as the answer; open, the text stays dimmed too. */
 .term-chat__thinking {
   margin: 4px 0;
+  color: var(--muted);
+}
+.term-chat__thinking > summary {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
   font-size: 12px;
-  color: rgba(var(--tint-rgb), 0.6);
-}
-.term-chat__thinking summary {
+  color: var(--muted);
   cursor: pointer;
-  font-style: italic;
+  list-style: none;
 }
-.term-chat__thinking .term-chat__text {
+.term-chat__thinking > summary::-webkit-details-marker {
+  display: none;
+}
+/* Drawn like the tool block's chevron: '▸' at this size renders as a dot. */
+.term-chat__thinking > summary::before {
+  content: '';
+  flex: 0 0 auto;
+  align-self: center;
+  width: 5px;
+  height: 5px;
+  margin: 0 2px 0 1px;
+  border-right: 1.5px solid var(--muted);
+  border-bottom: 1.5px solid var(--muted);
+  transform: rotate(-45deg);
+  transition: transform 0.12s ease;
+}
+.term-chat__thinking[open] > summary::before {
+  transform: rotate(45deg);
+}
+.term-chat__thinking > .term-chat__text {
   margin-top: 4px;
-  padding-left: 8px;
-  border-left: 2px solid rgba(var(--tint-rgb), 0.15);
+}
+/* A teammate's message to the lead (nodes/ChatTeammate.tsx), drawn as Claude Code's TUI draws it: a
+   quiet line on the assistant side, never a bubble. An idle notification is "✓ Teammate @x finished"
+   with a one-line preview of its report; a plain message is "› Message from @x". Both open to the
+   full text. The sender's TUI color is a dot, not the name's color (yellow text is unreadable on the
+   light theme). */
+.term-chat__teammate {
+  margin: 4px 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.term-chat__teammate > summary,
+.term-chat__teammate--line {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  min-width: 0;
+}
+.term-chat__teammate > summary {
+  cursor: pointer;
+  list-style: none;
+}
+.term-chat__teammate > summary::-webkit-details-marker {
+  display: none;
+}
+.term-chat__teammate-pointer {
+  flex: 0 0 auto;
+}
+/* The status text keeps its width and ends in an ellipsis only when the row itself is too narrow;
+   the preview (basis 0) takes what is left. */
+.term-chat__teammate-head {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.term-chat__teammate-from {
+  font-weight: 600;
+  color: var(--text);
+}
+.term-chat__teammate-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 4px;
+  border-radius: 50%;
+  vertical-align: 1px;
+}
+.term-chat__teammate-icon {
+  flex: 0 0 auto;
+}
+.term-chat__teammate-icon--available {
+  color: var(--state-success);
+}
+.term-chat__teammate-icon--interrupted {
+  color: var(--state-warning);
+}
+.term-chat__teammate-icon--failed {
+  color: var(--state-error);
+}
+/* The one-line preview (a plain message's summary, or the first line of an idle report): shrinks
+   first and ends in an ellipsis. The report's preview goes once the row is open, since the full
+   report is right under it; a summary is a title and stays. */
+.term-chat__teammate-preview {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.8;
+}
+.term-chat__teammate[open] > summary .term-chat__teammate-preview--result {
+  display: none;
+}
+.term-chat__teammate-body {
+  margin: 4px 0 0 14px;
+  color: var(--text);
+}
+.term-chat__teammate-summary {
+  color: var(--muted);
+}
+/* An image the user attached to a prompt (ChatImage): a height-capped thumbnail in the bubble; a click
+   drops the cap to show it at full size, still never wider than the bubble. */
+.term-chat__image {
+  display: block;
+  max-width: 100%;
+  max-height: 240px;
+  margin: 4px 0;
+  border-radius: 8px;
+  cursor: zoom-in;
+}
+.term-chat__image--full {
+  max-height: none;
+  cursor: zoom-out;
 }
 
 /* Transparent overlay that lets you pan across a terminal until you dwell/click. */
@@ -3957,6 +4433,48 @@ body,
   border-bottom: 1px solid var(--border);
   font-size: 11.5px;
   color: var(--text);
+}
+/* A simulator inside a run node (SimulatorView under the control rows). It fills what the node has
+   left, so resizing the node scales the screen (letterboxed, like a Simulator node): the bar stops
+   being a fixed strip and takes the space, and the panel takes the bar's. With the terminal shown
+   the two share the node. Positioned so the view's toasts, prompts and dialogs sit over the panel. */
+.run-bar--sim {
+  flex: 1 1 0;
+  min-height: 0;
+}
+.run-sim-host {
+  flex: 1 1 0;
+  min-height: 80px;
+  display: flex;
+  margin: 2px -8px -5px;
+  border-top: 1px solid var(--border);
+}
+.run-web {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.run-web__waiting {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--muted);
+  pointer-events: none;
+}
+.run-sim {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 /* Terminal hidden (the default): the node is just the control rows. Same `display: none` path a
    collapsed node takes, so xterm and the tmux client stay alive underneath. */
@@ -4090,6 +4608,16 @@ body,
 .run-bar__select--config {
   max-width: 240px;
 }
+.run-bar__check {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  cursor: pointer;
+}
 .run-bar__args {
   flex: 1;
   min-width: 0;
@@ -4213,6 +4741,26 @@ body,
 }
 .react-flow.has-wallpaper .react-flow__background {
   opacity: 0.3;
+}
+/* An aerial wallpaper's layer (AerialWallpaper.tsx). The canvas layer is a fixed SIBLING before
+   `.canvas-root` with z-index auto: it creates no stacking context, and the root (positioned, later
+   in tree order) paints all of its content over it, exactly as over its own background. The board
+   layer sits inside `.kanban-overlay` (a stacking context already: fixed, z 25) at z-index -1, above
+   the overlay's still and below its content, fixed to the viewport like the board's still. */
+.aerial-wallpaper {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}
+.aerial-wallpaper--board {
+  z-index: -1;
+}
+.aerial-wallpaper > video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
 .flow-wrap {
@@ -5229,6 +5777,56 @@ body,
 
 .update-card__btn:hover {
   background: var(--accent-hover);
+}
+
+/* Preparing / restarting: the click was taken, the button says so and cannot be pressed twice. */
+.update-card__btn:disabled {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  opacity: 0.7;
+  cursor: default;
+}
+
+.update-card__btn:disabled:hover {
+  background: var(--accent);
+}
+
+.update-card__spinner {
+  width: 11px;
+  height: 11px;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: nt-spin 0.8s linear infinite;
+  animation-play-state: var(--nt-anim-state);
+}
+
+.update-card__actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.update-card__actions .update-card__link {
+  align-self: center;
+}
+
+.update-card__notes {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12.5px;
+  color: rgba(var(--tint-rgb), 0.7);
+}
+
+.update-card__notes li + li {
+  margin-top: 2px;
+}
+
+.update-card__hint {
+  margin: 0;
+  font-size: 12.5px;
+  color: rgba(var(--tint-rgb), 0.6);
 }
 
 .update-card--pill {
@@ -6785,6 +7383,96 @@ body,
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+}
+
+/* Free-tier limit dialog (components/ProjectLimitDialog.tsx): the open projects, each with Close,
+   inside the `.confirm` shell — which owns the surface, the z-order (over the kanban board) and the
+   buttons. Only the title, the rows and the one-line notice need anything of their own. */
+.project-limit__title {
+  margin: 0 0 12px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.project-limit__list {
+  list-style: none;
+  margin: 0 0 16px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.project-limit__row,
+.project-limit__notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.project-limit__notice {
+  margin: 0 0 16px;
+}
+
+/* A long project name truncates instead of pushing its Close button out of the box. */
+.project-limit__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* One-time popup from the check feed (components/AnnouncementPopup.tsx), in the `.confirm` shell.
+   The level shows as the top edge, the banner's left edge turned on its side. */
+.confirm.announce-popup {
+  border-top: 3px solid var(--accent);
+}
+
+/* It takes focus itself (so keys stop reaching the terminal under the scrim); no ring for that. */
+.confirm.announce-popup:focus {
+  outline: none;
+}
+
+.confirm.announce-popup--success {
+  border-top-color: var(--success);
+}
+
+.confirm.announce-popup--warning {
+  border-top-color: var(--warn);
+}
+
+/* Edge to edge at the top of the box, and never cropped: it can be a design with words in it. The
+   admin console's preview draws it with the same numbers. */
+.announce-popup__image {
+  display: block;
+  flex: none;
+  width: calc(100% + 36px); /* the box's 18px padding, both sides */
+  max-height: min(320px, 40vh);
+  object-fit: contain;
+  margin: -18px -18px 14px;
+  border-radius: 11px 11px 0 0; /* the box's 14px, less its 3px top border */
+}
+
+.announce-popup__title {
+  margin: 0 0 10px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.confirm.project-limit__checking {
+  width: auto;
+}
+
+.project-limit__checking .confirm__msg {
+  margin: 0;
 }
 
 .confirm__msg {
@@ -8987,6 +9675,27 @@ button.group-node__setup:disabled {
 }
 /* The attribution line: quieter than a row, above the foot rule, and rendered in EVERY state — a
    failed sweep is exactly when a user is most likely to be blaming the wrong process. */
+/* The session host's own cost: a quiet, non-interactive line under the rows (Windows only). */
+.sessmem-host {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  padding: 6px 2px 0;
+  border-top: 1px solid rgba(var(--tint-rgb), 0.08);
+  font-size: 12px;
+  color: rgba(var(--tint-rgb), 0.6);
+}
+.sessmem-host__label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sessmem-host__mb {
+  font-variant-numeric: tabular-nums;
+}
 .sessmem-panel__attrib {
   margin-top: 10px;
   font-size: 11px;
@@ -9255,6 +9964,14 @@ button.group-node__setup:disabled {
   padding: 0 2px;
 }
 .scm-error__dismiss:hover {
+  color: var(--text-strong);
+}
+/* Neutral variant: "waiting for GitHub sign-in" while Publish retries in-process. */
+.scm-error--info {
+  border-color: rgba(var(--tint-rgb), 0.18);
+  background: rgba(var(--tint-rgb), 0.06);
+}
+.scm-error--info .scm-error__msg {
   color: var(--text-strong);
 }
 
@@ -11021,6 +11738,13 @@ button.group-node__setup:disabled {
    controls cluster (top-right), so column headers never sit under those icons. */
 .kanban-header {
   flex: 0 0 auto;
+  /* Above the board (issue #1350): the Filter / Views menus are absolutely positioned INSIDE this
+     strip, and under Liquid Glass the strip AND every `.kanban-col` carry a backdrop-filter, which
+     makes each of them its own stacking context. A menu's z-index then only ranks it inside the
+     strip, and the columns — later siblings at the same `auto` level — painted over it. Ranking
+     the strip itself above the board is the only order a child cannot escape from. */
+  position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -12675,6 +13399,77 @@ button.pull-checks__name {
    the scrolling region so Share / Close stay on screen however long the lists are. */
 .confirm.share-team {
   width: 480px;
+}
+
+/* ---- nodeterm://open confirm sheet (components/OpenLinkSheet.tsx; reuses the .confirm shell) ---- */
+.confirm.open-link {
+  width: 520px;
+}
+.open-link__title {
+  flex: 0 0 auto;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.open-link__source {
+  flex: 0 0 auto;
+  margin: 2px 0 12px;
+  font-size: 12px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.open-link__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  margin-bottom: 14px;
+}
+.open-link__label {
+  display: block;
+  margin: 0 0 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.open-link__field {
+  margin-bottom: 10px;
+}
+.open-link__value {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.open-link__muted {
+  color: var(--muted);
+}
+.open-link__prompt {
+  margin: 0 0 10px;
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(var(--tint-rgb), 0.06);
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.open-link__note,
+.open-link__warn {
+  margin: -4px 0 10px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--state-warning) 12%, transparent);
+}
+.open-link__error {
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--danger);
 }
 .share-team__title {
   flex: 0 0 auto;
@@ -15229,6 +16024,106 @@ button.pull-checks__name {
   flex: 0 0 46px;
 }
 
+/* -- chat-view scene (⌘M on an agent node; the JS interval / the real keystroke flips .is-chat) --
+   The node is the agents scene's .onb-node held static; the two faces crossfade inside a fixed
+   body so the node never changes size, and the chat bubbles mirror .term-chat__msg--user /
+   --assistant (accent bubble right, tinted bubble left) so the tour draws what ⌘M shows. */
+.onb-scene--chat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
+}
+.onb-cview__keys .onb-kbd {
+  animation: none;
+  transition: transform 0.12s ease, border-bottom-width 0.12s ease;
+}
+/* the chord "goes down" on every flip — the keys are what did it */
+.onb-cview__keys.is-chat .onb-kbd {
+  transform: translateY(2px);
+  border-bottom-width: 1px;
+}
+.onb-cview__mode {
+  margin-left: auto;
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.onb-cview__body {
+  position: relative;
+  height: 112px;
+}
+.onb-cview__face {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 9px 10px 10px;
+  transition: opacity 0.45s ease, transform 0.45s ease;
+}
+.onb-cview__term {
+  opacity: 1;
+  transform: translateY(0);
+}
+.onb-cview__chat {
+  opacity: 0;
+  transform: translateY(6px);
+}
+.onb-cview.is-chat .onb-cview__term {
+  opacity: 0;
+  transform: translateY(-6px);
+}
+.onb-cview.is-chat .onb-cview__chat {
+  opacity: 1;
+  transform: translateY(0);
+}
+.onb-cview__prompt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: Menlo, Monaco, monospace;
+  font-size: 10px;
+  color: rgba(235, 235, 245, 0.85);
+  margin-bottom: 2px;
+}
+.onb-cview__msg {
+  max-width: 82%;
+  padding: 6px 8px;
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 1.4;
+}
+.onb-cview__msg--user {
+  align-self: flex-end;
+  background: var(--accent, #0a84ff);
+  color: #fff;
+}
+.onb-cview__msg--assistant {
+  align-self: flex-start;
+  width: 72%;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  background: rgba(var(--tint-rgb), 0.06);
+}
+.onb-cview__compose {
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 7px;
+  background: rgba(var(--tint-rgb), 0.06);
+  border: 1px solid rgba(var(--tint-rgb), 0.12);
+  border-radius: 6px;
+}
+.onb-cview__compose .onb-caret {
+  height: 11px;
+}
+
 /* -- notify scene -- */
 /* --- Step: the notch capsule (SceneNotch) ------------------------------------------------
    A laptop lid seen from the front: the black top bar carries the notch, the capsule grows out
@@ -15595,6 +16490,10 @@ button.pull-checks__name {
     max-width: 100%;
   }
   .onb-mini {
+    transition: none;
+  }
+  .onb-cview__face,
+  .onb-cview__keys .onb-kbd {
     transition: none;
   }
   .onb-phone,
@@ -17151,19 +18050,31 @@ body.focus-mode .dock:hover {
      2, N9: 1.6–2.0 turned dark glass over a yellow wallpaper olive and light Clear glass pink;
      HIG liquid-glass › Tauri and Electron suggests about 1.2–1.5). */
   --glass-sat: calc(150% + 30% * max(0, 1 - var(--glass-t) / 0.7));
-  --glass-refract: url(#nt-refract);
-  --glass-blur: blur(calc(16px + 12px * var(--glass-t))) saturate(var(--glass-sat))
-    var(--glass-refract);
+  /* `--glass-refract` is NOT declared here: App.tsx sets it to `url(#nt-refract)` inline only left
+     of the Readable tick (lib/glassContrast.ts `glassRefractionOn`), and every chain reads it with
+     an empty fallback. From the tick to Tinted the bend was 3px or less under a ~20px blur, while
+     the filter cost as much GPU as all terminal blurs together (M2, one streaming terminal among
+     six glass ones: 74% → 42%): its feImage source damages a refracting surface's whole rect, so
+     one changing pixel re-ran the blur of every glass surface around it. */
+  /* `--glass-frost` (light only, below) is the backdrop squeeze of lib/glassContrast.ts: last in
+     the text and control chains, a colour matrix that moves no pixels. Unset in dark. */
+  /* Canvas cards and terminal nodes frost far less toward Clear: 4px at Clear (picked by eye, the
+     wallpaper reads through), the same 24.4px as before at the Readable tick, 28px at Tinted. No
+     `--glass-frost` here: the cards' own squeeze (`--glass-node-squeeze`) already carries the frost
+     floor for their slider position, and stacking both washed them out twice. */
+  --glass-blur: blur(calc(16px + 12px * var(--glass-t) - 12px * max(0, 1 - var(--glass-t) / 0.7)))
+    saturate(var(--glass-sat)) var(--glass-refract,);
   /* Small controls left of the tick: the backdrop under them is DIMMED (dark theme) or brightened
      (light theme) as the fill thins, toward Apple's "dark dimming layer" for bright content
      (materials.md). 1 at the tick and right of it; `--glass-control-dim` at Clear. The fill alone
      (0.35) left the tab label at 1.98:1 over the Sunrise gradient. It moves backdrop pixels only. */
   --glass-control-dim: 0.7;
   --glass-control-blur: blur(calc(16px + 12px * var(--glass-t))) saturate(var(--glass-sat))
-    brightness(calc(1 - (1 - var(--glass-control-dim)) * max(0, 1 - var(--glass-t) / 0.7))) var(--glass-refract);
+    brightness(calc(1 - (1 - var(--glass-control-dim)) * max(0, 1 - var(--glass-t) / 0.7))) var(--glass-refract,)
+    var(--glass-frost,);
   /* Text surfaces never frost less than at the Readable tick (0.7), whatever the slider says. */
   --glass-text-blur: blur(calc(16px + 12px * max(var(--glass-t), 0.7)))
-    saturate(150%) var(--glass-refract);
+    saturate(150%) var(--glass-refract,) var(--glass-frost,);
   /* Terminal nodes frost 15% less than the chrome (the user asked for less blur under the terminal
      windows): same curve, radius × 0.85, same saturation and refraction. They also FLATTEN the
      backdrop's luminance (HIG: regular glass "blurs and adjusts the luminosity"): a blurred photo
@@ -17172,8 +18083,8 @@ body.focus-mode .dock:hover {
      keeps the photo (1), Readable 0.3, Tinted 0 (flat — the tint is 0.95 there anyway). Measured
      at Readable, empty glass over the lake photo's snow/water edge: brightness swing 2.2:1 → 1.28:1
      (0.51 still left 1.53:1). */
-  --glass-term-blur: blur(calc((16px + 12px * var(--glass-t)) * 0.85))
-    saturate(var(--glass-sat)) contrast(calc(1 - var(--glass-t))) var(--glass-refract);
+  --glass-term-blur: blur(calc((16px + 12px * var(--glass-t) - 12px * max(0, 1 - var(--glass-t) / 0.7)) * 0.85))
+    saturate(var(--glass-sat)) contrast(calc(1 - var(--glass-t))) var(--glass-refract,);
 }
 
 /* Outermost chrome: fill + blur, in two groups (Phase 4 slider scope, lib/glassContrast.ts
@@ -17208,7 +18119,8 @@ body.focus-mode .dock:hover {
     .pubdlg,
     .consent-card,
     .github-issue-modal,
-    .mlaunch
+    .mlaunch,
+    .empty-canvas-hint
   ) {
   background: var(--glass-chrome-bg) !important;
   -webkit-backdrop-filter: var(--glass-text-blur);
@@ -17232,7 +18144,23 @@ body.focus-mode .dock:hover {
   -webkit-backdrop-filter: var(--glass-control-blur);
   backdrop-filter: var(--glass-control-blur);
 }
+/* The empty-canvas hint sits straight on the wallpaper, where its faint ink vanished (dark text on a
+   dark wallpaper in light glass). Under glass it is a small text-surface pill instead. */
+:root[data-nt-glass='on'] .empty-canvas-hint {
+  inset: 50% auto auto 50%;
+  transform: translate(-50%, -50%);
+  padding: 14px 20px;
+  border: 1px solid var(--glass-edge);
+  border-radius: 14px;
+  color: var(--text);
+}
+:root[data-nt-glass='on'] .empty-canvas-hint .kbd {
+  opacity: 1;
+}
 :root[data-nt-glass='on'][data-theme='light'] {
+  /* Lifts a black backdrop to grey 0.5 (GLASS_LIGHT_FROST): light glass over a dark wallpaper reads
+     as frost, not mud. Only lifts, so dark ink on it only gains contrast. */
+  --glass-frost: contrast(0.330) brightness(1.504);
   --glass-control-dim: 1.3;
   --muted: rgba(var(--tint-rgb), 0.8);
   --glass-placeholder: rgba(var(--tint-rgb), 0.85);
@@ -17517,7 +18445,7 @@ body.focus-mode .dock:hover {
 }
 /* RAM panel secondary text (N5-L2): hard-coded 0.45–0.6 ink measured 3.95–4.22:1 on glass; it takes
    the glass secondary label. */
-:root[data-nt-glass='on'] :is(.sessmem-panel__scope, .sessmem-panel__note, .sessmem-row__project, .sessmem-row__orphan, .sessmem-row__cmd, .sessmem-row__kids, .sessmem-panel__attrib, .sessmem-panel__foot) {
+:root[data-nt-glass='on'] :is(.sessmem-panel__scope, .sessmem-panel__note, .sessmem-row__project, .sessmem-row__orphan, .sessmem-row__cmd, .sessmem-row__kids, .sessmem-panel__attrib, .sessmem-panel__foot, .sessmem-host) {
   color: var(--muted);
 }
 /* The Members picker's hover was a solid accent row with white text (3.65:1) while every other list
@@ -17761,7 +18689,7 @@ body.focus-mode .dock:hover {
 /* An empty field must look empty (visual QA round 3, NM1): the placeholder's 4.5:1 floor sits at
    --text's own alpha in light (0.85), so TYPED text in chrome fields takes --text-strong instead.
    Terminal nodes and the card-modal terminal keep their theme ink; notes keep their own. */
-:root[data-nt-glass='on'] :is(input:not([type]), input[type='text'], input[type='search'], textarea):not(.term-node *, .sticky-node *, .kanban-modal__termwrap *, .monaco-editor *) {
+:root[data-nt-glass='on'] :is(input:not([type]), input[type='text'], input[type='search'], textarea):not(.term-node *, .sticky-node *, .kanban-modal__termwrap *, .monaco-editor *, .excalidraw *) {
   color: var(--text-strong);
 }
 :root[data-nt-glass='on'] .settings-nav-row {
@@ -17783,13 +18711,14 @@ body.focus-mode .dock:hover {
 }
 
 /* Every node kind. Terminal nodes keep their own theme-derived tint (.term-node--glass, above);
-   the others take the chrome fill here. Bodies
+   the others take `--glass-node-bg`, the chrome colour at the SLIDER's alpha (App.tsx), with
+   `--glass-node-squeeze` holding their text at 4.5:1 left of the Readable tick. Bodies
    that are another renderer's surface — Monaco, a <webview>, a <video> — stay opaque: they paint
    their own background. Sticky notes keep their colour: the colour IS the note. */
 :root[data-nt-glass='on'] :is(.files-node, .loop-node, .subagent-node, .trigger-node, .dino-node) {
-  background: var(--glass-chrome-bg);
-  -webkit-backdrop-filter: var(--glass-blur);
-  backdrop-filter: var(--glass-blur);
+  background: var(--glass-node-bg);
+  -webkit-backdrop-filter: var(--glass-blur) var(--glass-node-squeeze,);
+  backdrop-filter: var(--glass-blur) var(--glass-node-squeeze,);
 }
 :root[data-nt-glass='on']
   .canvas-moving
@@ -17797,16 +18726,100 @@ body.focus-mode .dock:hover {
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
 }
+/* ...but every node keeps its squeeze: left of the Readable tick it, not the tint, holds the text
+   at 4.5:1. A colour matrix with no blur, so the pan still sheds the expensive part. */
+:root[data-nt-glass='on'] .canvas-moving .term-node {
+  -webkit-backdrop-filter: var(--term-glass-backdrop, none);
+  backdrop-filter: var(--term-glass-backdrop, none);
+}
+:root[data-nt-glass='on'] .canvas-moving :is(.files-node, .loop-node, .subagent-node, .trigger-node, .dino-node) {
+  -webkit-backdrop-filter: var(--glass-node-squeeze, none);
+  backdrop-filter: var(--glass-node-squeeze, none);
+}
+/* Subagent cards: no clay stripe (Liquid Glass drops window accents, the dot keeps the state), and
+   the transcript is ink on the card's glass instead of a black slab with hard-coded grey text. */
+:root[data-nt-glass='on'] .subagent-node {
+  border-color: var(--glass-edge);
+  border-left-width: 1px;
+}
+:root[data-nt-glass='on'] .subagent-node.working .subagent-node__dot {
+  background: var(--state-working);
+}
+:root[data-nt-glass='on'] .subagent-node__term {
+  background: transparent;
+  border-color: var(--glass-edge);
+  color: var(--text);
+}
 
 /* No per-node accent colour on a window (the sessions list and the kanban board keep them). The
    top border and the colour dot are INLINE styles from `data.color`, hence !important. The dot
    stays as a neutral ring: it is also the button that opens the colour picker. */
 :root[data-nt-glass='on'] .term-node {
-  -webkit-backdrop-filter: var(--glass-term-blur);
-  backdrop-filter: var(--glass-term-blur);
+  /* `--term-glass-backdrop` is this node's squeeze (useTerminalGlass): what keeps its text at 4.5:1
+     left of the Readable tick. Unset when the tint alone suffices. Under Reduce Transparency the
+     chain is `none brightness(...)`, which is invalid and so computes to none, as before. */
+  -webkit-backdrop-filter: var(--glass-term-blur) var(--term-glass-backdrop,);
+  backdrop-filter: var(--glass-term-blur) var(--term-glass-backdrop,);
   border-color: var(--glass-edge);
   border-top-width: 1px;
   border-top-color: var(--glass-edge) !important;
+}
+/* Static frost (performance — lib/glassFrost.ts, canvas/GlassFrostSync.tsx). While
+   `data-nt-frost` is on, a terminal node does NOT frost with a live backdrop-filter: Chromium re-ran
+   that filter every time the node was redrawn, i.e. for every line a streaming agent printed, and
+   the damage spread to the glass around it (MEASURED, M2, six glass terminals streaming: 75% →
+   43% GPU). Instead `.term-node__frost` paints a COPY of the wallpaper behind the node, aligned to
+   the real one by custom properties, with the same chain as an ordinary `filter`, and the tint over
+   it. Nothing in it changes while the camera is still, so Chromium draws it once and reuses it.
+   It frosts the wallpaper only (not the dot grid, edges or other nodes behind the node). Focus mode
+   moves the node out of the canvas, so a focused node keeps the live backdrop. The frost layer is
+   opaque (the wallpaper copy over the canvas colour), so nothing behind it can read sharp through
+   the tint. */
+.term-node__frost {
+  display: none;
+}
+:root[data-nt-glass='on'][data-nt-frost='on'] .term-node.term-node--glass:not(.term-node--focused) {
+  background: transparent;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  /* NOT a stacking context of its own (no isolation): the frost's z-index -1 then lands in the
+     React Flow wrapper's stacking context, painted BEFORE this node's border, header and body —
+     the order the live backdrop and the tint had. Inside the node it painted over the 1px glass
+     edge. */
+}
+:root[data-nt-glass='on'][data-nt-frost='on'] .term-node--glass:not(.term-node--focused) > .term-node__frost {
+  display: block;
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  overflow: hidden;
+  border-radius: inherit;
+  pointer-events: none;
+}
+/* The wallpaper copy. It reaches FROST_PAD (80px) past the node so the blur at the rim samples the
+   wallpaper beside the node, not transparency; the layer's own overflow clips it back. The picture
+   itself is one rule GlassFrostSync renders (a data: URL can exceed what a custom property holds). */
+.term-node__frost::before {
+  content: '';
+  position: absolute;
+  inset: -80px;
+  background-color: var(--canvas-bg);
+  background-repeat: no-repeat;
+  background-size: calc(var(--frost-w) * 1px) calc(var(--frost-h) * 1px);
+  background-position: calc((var(--frost-x) - var(--node-x)) * 1px + 80px) calc((var(--frost-y) - var(--node-y)) * 1px + 80px);
+  filter: var(--glass-term-blur) var(--term-glass-backdrop,);
+}
+/* The node's tint, over the frost — what used to be the node's own background. */
+.term-node__frost::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--term-glass-bg);
+}
+/* Keep blur while moving OFF: the frost drops its blur through a camera move like the live
+   backdrop did, and keeps the squeeze that holds the text at 4.5:1 left of the Readable tick. */
+:root[data-nt-glass='on'] .canvas-moving .term-node__frost::before {
+  filter: var(--term-glass-backdrop, none);
 }
 :root[data-nt-glass='on'] .term-node__color {
   background: transparent !important;
@@ -17930,7 +18943,8 @@ body.focus-mode .dock:hover {
 }
 /* The card modal's terminal: the same glass as a terminal node (ModalTerminal sets the
    `--term-glass-*` tint inline). The modal itself is text-surface glass (listed above), so the
-   tint needs no blur of its own; the tint alone carries its foreground's 4.5:1. */
+   tint needs no blur of its own. It never goes clearer than the Readable tick
+   (`useTerminalGlass(theme, true)`), so the tint alone carries its foreground's 4.5:1. */
 /* The card modal's comments & activity panel hard-codes 35–55% ink for its title, times and events
    (3.1–3.6:1 on glass, visual QA M3): secondary label on glass, like the rest of the look. */
 :root[data-nt-glass='on'] :is(.board-log__title, .board-log__hint, .board-log__time, .board-log__event-body) {
@@ -18279,4 +19293,324 @@ body.focus-mode .dock:hover {
 .glass-slider__readable:focus-visible {
   border-radius: 3px;
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 60%, transparent);
+}
+
+/* ── Simulator node (nodes/SimulatorNode.tsx) ─────────────────────────────────────────────────
+   A live iOS simulator screen: header, a control row, then the screen, which keeps the phone's
+   proportions (object-fit: contain) inside whatever size the node is. */
+.sim-node {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, calc(0.35 * var(--shadow-k)));
+}
+.sim-node.selected {
+  border-color: var(--accent);
+}
+.sim-node__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  cursor: grab;
+  flex-shrink: 0;
+}
+.sim-node__title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.sim-node__bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 4px 8px 6px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11.5px;
+  flex-shrink: 0;
+}
+.sim-node__device {
+  flex: 1;
+  min-width: 0;
+  max-width: none;
+}
+.sim-node__screen {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  /* theme-exempt: the letterbox around a device screen is black in every theme, like a video. */
+  background: #000;
+  outline: none;
+  cursor: pointer;
+  touch-action: none;
+}
+.sim-node__screen:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+.sim-node__frame {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  user-select: none;
+  pointer-events: none;
+}
+.sim-node__placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  text-align: center;
+  font-size: 12px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.7);
+}
+.sim-node__note {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 8px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+}
+
+.sim-node__hint {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  top: 8px;
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 6px 8px;
+  border-radius: 7px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.72);
+}
+.sim-node__hint-close {
+  flex: none;
+  padding: 0 2px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+.sim-node__rec {
+  height: 22px;
+  padding: 0 7px;
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.sim-node__drop {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border: 2px dashed var(--accent);
+  pointer-events: none;
+}
+.sim-node__toast {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: 10px;
+  padding: 6px 10px;
+  border-radius: 7px;
+  font-size: 11.5px;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, calc(0.3 * var(--shadow-k)));
+  pointer-events: none;
+}
+.sim-node__toast--error {
+  color: var(--danger);
+}
+.sim-node__overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  background: color-mix(in srgb, var(--bg) 55%, transparent);
+}
+.sim-node__dialog {
+  width: 100%;
+  max-width: 340px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, calc(0.4 * var(--shadow-k)));
+  font-size: 12px;
+  color: var(--text);
+}
+.sim-node__dialog-title {
+  font-weight: 600;
+  font-size: 13px;
+}
+.sim-node__dialog-body {
+  color: var(--muted);
+  line-height: 1.45;
+}
+.sim-node__field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.sim-node__field span {
+  color: var(--muted);
+  font-size: 11px;
+}
+.sim-node__field input,
+.sim-node__field textarea {
+  font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 7px;
+  resize: vertical;
+}
+.sim-node__dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+/* ── Whiteboard node (nodes/WhiteboardNode.tsx) ─────────────────────────────────────────────
+   The node shows a still picture of the board; the live Excalidraw editor is a fixed overlay on
+   document.body laid over the node's box (see the component for why it is not inside the node). */
+.whiteboard-node {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.whiteboard-node.selected {
+  box-shadow: 0 0 0 2px var(--accent);
+}
+.whiteboard-node__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px;
+  background: var(--surface-overlay);
+}
+.whiteboard-node__body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  outline: none;
+  cursor: crosshair;
+}
+.whiteboard-node__thumb {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+}
+.whiteboard-node__hint {
+  color: var(--muted);
+  font-size: 13px;
+  pointer-events: none;
+}
+.whiteboard-node__save-failed {
+  flex: 0 0 auto;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--state-error) 15%, transparent);
+  color: var(--state-error);
+  font-size: 11px;
+  font-weight: 600;
+}
+/* "Keep mine" / "Discard my changes": the way forward from a save that did not land. */
+.whiteboard-node__save-action {
+  flex: 0 0 auto;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text);
+  font-size: 11px;
+  cursor: pointer;
+}
+.whiteboard-node__save-action:hover {
+  background: var(--panel-2);
+  color: var(--text-strong);
+}
+/* The canvas area, in .canvas-root coordinates: clips the live editor to the canvas and stacks it
+   under the sessions sidebar (z 12) and the Dock (z 20), which sit beside .flow-wrap. */
+.whiteboard-clip {
+  position: absolute;
+  z-index: 10;
+  overflow: hidden;
+  pointer-events: none;
+}
+.whiteboard-overlay {
+  position: absolute;
+  overflow: hidden;
+  border-radius: 0 0 9px 9px;
+  background: var(--bg);
+  pointer-events: auto;
+}
+.whiteboard-overlay__loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--muted);
+  font-size: 13px;
 }

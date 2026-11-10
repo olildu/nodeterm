@@ -27,6 +27,7 @@ export type SettingsSectionId =
   | 'ssh'
   | 'updates'
   | 'privacy'
+  | 'sign-in'
   | 'debug'
   | `project-${string}`
 
@@ -42,6 +43,8 @@ export interface SettingsSectionRef {
   title: string
   /** Only meaningful on macOS (the notch capsule) — hidden elsewhere by `visibleSettingsGroups`. */
   macOnly?: boolean
+  /** Only meaningful in a browser tab (the Server Edition's sign-in session) — hidden under Electron. */
+  browserOnly?: boolean
   /** Project-section rows only (`project-${string}` ids): the project's own color/icon, so the
    *  sidebar can render its `ProjectGlyph` beside the title instead of the generic folder glyph
    *  every project section used to share. Absent on every static section. */
@@ -111,6 +114,7 @@ export const SETTINGS_GROUPS: SettingsGroup[] = [
       { id: 'license', title: 'License' },
       { id: 'updates', title: 'Updates' },
       { id: 'privacy', title: 'Privacy' },
+      { id: 'sign-in', title: 'Sign-in', browserOnly: true },
       { id: 'debug', title: 'Debug' }
     ]
   }
@@ -124,14 +128,14 @@ export function allSectionIds(): SettingsSectionId[] {
 
 /**
  * The groups as the sidebar should render them for this platform: a mac-only section is dropped
- * entirely off macOS (an empty group would be dropped too, though none exists today). Pure — the
- * caller passes the platform so this stays testable.
+ * entirely off macOS, a browser-only one under Electron (an empty group would be dropped too,
+ * though none exists today). Pure — the caller passes the platform so this stays testable.
  */
-export function visibleSettingsGroups(isMac: boolean): SettingsGroup[] {
-  if (isMac) return SETTINGS_GROUPS
-  return SETTINGS_GROUPS.map((g) => ({ ...g, sections: g.sections.filter((s) => !s.macOnly) })).filter(
-    (g) => g.sections.length > 0
-  )
+export function visibleSettingsGroups(isMac: boolean, isBrowser = false): SettingsGroup[] {
+  return SETTINGS_GROUPS.map((g) => ({
+    ...g,
+    sections: g.sections.filter((s) => (isMac || !s.macOnly) && (isBrowser || !s.browserOnly))
+  })).filter((g) => g.sections.length > 0)
 }
 
 /**

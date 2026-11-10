@@ -21,6 +21,7 @@ import { isSafeNodeId } from '../../shared/safe-id'
 import { RMT_TMUX_SOCKET } from './control-master'
 import { sessionName } from '../tmux-naming'
 import { CONTROL_RE } from '../relay/team-admin'
+import { isRecord } from '../../shared/is-record'
 
 export const SERVER_INSTALL_URL = 'https://raw.githubusercontent.com/eneskirca/nodeterm/main/scripts/install-server.sh'
 /** Where a root-installed nodeterm-server's unit lives (the installer's system mode). */
@@ -147,7 +148,6 @@ const parseJson = (text: string): unknown => {
     return undefined
   }
 }
-const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 
 /** Read `shareProbeCommand`'s reply. Login noise before `##NTP 1` is skipped; a reply that never
  *  reaches `##END` (a dropped channel, a timeout) is an error, never a half-filled probe that

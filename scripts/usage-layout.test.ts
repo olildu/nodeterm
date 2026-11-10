@@ -91,4 +91,4 @@ it.skipIf(!existsSync(chrome))('keeps refresh clickable beside/above the real do
   } finally {
     rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
   }
-}, 40000)
+}, 90_000) // cold esbuild bundle + Chrome start, often beside another real-browser suite on CI

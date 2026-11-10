@@ -834,3 +834,34 @@ describe('--no-daemon: stripped from the managed thread, kept or added on plain 
     expect(codexArgv()).toEqual(['hello'])
   })
 })
+
+// #1175: a hook under a STALE shared daemon inherits the node id of the pane that started it, so
+// the hook prelude lets the payload thread's record outrank an inherited id. Our own plain exits
+// run codex IN-PROCESS: their hooks carry THIS pane's env, which must keep winning even when the
+// thread's record names another node (the bind-refused fallback). The marker says so.
+describe('NODETERM_CODEX_PLAIN marks the in-process exits, never the --remote client', () => {
+  const plainMarks = (): string[] =>
+    fs.readFileSync(argvLog, 'utf8').split('\n').filter((l) => l.startsWith('PLAIN='))
+  beforeEach(() => {
+    fakeHelpNoDaemon = true
+    writeFakeCodex(`printf 'PLAIN=%s\\n' "\${NODETERM_CODEX_PLAIN-}" >> ${JSON.stringify(argvLog)}`)
+  })
+
+  it('the bind-refused fallback runs plain codex marked', async () => {
+    bindAnswer = null
+    await callLauncher(['resume', 'thread-xyz'])
+    expect(codexArgv()[0]).toBe('--no-daemon resume thread-xyz')
+    expect(plainMarks()).toEqual(['PLAIN=1'])
+  })
+
+  it('a preflight fallback that already carries --no-daemon is marked too', async () => {
+    await callLauncher(['fix the bug', '--no-daemon'], { NODETERM_HOOK_ENDPOINT: '' })
+    expect(plainMarks()).toEqual(['PLAIN=1'])
+  })
+
+  it('the managed --remote resume is NOT marked (its hooks run in the daemon)', async () => {
+    await callLauncher(['resume', 'thread-xyz'])
+    expect(codexArgv()[0]).toBe('--remote unix:// resume thread-xyz')
+    expect(plainMarks()).toEqual(['PLAIN='])
+  })
+})

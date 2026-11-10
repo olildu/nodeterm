@@ -7,6 +7,8 @@ import type {
   TerminalCursorStyle
 } from '@shared/types'
 import { isWindowsPlatform } from '@shared/platform-utils'
+import { xtermScrollback } from '@shared/scrollback'
+import { toXtermText } from '@shared/capture-paint'
 import { isKnownTerminalThemeId, resolveTerminalTheme } from './themes'
 
 /**
@@ -145,25 +147,18 @@ export function shouldApplyResync(screen: string | null | undefined): screen is 
   return typeof screen === 'string' && screen.length > 0
 }
 
-/** Hard cap on xterm's in-memory scrollback: the cost is per node and one canvas holds many. */
-export const XTERM_SCROLLBACK_MAX = 10000
-
 /**
- * Floor, mirroring the tmux conf's own `history-limit ${Math.max(1000, scrollback)}`, so the two
- * buffers never disagree at the low end.
- */
-export const XTERM_SCROLLBACK_MIN = 1000
-
-/**
- * How many scrollback lines xterm keeps. The WHEEL scrolls tmux (its mouse is on, and the pane is
+ * Scrollback bounds now live in `@shared/scrollback` (the Windows session host's emulator uses the
+ * same cap). Re-exported so existing renderer imports keep working.
+ *
+ * How many scrollback lines xterm keeps: the WHEEL scrolls tmux (its mouse is on, and the pane is
  * on the alternate screen), so this buffer is not what the user scrolls in a tmux session — it is
- * the fallback for a session with no tmux (a plain shell) and the room a cold-restore snapshot
- * replay needs. xterm's default of 1000 lines is too small for the latter, so it follows the same
- * `settings.tmuxScrollback` the user picked for tmux's history-limit, floored and capped.
+ * the fallback for a session with no tmux (a plain shell, the Windows session host) and the room a
+ * cold-restore snapshot replay needs. It follows `settings.tmuxScrollback`, floored and capped.
  */
-export function xtermScrollback(tmuxScrollback: number): number {
-  return Math.min(Math.max(XTERM_SCROLLBACK_MIN, tmuxScrollback), XTERM_SCROLLBACK_MAX)
-}
+export { XTERM_SCROLLBACK_MAX, XTERM_SCROLLBACK_MIN, xtermScrollback } from '@shared/scrollback'
+// The capture → emulator transforms live in @shared so main's relay repaint uses the same rules.
+export { stripTrailingNewline, toXtermText } from '@shared/capture-paint'
 
 /* ------------------------------------------------------------------------------------------- *
  * Terminal appearance — ONE source for both xterm call sites.
@@ -640,14 +635,6 @@ export function cursorPlacementSeq(cursor: PaneCursor | undefined): string {
   return `\x1b[${cursor.y + 1};${cursor.x + 1}H` + (cursor.visible ? '\x1b[?25h' : '\x1b[?25l')
 }
 
-/**
- * Make text captured from tmux (`capture-pane`, LF-separated lines) safe to `term.write()`.
- * xterm runs with `convertEol: false` — a bare LF moves down but keeps the column, so raw capture
- * output would render as a staircase. Lone LFs become CRLF; existing CRLFs are left alone.
- */
-export function toXtermText(text: string): string {
-  return text.replace(/\r?\n/g, '\r\n')
-}
 
 /**
  * Who closed this node, for the "closed by …" overlay. `by` is null when the destroy was not
@@ -660,18 +647,6 @@ export function closedByLabel(
 ): string {
   if (by === null) return 'another user'
   return peers[by]?.name || 'another user'
-}
-
-/**
- * Drop exactly ONE trailing newline from a tmux capture.
- * `capture-pane -p -e -S -<n>` emits a trailing LF after its last line. Writing it would leave the
- * cursor one row BELOW the last captured row: xterm scrolls, the topmost row of the captured
- * visible screen is pushed into scrollback, and tmux's attach redraw (`\x1b[H\x1b[2J`) then
- * repaints that same screen — so on every warm reattach the first visible row would appear twice.
- * Strip on the RAW capture (LF-separated), before `toXtermText` turns the LFs into CRLFs.
- */
-export function stripTrailingNewline(text: string): string {
-  return text.replace(/\r?\n$/, '')
 }
 
 /**

@@ -119,8 +119,14 @@ export const PASSWORD_SHOWN_ONCE = 'This is the only time the password is shown.
 /** Why Control is not offered on a node — the dialog's disabled option and the create error alike. */
 export const CONTROL_UNSUPPORTED_REASON =
   "Control isn't available for this terminal: its Zellij session's key bindings would reach every session."
-/** A Control link locked by wrong passwords (spec §2.3), beside "Allow control again". */
+/** A Control link locked by wrong passwords (spec §2.3), beside "Allow control again": the lock of a
+ *  core from before timed locks, which waits for the owner. */
 export const CONTROL_LOCKED_TEXT = 'Control locked after 10 wrong passwords.'
+/** The locked line, with when it lifts by itself (finding L2) when it does. */
+export function controlLockedText(lockedUntil: number | null | undefined, now: number = Date.now()): string {
+  if (typeof lockedUntil !== 'number' || !Number.isFinite(lockedUntil)) return CONTROL_LOCKED_TEXT
+  return `Control locked after 10 wrong passwords, until ${formatUntil(lockedUntil, now)}.`
+}
 /** The popover's Change password form: a new password demotes every controller (Task 4 ruling). */
 export const PASSWORD_CHANGE_NOTE = 'Anyone typing now goes back to watching until they unlock with the new password.'
 /** `setControl` / `allowControl` answered false, or did not answer. */
@@ -374,17 +380,23 @@ export function capUnits(s: string, max: number): string {
 /**
  * R63: whether a link to a node can be watched ONLY while the node is open in this app. A viewer joins
  * a session this process holds (the canvas node, a parked view) or — with nothing held — spawns its
- * own read-only tmux client; a machine whose LOCAL terminals are not tmux (Windows' session host, tmux
- * switched off or missing, Zellij) has no such client. An SSH project's node runs in the HOST's tmux,
- * which does. Unknown (the status not read yet, or unreadable) claims nothing: the popover's waiting
- * line still tells the truth at runtime.
+ * own read-only tmux client; a machine whose LOCAL terminals are not tmux (tmux switched off or
+ * missing, Zellij) has no such client. The session host has its read-only equivalent (`watch-attach`)
+ * when the running host speaks it (`watchJoin`); one from an older build does not. An SSH project's
+ * node runs in the HOST's tmux, which does. Unknown (the status not read yet, or unreadable) claims
+ * nothing: the popover's waiting line still tells the truth at runtime.
  */
 export function watchableOnlyWhileOpen(o: {
-  persistence: { enabled: boolean; backend: string | null } | null | undefined
+  persistence:
+    | { enabled: boolean; backend: string | null; watchJoin?: boolean }
+    | null
+    | undefined
   remoteNode: boolean
 }): boolean {
   if (o.remoteNode || !o.persistence) return false
-  return !(o.persistence.enabled && o.persistence.backend === 'tmux')
+  if (!o.persistence.enabled) return true
+  if (o.persistence.backend === 'tmux') return false
+  return !(o.persistence.backend === 'session-host' && o.persistence.watchJoin === true)
 }
 export function watchWhileOpenNote(): string {
   return `On ${thisMachine()}, viewers can watch this terminal only while it is open in nodeterm; otherwise they wait until you open it.`
@@ -458,6 +470,25 @@ export function controlTakenText(n: { name: string; title: string }): string {
 }
 
 /**
+ * The lock notice (finding L2): until when, and who tipped it — the name the attempt gave itself, as a
+ * claim ("a viewer using the name “Mert”"), else "a viewer" — so a kick and a new password are obvious.
+ * A core from before timed locks sends neither field, and gets the old sentence.
+ */
+export function controlLockedNoticeText(
+  n: { title: string; by?: string | null; until?: number | null },
+  now: number = Date.now()
+): string {
+  const title = stripBidiControls(n.title)
+  if (n.by === undefined && n.until === undefined) {
+    return `Control of ${title} was locked after 10 wrong passwords. Allow it again from the LIVE chip.`
+  }
+  const name = typeof n.by === 'string' ? stripBidiControls(n.by).trim() : ''
+  const who = name ? `a viewer using the name ${quoted(name)}` : 'a viewer'
+  const when = typeof n.until === 'number' && Number.isFinite(n.until) ? ` until ${formatUntil(n.until, now)}` : ''
+  return `Control of ${title} is locked${when} after 10 wrong passwords; the last came from ${who}. Allow it again from the LIVE chip.`
+}
+
+/**
  * The info strip for a notice from core; null for a kind this build does not know (a newer core).
  * Exhaustive over the kinds this build knows: a kind added to `WatchLinkNotice` fails to compile
  * here until it has copy — a `default: return null` once let two kinds render nothing.
@@ -483,7 +514,7 @@ export function noticeText(n: WatchLinkNotice): string | null {
     case 'control-taken':
       return controlTakenText(n)
     case 'control-locked':
-      return `Control of ${stripBidiControls(n.title)} was locked after 10 wrong passwords. Allow it again from the LIVE chip.`
+      return controlLockedNoticeText(n)
     default: {
       // Compile-time: every known kind is handled above. Runtime: a newer core's kind is no notice.
       const unknown: never = n

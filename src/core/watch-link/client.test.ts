@@ -14,6 +14,8 @@ import { encodePtyData } from '../../shared/rpc'
 import { connectWatchClient, TRUST_CONFIRM_JSON, type WatchSocket } from '../../shared/watch-link/client'
 import { deriveWatchLinkKeys, type WatchLinkKeys } from '../../shared/watch-link/keys'
 import { INPUT_MAX } from '../../shared/watch-link/protocol'
+import { openUnlock } from '../../shared/watch-link/unlock-seal'
+import { bytesToB64 } from '../../shared/watch-link/bytes'
 
 function hostWith(opts: { keys?: WatchLinkKeys; autoApprove?: boolean } = {}) {
   const keys = opts.keys ?? deriveWatchLinkKeys(nacl.randomBytes(32))
@@ -149,6 +151,23 @@ describe('connectWatchClient against the real relay socket', () => {
     expect(h.tunnel.at(-1)).toBe(JSON.stringify({ t: 'cast', method: 'watch:chat', args: [{ name: 'Ada', text: 'hi' }] }))
   })
 
+  it('asks for read-back only while open, with the cursor only when one is given', async () => {
+    const h = hostWith()
+    const c = connectWatchClient({ socket: h.peerT, keys: h.keys, events: events().ev })
+    expect(c.requestHistory()).toBe(false)
+    await vi.waitFor(() => expect(h.tunnel).toContain(TRUST_CONFIRM_JSON))
+    h.confirm()
+    expect(c.requestHistory()).toBe(true)
+    expect(h.tunnel.at(-1)).toBe('{"t":"cast","method":"watch:history","args":[{}]}')
+    expect(c.requestHistory(4096)).toBe(true)
+    expect(h.tunnel.at(-1)).toBe('{"t":"cast","method":"watch:history","args":[{"before":4096}]}')
+    // A cursor the host would refuse never leaves the client.
+    const n = h.tunnel.length
+    expect(c.requestHistory(-1)).toBe(false)
+    expect(c.requestHistory(1.5)).toBe(false)
+    expect(h.tunnel).toHaveLength(n)
+  })
+
   it('sends the control casts only while open, exactly as the host reads them', async () => {
     const h = hostWith()
     const { socket, sent } = counting(h.peerT)
@@ -173,6 +192,32 @@ describe('connectWatchClient against the real relay socket', () => {
     expect({ tunnel: h.tunnel.length, binary: sent.binary }).toEqual(before)
     expect(c.sendInput('x'.repeat(INPUT_MAX))).toBe(true)
     expect(h.tunnel).toHaveLength(before.tunnel + 1)
+  })
+
+  // Finding L3: once a meta on this connection offered an unlock key, the password is sealed to it and
+  // never sent in the clear on this connection again.
+  it('seals an unlock to the key the connection offered, and from then on never sends one in the clear', async () => {
+    const h = hostWith()
+    const c = connectWatchClient({ socket: h.peerT, keys: h.keys, events: events().ev })
+    await vi.waitFor(() => expect(h.tunnel).toContain(TRUST_CONFIRM_JSON))
+    h.confirm()
+    // A key that is not one is ignored: still in the clear (what a host from before sealing gets).
+    h.host.sendTunnelText(JSON.stringify({ t: 'ev', channel: 'watch:meta', args: [{ v: 1, unlockKey: 'AAAA' }] }))
+    expect(c.unlock('Mert', 'correct-horse-77')).toBe(true)
+    expect(h.tunnel.at(-1)).toBe('{"t":"cast","method":"watch:unlock","args":[{"name":"Mert","password":"correct-horse-77"}]}')
+    const conn = nacl.box.keyPair()
+    h.host.sendTunnelText(JSON.stringify({ t: 'ev', channel: 'watch:meta', args: [{ v: 1, unlockKey: bytesToB64(conn.publicKey) }] }))
+    expect(c.unlock('Mert', 'correct-horse-77')).toBe(true)
+    const sealed = h.tunnel.at(-1)!
+    expect(sealed).not.toContain('correct-horse-77')
+    const arg = (JSON.parse(sealed) as { method: string; args: unknown[] })
+    expect(arg.method).toBe('watch:unlock')
+    expect(openUnlock(arg.args[0], conn.secretKey)).toEqual({ name: 'Mert', password: 'correct-horse-77' })
+    // A later meta without one (a rejoin's) does not bring the clear text back.
+    h.host.sendTunnelText(JSON.stringify({ t: 'ev', channel: 'watch:meta', args: [{ v: 1 }] }))
+    expect(c.unlock('Mert', 'correct-horse-77')).toBe(true)
+    expect(h.tunnel.at(-1)).not.toContain('correct-horse-77')
+    expect(openUnlock(JSON.parse(h.tunnel.at(-1)!).args[0], conn.secretKey)).toEqual({ name: 'Mert', password: 'correct-horse-77' })
   })
 
   it('keeps both directions flowing past seq 255', async () => {

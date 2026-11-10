@@ -83,7 +83,7 @@ describe('ControlModeClient.start', () => {
     expect(spawner.calls).toEqual([
       {
         bin: '/opt/homebrew/bin/tmux',
-        args: ['-L', 'node-terminal', '-C', 'attach-session', '-t', 'nt-term-1']
+        args: ['-L', 'node-terminal', '-C', 'attach-session', '-t', '=nt-term-1']
       }
     ])
   })
@@ -129,7 +129,7 @@ describe('ControlModeClient.sendKeys', () => {
   it('writes the hex send-keys line and resolves true on an ok reply', async () => {
     const { client, child } = makeClient()
     const p = client.sendKeys('ls\n')
-    expect(child.writes).toEqual(['send-keys -t nt-term-1 -H 6c 73 0a\n'])
+    expect(child.writes).toEqual(['send-keys -t =nt-term-1: -H 6c 73 0a\n'])
     child.feed(reply(1))
     await expect(p).resolves.toBe(true)
   })
@@ -142,7 +142,7 @@ describe('ControlModeClient.sendKeys', () => {
   it('can target another session on the same server', async () => {
     const { client, child } = makeClient()
     const p = client.sendKeys('x', 'nt-term-9')
-    expect(child.writes).toEqual(['send-keys -t nt-term-9 -H 78\n'])
+    expect(child.writes).toEqual(['send-keys -t =nt-term-9: -H 78\n'])
     child.feed(reply(1))
     await expect(p).resolves.toBe(true)
   })

@@ -43,6 +43,14 @@ describe('pushSessionRename', () => {
     }
   })
 
+  it('recognizes the Windows session host\'s shells — never types `/rename` into PowerShell or cmd', async () => {
+    for (const pane of ['cmd.exe', 'pwsh.exe', 'PowerShell.exe']) {
+      const x = io([pane])
+      await expect(pushSessionRename(x, 'n1', 'x', 'was'), pane).resolves.toBe(false)
+      expect(x.sent, pane).toEqual([])
+    }
+  })
+
   it('waits for the CLI to boot, then writes once', async () => {
     const x = io(['zsh', 'zsh', 'node'])
     await expect(pushSessionRename(x, 'n1', 'Later', 'Earlier')).resolves.toBe(true)
@@ -215,5 +223,21 @@ describe('renameCommand: a title cannot splice a second command', () => {
     return pushSessionRename(x, 'n1', 'Deploy\nrm -rf ~', 'Old name').then(() => {
       expect(x.sent).toEqual(['/rename Deploy rm -rf ~'])
     })
+  })
+})
+
+describe('pushSessionRename: a separate-submit agent (cursor)', () => {
+  it('sends ONE line with the default Enter; PtyManager.sendText splits it, nothing here does', async () => {
+    const calls: unknown[][] = []
+    const x = {
+      paneCommand: async () => 'cursor-agent',
+      sendText: async (...args: unknown[]) => {
+        calls.push(args.slice(1))
+        return true as const
+      },
+      sleep: async () => {}
+    }
+    await expect(pushSessionRename(x, 'n1', 'Probe', 'Old')).resolves.toBe(true)
+    expect(calls).toEqual([['/rename Probe']])
   })
 })

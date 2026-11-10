@@ -2,6 +2,7 @@ import { resolve } from 'path'
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
+import { excalidrawAssetsPlugin } from './scripts/excalidraw-assets-plugin'
 
 export default defineConfig({
   main: {
@@ -59,10 +60,14 @@ export default defineConfig({
     resolve: {
       alias: {
         '@renderer': resolve(__dirname, 'src/renderer'),
-        '@shared': resolve(__dirname, 'src/shared')
+        '@shared': resolve(__dirname, 'src/shared'),
+        // The whiteboard's Excalidraw would otherwise bundle all of mermaid (~7.3 MB) for its
+        // "text to diagram" tool. See the stub's header.
+        '@excalidraw/mermaid-to-excalidraw': resolve(__dirname, 'src/renderer/whiteboard/mermaid-stub.ts')
       }
     },
-    plugins: [react(), tailwindcss()],
+    // excalidrawAssetsPlugin: the whiteboard node's fonts, served offline (see the plugin's doc).
+    plugins: [react(), tailwindcss(), excalidrawAssetsPlugin(__dirname)],
     build: {
       rollupOptions: {
         input: {

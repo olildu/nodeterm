@@ -26,7 +26,7 @@
 
 import type { Project, SessionMemoryRow } from '@shared/types'
 
-type ProjectLike = Pick<Project, 'name' | 'nodes' | 'remote' | 'ssh'>
+type ProjectLike = Pick<Project, 'name' | 'nodes' | 'remote' | 'ssh' | 'storeInAppData'>
 
 /** The node ids whose tmux sessions a close-with-end / delete addresses (terminal-kind only). */
 export function terminalNodeIds(project: Pick<Project, 'nodes'>): string[] {
@@ -114,10 +114,13 @@ export function deleteConfirmCopy(project: ProjectLike): DeleteConfirmCopy {
         ? `ends its ${n} terminal session${plural(n)} on ${sshHostLabel(project)} and `
         : `ends its ${n} terminal session${plural(n)} and `
   const where = project.ssh ? 'on the server' : 'on disk'
+  // A project stored in app data (#1145) has no copy in its folder: removing it deletes the canvas
+  // and its app-data side files (WorkspaceStore's data-file sweep).
+  const tail = project.storeInAppData && !project.ssh
+    ? `The folder ${where} is not deleted, but the canvas, project settings, board log and whiteboards it kept in app data are.`
+    : `The folder ${where} (including .nodeterm/project.json) is not deleted.`
   return {
-    message:
-      `Delete “${name}”? This ${sessions}removes the project from nodeterm. The folder ${where} ` +
-      `(including .nodeterm/project.json) is not deleted.`,
+    message: `Delete “${name}”? This ${sessions}removes the project from nodeterm. ${tail}`,
     confirmLabel: 'Delete',
     danger: true
   }

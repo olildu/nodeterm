@@ -39,10 +39,15 @@
 // at boot and links sealed earlier stay on disk, and a link no longer in the list is still dropped.
 //
 // A CONTROL LINK (role 'controller') carries `control`: whether typing is on, the password's scrypt
-// salt and hash (./password.ts — never the plaintext), whether wrong attempts locked it, and the
+// salt and hash (./password.ts — never the plaintext), whether wrong attempts locked it, the
 // link-wide count of wrong attempts toward that lock (`wrong`, 0..CONTROL_WRONG_MAX — persisted, so an
 // app restart does not hand an attacker who holds the link fresh guesses; a file written before the
-// count existed reads as 0). It is
+// count existed reads as 0), when the lock lifts by itself (`lockedUntil`, finding L2 — persisted, so a
+// restart neither lifts it early nor makes it permanent; a lock written before timed locks has none and
+// lasts until the owner allows control again, as it always did) and how many locks there have been
+// since the owner last did (`lockStep`, so each lock lasts twice as long as the last, up to 24 h). An
+// older build reads the file as before and ignores the two new fields: a timed lock is permanent there
+// (the safe direction for a downgrade). It is
 // written as it is, not sealed: the hash is scrypt'd, and anyone who can read this 0600 file under
 // userData is already this user. `control` is present IFF the role is 'controller', and a load drops
 // any entry that breaks that rule: a hand-edited file cannot give a viewer link a password, and a
@@ -55,11 +60,20 @@ import { promises as fs } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { renameAtomic, writeFileAtomic } from '../fs-atomic'
 import { LINK_ID_RE } from '../../shared/watch-link/link'
-import type { WatchLinkRole } from '../../shared/watch-link/protocol'
+import { CONTROL_LOCK_MAX_MS, type WatchLinkRole } from '../../shared/watch-link/protocol'
 import { isSafeNodeId } from '../../shared/safe-id'
 
 /** Wrong unlock attempts across a Control link that lock it (link-host.ts `WRONG_PER_LINK`). */
 export const CONTROL_WRONG_MAX = 10
+/** How long a wrong-password lock lasts by itself: 15 minutes for the first lock since the owner last
+ *  allowed control, doubling with each later one, never past `CONTROL_LOCK_MAX_MS` (24 h). */
+export const CONTROL_LOCK_FIRST_MS = 15 * 60_000
+/** The most locks the record counts (`lockStep`): far past the step where the cap is reached. */
+export const CONTROL_LOCK_STEP_MAX = 16
+export function controlLockMs(step: number): number {
+  const n = Number.isInteger(step) && step > 0 ? Math.min(step, CONTROL_LOCK_STEP_MAX) : 0
+  return Math.min(CONTROL_LOCK_FIRST_MS * 2 ** n, CONTROL_LOCK_MAX_MS)
+}
 
 /** A Control link's typing state. The salt and hash are base64 (16 and 32 bytes). */
 export interface WatchLinkControlRecord {
@@ -68,8 +82,15 @@ export interface WatchLinkControlRecord {
   hash: string
   locked: boolean
   /** Wrong unlock attempts across the link since the last reset (a new password, Allow control
-   *  again): an integer 0..CONTROL_WRONG_MAX. */
+   *  again, a lock that lifted): an integer 0..CONTROL_WRONG_MAX. */
   wrong: number
+  /** While `locked`: when the lock lifts by itself (epoch ms, this machine's clock); null (or absent)
+   *  for a lock that lifts only when the owner allows control again — every lock a build from before
+   *  timed locks wrote. Always null while not locked. */
+  lockedUntil?: number | null
+  /** How many locks since the owner last allowed control again (0..CONTROL_LOCK_STEP_MAX): the next
+   *  lock lasts `controlLockMs(lockStep)`. A lock that lifts by itself does not reset it. Absent: 0. */
+  lockStep?: number
 }
 
 export interface WatchLinkRecord {
@@ -154,16 +175,25 @@ function isB64Of(v: unknown, bytes: number): v is string {
   return b.length === bytes && b.toString('base64') === v
 }
 
-/** A Control link's `control`, rebuilt from its five fields (nothing else is carried), or null. An
+/** A Control link's `control`, rebuilt from its seven fields (nothing else is carried), or null. An
  *  absent `wrong` is 0 (a file written before the count was persisted); a present one must be an
- *  integer 0..CONTROL_WRONG_MAX. */
+ *  integer 0..CONTROL_WRONG_MAX. An absent `lockedUntil` is null — a lock written before timed locks
+ *  keeps its meaning, "until the owner allows control again" — and a present one must be null or a
+ *  finite epoch ms ≥ 0; it is carried only while `locked`. An absent `lockStep` is 0; a present one must
+ *  be an integer 0..CONTROL_LOCK_STEP_MAX. */
 function readControl(v: unknown): WatchLinkControlRecord | null {
   if (!v || typeof v !== 'object' || Array.isArray(v)) return null
-  const { enabled, salt, hash, locked, wrong = 0 } = v as Record<string, unknown>
+  const { enabled, salt, hash, locked, wrong = 0, lockedUntil = null, lockStep = 0 } = v as Record<string, unknown>
   if (typeof enabled !== 'boolean' || typeof locked !== 'boolean') return null
   if (!isB64Of(salt, CONTROL_SALT_BYTES) || !isB64Of(hash, CONTROL_HASH_BYTES)) return null
   if (!Number.isInteger(wrong) || (wrong as number) < 0 || (wrong as number) > CONTROL_WRONG_MAX) return null
-  return { enabled, salt, hash, locked, wrong: wrong as number }
+  if (lockedUntil !== null && (!num(lockedUntil) || lockedUntil < 0)) return null
+  if (!Number.isInteger(lockStep) || (lockStep as number) < 0 || (lockStep as number) > CONTROL_LOCK_STEP_MAX) return null
+  return {
+    enabled, salt, hash, locked, wrong: wrong as number,
+    lockedUntil: locked ? (lockedUntil as number | null) : null,
+    lockStep: lockStep as number
+  }
 }
 
 export class WatchLinkStore {
@@ -351,7 +381,7 @@ export class WatchLinkStore {
           }
           sealedNext.set(r.linkId, { digest, sealed: secret })
         }
-        // Only the five control fields are written (as `readControl` read them above): nothing else that
+        // Only the seven control fields are written (as `readControl` read them above): nothing else that
         // rides on the object reaches disk.
         const c = r.control ? readControl(r.control) : null
         const control = c ? { control: c } : {}

@@ -9,6 +9,7 @@ import {
   unlinkPull
 } from '@shared/kanban-pull-links'
 import { useProjects } from '../../state/projects'
+import { useOwningProjectId } from '../../session/owning-project'
 import { useGitHubIssues } from '../../state/githubIssues'
 import { useSettings } from '../../state/settings'
 import { pullsForCard } from '../../lib/pullLinks'
@@ -35,8 +36,13 @@ export function CardPullRequests({
   board: ProjectKanban
   onChangeBoard: (next: ProjectKanban) => void
 }): React.JSX.Element | null {
-  const projectId = useProjects((state) => state.activeProjectId)
-  const ssh = useProjects((state) => !!state.projects.find((item) => item.id === state.activeProjectId)?.ssh)
+  // The project that owns `board` — the card's project under the modal's ProjectSessionScope (an
+  // Omni lane is not the active project), else the active one. Its pull board, SSH flag and
+  // auto-move target must all describe that same project.
+  const owningProjectId = useOwningProjectId()
+  const activeProjectId = useProjects((state) => state.activeProjectId)
+  const projectId = owningProjectId ?? activeProjectId
+  const ssh = useProjects((state) => !!state.projects.find((item) => item.id === projectId)?.ssh)
   const pullBoard = useGitHubIssues((state) => state.projects[projectId]?.pullBoard)
   const autoMoveRaw = useSettings((state) => state.settings.kanbanPullAutoMove)
   const target = useMemo(() => {

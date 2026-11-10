@@ -140,6 +140,19 @@ describe('Windows pairing: relay-only', () => {
     }
   })
 
+  it('never reads or carries SSH host-key fingerprints (no SSH to pin on this host)', async () => {
+    reset()
+    const readSshHostKeys = vi.fn(async () => ['SHA256:' + 'A'.repeat(43)])
+    const service = createPairingService(relayDeps(), { ...win, readSshHostKeys })
+    try {
+      const started = await service.start(() => {})
+      expect(readSshHostKeys).not.toHaveBeenCalled()
+      expect(JSON.parse(started.payload)).not.toHaveProperty('sshHostKeys')
+    } finally {
+      service.stop()
+    }
+  })
+
   it('takes the default-route address when it belongs to this machine', async () => {
     const service = createPairingService(relayDeps(), { ...win, defaultRouteAddress: async () => '172.20.48.1' })
     try {

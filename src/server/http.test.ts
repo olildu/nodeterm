@@ -12,7 +12,8 @@ import {
   _resetStaticCacheForTest,
   SESSION_COOKIE
 } from './http'
-import { parseTrustedNets } from './proxy-trust'
+import { parseTrustedNets, PROXY_SECRET_HEADER } from './proxy-trust'
+import { MAX_FAILURES } from './auth'
 
 let dir: string, rendererDir: string, server: http.Server, base: string, auth: Auth
 
@@ -98,7 +99,9 @@ describe('http layer', () => {
   it('serves static with CSP rewrite on index.html and blocks traversal', async () => {
     const cookie = await setupAndLogin()
     const html = await (await fetch(`${base}/`, { headers: { cookie } })).text()
-    expect(html).toContain(`connect-src 'self' ws: wss:`)
+    // S6: same-origin only — a same-origin ws:/wss: URL is covered by 'self' (CSP3).
+    expect(html).toContain(`connect-src 'self';`)
+    expect(html).not.toContain('ws: wss:')
     const js = await fetch(`${base}/app.js`, { headers: { cookie } })
     expect(js.headers.get('content-type')).toContain('javascript')
     const evil = await fetch(`${base}/..%2f..%2fauth.json`, { headers: { cookie } })
@@ -232,7 +235,7 @@ describe('http layer', () => {
       )
       const res = await rawGet('/', { cookie, 'accept-encoding': 'gzip' })
       expect(res.headers['content-encoding']).toBe('gzip')
-      expect(zlib.gunzipSync(res.body).toString('utf8')).toContain(`connect-src 'self' ws: wss:`)
+      expect(zlib.gunzipSync(res.body).toString('utf8')).toContain(`connect-src 'self';`)
     })
 
     it('re-compresses after the file changes on disk (a rebuild must not serve stale bytes)', async () => {
@@ -259,13 +262,15 @@ describe('http layer', () => {
 
 describe('http layer with proxy header trust', () => {
   const HDR = 'Cf-Access-Authenticated-User-Email'
+  const SECRET = 'q'.repeat(48)
+  const SEC = { [PROXY_SECRET_HEADER]: SECRET }
 
-  function trustedServer(netsSpec: string): Promise<{ srv: http.Server; url: string }> {
+  function trustedServer(netsSpec: string, secret: string | undefined = SECRET): Promise<{ srv: http.Server; url: string }> {
     const srv = http.createServer(
       createHttpHandler({
         auth,
         rendererDir,
-        trustProxy: { header: HDR, nets: parseTrustedNets(netsSpec) }
+        trustProxy: { header: HDR, nets: parseTrustedNets(netsSpec), ...(secret ? { secret } : {}) }
       })
     )
     return new Promise((r) =>
@@ -275,19 +280,19 @@ describe('http layer with proxy header trust', () => {
     )
   }
 
-  it('trusted peer + header: serves the app with no cookie; /login and /setup redirect home', async () => {
+  it('trusted peer + header + secret: serves the app with no cookie; /login and /setup redirect home', async () => {
     const { srv, url } = await trustedServer('127.0.0.0/8')
     try {
-      const home = await fetch(`${url}/`, { headers: { [HDR]: 'dev@corp.com' } })
+      const home = await fetch(`${url}/`, { headers: { ...SEC, [HDR]: 'dev@corp.com' } })
       expect(home.status).toBe(200)
       const login = await fetch(`${url}/login`, {
-        headers: { [HDR]: 'dev@corp.com' },
+        headers: { ...SEC, [HDR]: 'dev@corp.com' },
         redirect: 'manual'
       })
       expect(login.status).toBe(302)
       expect(login.headers.get('location')).toBe('/')
       const setup = await fetch(`${url}/setup`, {
-        headers: { [HDR]: 'dev@corp.com' },
+        headers: { ...SEC, [HDR]: 'dev@corp.com' },
         redirect: 'manual'
       })
       expect(setup.status).toBe(302)
@@ -297,17 +302,40 @@ describe('http layer with proxy header trust', () => {
     }
   })
 
+  it('S2: from loopback, the header WITHOUT the secret is not an identity (any local process could send it)', async () => {
+    const { srv, url } = await trustedServer('127.0.0.0/8')
+    const { srv: srvNoSecret, url: urlNoSecret } = await trustedServer('127.0.0.0/8', undefined)
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      // The audit's repro: no cookie, just the header from a local process → was 200.
+      expect((await fetch(`${url}/x.json`, { headers: { [HDR]: 'anyone' }, redirect: 'manual' })).status).toBe(401)
+      expect(
+        (await fetch(`${url}/x.json`, { headers: { [HDR]: 'anyone', [PROXY_SECRET_HEADER]: 'guess' }, redirect: 'manual' }))
+          .status
+      ).toBe(401)
+      // A config with loopback nets and no secret at all trusts no loopback peer.
+      expect((await fetch(`${urlNoSecret}/x.json`, { headers: { [HDR]: 'anyone' }, redirect: 'manual' })).status).toBe(401)
+      // The refusal is logged, without the value of any header.
+      expect(warn.mock.calls.flat().join(' ')).not.toContain('anyone')
+      expect(warn.mock.calls.flat().join(' ')).not.toContain('guess')
+    } finally {
+      warn.mockRestore()
+      await new Promise((r) => srv.close(r))
+      await new Promise((r) => srvNoSecret.close(r))
+    }
+  })
+
   it('missing/empty header, or a peer outside the nets, falls through to normal auth', async () => {
     const { srv, url } = await trustedServer('127.0.0.0/8')
     const { srv: srvFar, url: urlFar } = await trustedServer('10.0.0.0/8')
     try {
-      expect((await fetch(`${url}/x.json`, { redirect: 'manual' })).status).toBe(401)
+      expect((await fetch(`${url}/x.json`, { headers: SEC, redirect: 'manual' })).status).toBe(401)
       expect(
-        (await fetch(`${url}/x.json`, { headers: { [HDR]: '  ' }, redirect: 'manual' })).status
+        (await fetch(`${url}/x.json`, { headers: { ...SEC, [HDR]: '  ' }, redirect: 'manual' })).status
       ).toBe(401)
       // Loopback peer, but the trusted nets exclude loopback → the header means nothing.
       expect(
-        (await fetch(`${urlFar}/x.json`, { headers: { [HDR]: 'dev@corp.com' }, redirect: 'manual' }))
+        (await fetch(`${urlFar}/x.json`, { headers: { ...SEC, [HDR]: 'dev@corp.com' }, redirect: 'manual' }))
           .status
       ).toBe(401)
       // Password/cookie auth still works beside proxy trust.

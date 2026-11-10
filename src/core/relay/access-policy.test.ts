@@ -58,13 +58,18 @@ describe('access policy', () => {
   it('commenter may chat and append to a shared board, viewer may not', () => {
     expect(decideAccess('cast', IPC.presenceChat, ['hi'], ctx('viewer')).allow).toBe(false)
     expect(decideAccess('cast', IPC.presenceChat, ['hi'], ctx('commenter')).allow).toBe(true)
-    expect(decideAccess('req', IPC.boardLogAppend, ['P', { kind: 'comment' }], ctx('commenter')).allow).toBe(true)
-    expect(decideAccess('req', IPC.boardLogAppend, ['Q', { kind: 'comment' }], ctx('commenter')).allow).toBe(false)
+    const comment = { id: 'c', ts: 1, kind: 'comment', author: { name: 'A', color: '#fff' }, text: 'hi' }
+    expect(decideAccess('req', IPC.boardLogAppend, ['P', comment], ctx('commenter')).allow).toBe(true)
+    expect(decideAccess('req', IPC.boardLogAppend, ['Q', comment], ctx('commenter')).allow).toBe(false)
   })
   it('M1: a commenter appends COMMENTS only — an activity entry ("moved card to Done") is refused', () => {
     const COMMENTS_ONLY = 'Commenters can only add comments to the board log.'
     const entry = (kind: unknown) => ({ id: 'e1', ts: 1, author: { name: 'Owner', color: '#fff' }, kind, event: { type: 'card-moved' } })
-    expect(decideAccess('req', IPC.boardLogAppend, ['P', entry('comment')], ctx('commenter'))).toEqual({ allow: true })
+    // Allowed, and reduced to a comment's own fields (the `event` is dropped — security audit F3).
+    expect(decideAccess('req', IPC.boardLogAppend, ['P', entry('comment')], ctx('commenter'))).toEqual({
+      allow: true,
+      args: ['P', { id: 'e1', ts: 1, author: { name: 'Owner', color: '#fff' }, kind: 'comment' }]
+    })
     expect(decideAccess('req', IPC.boardLogAppend, ['P', entry('event')], ctx('commenter'))).toEqual({ allow: false, message: COMMENTS_ONLY })
     for (const bad of [undefined, null, 'comment', ['comment'], {}]) {
       expect(decideAccess('req', IPC.boardLogAppend, ['P', bad], ctx('commenter')).allow, String(bad)).toBe(false)
@@ -157,9 +162,14 @@ describe('access policy: the fs jail', () => {
     expect(decideAccess('req', IPC.fsReadBinary, ['/srv/app/logo.png'], v).allow).toBe(true)
   })
 
-  it('a project whose cwd is the filesystem root still contains its files', () => {
+  // Security audit F4: a share rooted at `/` handed a viewer every file on the machine. It is no
+  // longer a root at all (share-root.ts); the other shared roots are unaffected.
+  it('a project whose cwd is the filesystem root is not a root: nothing under it is readable', () => {
     const c: AccessContext = { ...ctx('viewer'), projectCwds: () => ['/'] }
-    expect(decideAccess('req', IPC.fsRead, ['/srv/app/README.md'], c).allow).toBe(true)
+    expect(decideAccess('req', IPC.fsRead, ['/srv/app/README.md'], c).allow).toBe(false)
+    const both: AccessContext = { ...ctx('viewer'), projectCwds: () => ['/', '/srv/app'] }
+    expect(decideAccess('req', IPC.fsRead, ['/srv/app/README.md'], both).allow).toBe(true)
+    expect(decideAccess('req', IPC.fsRead, ['/etc/hostname'], both).allow).toBe(false)
   })
 
   it('a cwd that is not absolute is never a root', () => {
@@ -336,14 +346,32 @@ describe('outbound filter: deny by default for non-editors', () => {
     expect(filterOutboundEvent(ev(IPC.githubIssuesChanged('P'), [1]), ctx('viewer'))).toBe(false)
   })
 
-  it('per-session terminal events and presence are delivered', () => {
+  it('per-session terminal events are delivered', () => {
     for (const ch of [IPC.ptyExit('s'), IPC.ptySize('s'), IPC.ptyClosed('s'), IPC.ptyRecycled('s'), IPC.ptyResync('s')]) {
       expect(filterOutboundEvent(ev(ch, 0), ctx('viewer')), ch).toBe(true)
     }
     expect(filterOutboundEvent(JSON.stringify({ t: 'ev', channel: IPC.ptyRecycled('s'), args: [] }), ctx('viewer'))).toBe(true)
-    expect(filterOutboundEvent(ev(IPC.presenceSync, []), ctx('viewer'))).toBe(true)
-    expect(filterOutboundEvent(ev(IPC.presencePeer, {}), ctx('viewer'))).toBe(true)
-    expect(filterOutboundEvent(ev(IPC.contextUpdate, { sessionId: 'x', usedPercent: 3 }), ctx('viewer'))).toBe(true)
+  })
+
+  // Security audit (a)/(d): presence and context:update named every project's work. Presence is only
+  // delivered through the per-peer filter (`createPresenceFilter`, tested below); through the
+  // stateless table it is dropped. A context update needs a SHARED node behind it.
+  it('presence never passes the stateless table; context:update only for a shared node\'s session', () => {
+    expect(filterOutboundEvent(ev(IPC.presenceSync, []), ctx('viewer'))).toBe(false)
+    expect(filterOutboundEvent(ev(IPC.presencePeer, {}), ctx('viewer'))).toBe(false)
+    expect(filterOutboundEvent(ev(IPC.presenceSync, []), ctx('editor'))).toBe(true)
+    // No node, no way to attribute it: dropped.
+    expect(filterOutboundEvent(ev(IPC.contextUpdate, { sessionId: 'x', usedPercent: 3 }), ctx('viewer'))).toBe(false)
+    expect(filterOutboundEvent(ev(IPC.contextUpdate, { nodeId: 'n1', sessionId: 'x' }), ctx('viewer'))).toBe(true)
+    expect(filterOutboundEvent(ev(IPC.contextUpdate, { nodeId: 'n2', sessionId: 'x' }), ctx('viewer'))).toBe(false)
+    const withMirror: AccessContext = {
+      ...ctx('viewer'),
+      nodesOfAgentSession: (sid) => (sid === 'shared-s' ? ['n1'] : sid === 'other-s' ? ['n2'] : sid === 'both-s' ? ['n1', 'n2'] : [])
+    }
+    expect(filterOutboundEvent(ev(IPC.contextUpdate, { sessionId: 'shared-s' }), withMirror)).toBe(true)
+    expect(filterOutboundEvent(ev(IPC.contextUpdate, { sessionId: 'other-s' }), withMirror)).toBe(false)
+    expect(filterOutboundEvent(ev(IPC.contextUpdate, { sessionId: 'both-s' }), withMirror)).toBe(false)
+    expect(filterOutboundEvent(ev(IPC.contextUpdate, { sessionId: 'nobody' }), withMirror)).toBe(false)
   })
 
   it('an unread clear names a node', () => {
@@ -462,12 +490,114 @@ describe('wrapSinkForRole', () => {
       const w = wrapSinkForRole(sink, () => {
         throw new Error('team store unreadable')
       })
-      expect(() => w.sendText(JSON.stringify({ t: 'ev', channel: IPC.presencePeer, args: [{}] }))).not.toThrow()
-      expect(() => w.sendText(JSON.stringify({ t: 'ev', channel: IPC.presencePeer, args: [{}] }))).not.toThrow()
+      expect(() => w.sendText(JSON.stringify({ t: 'ev', channel: IPC.presencePeer, args: [{ op: 'leave', clientId: 1 }] }))).not.toThrow()
+      expect(() => w.sendText(JSON.stringify({ t: 'ev', channel: IPC.agentStatus, args: [{ nodeId: 'n1' }] }))).not.toThrow()
       expect(text).toEqual([])
       expect(warn).toHaveBeenCalledTimes(1)
     } finally {
       warn.mockRestore()
+    }
+  })
+})
+
+describe('presence through wrapSinkForRole (security audit (a))', () => {
+  const peer = (clientId: number, projectId: string | null, extra: Record<string, unknown> = {}) => ({
+    clientId, name: `p${clientId}`, color: '#5ac8fa', cursor: null, focus: null, chat: null,
+    typing: null, projectId, dino: null, kind: 'desktop', ...extra
+  })
+  const pev = (channel: string, arg: unknown) => JSON.stringify({ t: 'ev', channel, args: [arg] })
+  const rig = (role: () => AccessContext['role']) => {
+    const got: Array<{ channel: string; arg: unknown }> = []
+    const w = wrapSinkForRole(
+      { sendText: (j) => { const m = JSON.parse(j); got.push({ channel: m.channel, arg: m.args[0] }) }, sendBinary: () => {} },
+      () => ctx(role())
+    )
+    return { w, got }
+  }
+  it('a viewer sees only the shared project\'s peers; an editor sees everyone, verbatim', () => {
+    const sync = pev(IPC.presenceSync, [peer(1, 'Q', { focus: 'n2', chat: 'private' }), peer(2, 'P', { focus: 'n2', typing: { nodeId: 'n1', at: 1 } })])
+    const v = rig(() => 'viewer')
+    v.w.sendText(sync)
+    expect(v.got).toEqual([{ channel: IPC.presenceSync, arg: [expect.objectContaining({ clientId: 2, focus: null, typing: { nodeId: 'n1', at: 1 } })] }])
+    const e = rig(() => 'editor')
+    e.w.sendText(sync)
+    expect(e.got).toEqual([{ channel: IPC.presenceSync, arg: JSON.parse(sync).args[0] }])
+  })
+  it('a commenter\'s view follows the peer across projects, and a role change resends the whole picture', () => {
+    let role: AccessContext['role'] = 'commenter'
+    const r = rig(() => role)
+    r.w.sendText(pev(IPC.presenceSync, [peer(1, 'P'), peer(2, 'Q')]))
+    r.got.length = 0
+    r.w.sendText(pev(IPC.presencePeer, { op: 'update', clientId: 2, patch: { chat: 'Q chat' } }))
+    r.w.sendText(pev(IPC.presencePeer, { op: 'update', clientId: 1, patch: { projectId: 'Q' } }))
+    expect(r.got).toEqual([{ channel: IPC.presencePeer, arg: { op: 'leave', clientId: 1 } }])
+    r.got.length = 0
+    role = 'editor'
+    r.w.sendText(pev(IPC.presencePeer, { op: 'update', clientId: 2, patch: { chat: 'again' } }))
+    expect(r.got).toEqual([{ channel: IPC.presenceSync, arg: [expect.objectContaining({ clientId: 1 }), expect.objectContaining({ clientId: 2, chat: 'again' })] }])
+    r.got.length = 0
+    role = 'viewer'
+    r.w.sendText(pev(IPC.presencePeer, { op: 'update', clientId: 2, patch: { chat: 'x' } }))
+    expect(r.got).toEqual([{ channel: IPC.presenceSync, arg: [] }])
+  })
+  it('an update for a peer it never saw, and anything malformed, is dropped', () => {
+    const r = rig(() => 'viewer')
+    r.w.sendText(pev(IPC.presenceSync, []))
+    r.got.length = 0
+    r.w.sendText(pev(IPC.presencePeer, { op: 'update', clientId: 77, patch: { projectId: 'P' } }))
+    r.w.sendText(pev(IPC.presencePeer, 'nonsense'))
+    r.w.sendText(pev(IPC.presenceSync, 'nonsense'))
+    expect(r.got).toEqual([])
+  })
+})
+
+describe('board comments from a Commenter (security audit F3)', () => {
+  const COMMENT = { id: 'c1', ts: 1, kind: 'comment', author: { name: 'Ada', color: '#fff' }, text: 'hi', nodeId: 'n1' }
+  it('only the fields a comment has are written; padding is dropped', () => {
+    const d = decideAccess('req', IPC.boardLogAppend, ['P', { ...COMMENT, pad: 'A'.repeat(1_000_000), event: { type: 'card-moved' } }], ctx('commenter'))
+    expect(d).toEqual({ allow: true, args: ['P', COMMENT] })
+  })
+  it('a malformed or oversized comment is refused', () => {
+    for (const bad of [
+      { ...COMMENT, id: '' },
+      { ...COMMENT, ts: 'now' },
+      { ...COMMENT, author: 'Ada' },
+      { ...COMMENT, author: { name: 'x'.repeat(500), color: '#fff' } },
+      { ...COMMENT, text: 42 },
+      { kind: 'comment' }
+    ]) {
+      expect(decideAccess('req', IPC.boardLogAppend, ['P', bad], ctx('commenter')).allow, JSON.stringify(bad).slice(0, 60)).toBe(false)
+    }
+    const long = decideAccess('req', IPC.boardLogAppend, ['P', { ...COMMENT, text: 'y'.repeat(100_000) }], ctx('commenter'))
+    expect(long.allow && ((long.args?.[1] as { text: string }).text.length)).toBeLessThan(20_000)
+  })
+})
+
+describe('a shared folder that is the home directory or the disk root is not a root (security audit F4)', () => {
+  it('a viewer reads nothing under it, ~/.ssh included', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'authz-home-'))
+    try {
+      fs.mkdirSync(path.join(home, '.ssh'))
+      fs.writeFileSync(path.join(home, '.ssh', 'id_ed25519'), 'PRIVATE KEY')
+      fs.mkdirSync(path.join(home, 'proj'))
+      fs.writeFileSync(path.join(home, 'proj', 'README.md'), 'ok')
+      const rp = (p: string): string | null => {
+        try {
+          return fs.realpathSync(p)
+        } catch {
+          return null
+        }
+      }
+      const at = (cwd: string): AccessContext => ({
+        ...ctx('viewer'), projectCwds: () => [cwd], homeDir: home, hostDataDir: path.join(os.tmpdir(), 'no-data'), realpath: rp
+      })
+      expect(decideAccess('req', IPC.fsRead, [path.join(home, '.ssh', 'id_ed25519')], at(home)).allow).toBe(false)
+      expect(decideAccess('req', IPC.fsRead, [path.join(home, '.ssh', 'id_ed25519')], at(path.dirname(home))).allow).toBe(false)
+      expect(decideAccess('req', IPC.fsRead, ['/etc/hostname'], at('/')).allow).toBe(false)
+      // A project folder below the home directory is a root as before.
+      expect(decideAccess('req', IPC.fsRead, [path.join(home, 'proj', 'README.md')], at(path.join(home, 'proj'))).allow).toBe(true)
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
     }
   })
 })
@@ -485,6 +615,22 @@ describe('narrowResponseForRole', () => {
     expect(narrowResponseForRole(IPC.agentSubagentSnapshot, snapshot, ctx('editor'))).toBe(snapshot)
     const r = { anything: 1 }
     expect(narrowResponseForRole(IPC.fsRead, r, ctx('viewer'))).toBe(r)
+  })
+  // The agent-status snapshot names every node the host's mirror holds, keyed by node, with its
+  // session id and account: a non-editor gets the shared nodes' entries only, as with `agent:status`.
+  const NODE = 'n1'
+  const viewerCtx = ctx('viewer')
+  it('narrowResponseForRole trims agent:status-snapshot to shared nodes', () => {
+    const out = narrowResponseForRole(IPC.agentStatusSnapshot, [{ nodeId: NODE }, { nodeId: 'other' }], viewerCtx)
+    expect(out).toEqual([{ nodeId: NODE }])
+    expect(narrowResponseForRole(IPC.agentStatusSnapshot, [{ nodeId: 'n2', state: 'working' }], ctx('commenter'))).toEqual([])
+    expect(narrowResponseForRole(IPC.agentStatusSnapshot, 'garbage', viewerCtx)).toEqual([])
+    const all = [{ nodeId: NODE }, { nodeId: 'other' }]
+    expect(narrowResponseForRole(IPC.agentStatusSnapshot, all, ctx('editor'))).toBe(all)
+  })
+  it('a viewer and a commenter may call agent:status-snapshot', () => {
+    expect(decideAccess('req', IPC.agentStatusSnapshot, [], ctx('viewer'))).toEqual({ allow: true })
+    expect(decideAccess('req', IPC.agentStatusSnapshot, [], ctx('commenter'))).toEqual({ allow: true })
   })
 })
 
@@ -760,36 +906,38 @@ describe('access policy: a node id held by more than one project (M4)', () => {
 // scrollback snapshots and the unshared inline canvases. The data directory is never readable by a
 // non-editor, whatever shared root holds it.
 describe('access policy: the server data directory is never readable by a non-editor (M7)', () => {
-  const HOST_DATA = "Viewers can't read this server's own data folder."
+  // A share that CONTAINS the data directory (a share of `$HOME`, which is where it lives by default)
+  // used to be served with the data directory jailed out file by file. Since security audit F4 such a
+  // folder is not a root at all (share-root.ts): `~/.ssh` sits beside the data directory, not in it.
   const home = (role: AccessContext['role']): AccessContext => ({
     ...ctx(role),
     projectCwds: () => ['/home/u'],
+    homeDir: '/somewhere/else',
     hostDataDir: '/home/u/.nodeterm-server',
     realpath: (p) => (p === '/home/u/data-link' ? '/home/u/.nodeterm-server' : p.startsWith('/home/u/data-link/') ? '/home/u/.nodeterm-server' + p.slice('/home/u/data-link'.length) : p)
   })
 
-  it('fs reads, lists and existence checks inside it are refused with the reason; the rest of the root is not', () => {
+  it('a share that contains it is not a root: its files, the data dir\'s, and git under it are refused', () => {
     const v = home('viewer')
     for (const m of [IPC.fsRead, IPC.fsReadBinary, IPC.fsExists]) {
-      expect(decideAccess('req', m, ['/home/u/.nodeterm-server/relay/host-key.json'], v), m).toEqual({ allow: false, message: HOST_DATA })
+      expect(decideAccess('req', m, ['/home/u/.nodeterm-server/relay/host-key.json'], v).allow, m).toBe(false)
     }
-    expect(decideAccess('req', IPC.fsList, ['/home/u/.nodeterm-server'], v)).toEqual({ allow: false, message: HOST_DATA })
-    expect(decideAccess('req', IPC.fsRead, ['/home/u/notes.txt'], v)).toEqual({ allow: true })
-    expect(decideAccess('req', IPC.fsList, ['/home/u'], v)).toEqual({ allow: true })
-    // A sibling whose name starts the same is not inside it.
-    expect(decideAccess('req', IPC.fsRead, ['/home/u/.nodeterm-server2/x'], v)).toEqual({ allow: true })
+    expect(decideAccess('req', IPC.fsList, ['/home/u/.nodeterm-server'], v).allow).toBe(false)
+    expect(decideAccess('req', IPC.fsRead, ['/home/u/notes.txt'], v).allow).toBe(false)
+    expect(decideAccess('req', IPC.fsRead, ['/home/u/data-link/team.json'], home('commenter')).allow).toBe(false)
+    expect(decideAccess('req', IPC.gitStatus, ['/home/u/.nodeterm-server'], v).allow).toBe(false)
+    expect(decideAccess('req', IPC.gitDiff, ['/home/u', '.nodeterm-server/relay/team.json', false, true], v).allow).toBe(false)
   })
 
-  it('a symlink inside the shared root that points into it is refused too', () => {
-    expect(decideAccess('req', IPC.fsRead, ['/home/u/data-link/team.json'], home('commenter'))).toEqual({ allow: false, message: HOST_DATA })
-  })
-
-  it('git reads cannot reach it either: a cwd inside it, or a diffed file inside it', () => {
-    const v = home('viewer')
-    expect(decideAccess('req', IPC.gitStatus, ['/home/u/.nodeterm-server'], v)).toEqual({ allow: false, message: HOST_DATA })
-    expect(decideAccess('req', IPC.gitDiff, ['/home/u', '.nodeterm-server/relay/team.json', false, true], v)).toEqual({ allow: false, message: HOST_DATA })
-    expect(decideAccess('req', IPC.gitDiff, ['/home/u', '.nodeterm-server/relay/team.json', false, false], v)).toEqual({ allow: false, message: HOST_DATA })
-    expect(decideAccess('req', IPC.gitDiff, ['/home/u', 'src/a.ts', false, false], v)).toEqual({ allow: true })
+  it('the per-file jail still stands behind it: a symlink from a shared root into the data dir is refused', () => {
+    const c: AccessContext = {
+      ...ctx('viewer'),
+      projectCwds: () => ['/srv/app'],
+      hostDataDir: '/var/lib/nt-data',
+      realpath: (p) => (p.startsWith('/srv/app/data-link') ? '/var/lib/nt-data' + p.slice('/srv/app/data-link'.length) : p)
+    }
+    expect(decideAccess('req', IPC.fsRead, ['/srv/app/data-link/relay/host-key.json'], c).allow).toBe(false)
+    expect(decideAccess('req', IPC.fsRead, ['/srv/app/README.md'], c)).toEqual({ allow: true })
   })
 
   it('a data directory configured through a symlink is compared by its real path', () => {
@@ -799,8 +947,9 @@ describe('access policy: the server data directory is never readable by a non-ed
       hostDataDir: '/srv/nt-link',
       realpath: (p) => (p === '/srv/nt-link' ? '/data/nt' : p)
     }
-    expect(decideAccess('req', IPC.fsRead, ['/data/nt/relay/host-key.json'], c)).toEqual({ allow: false, message: HOST_DATA })
-    expect(decideAccess('req', IPC.fsRead, ['/data/other.txt'], c)).toEqual({ allow: true })
+    // `/data` contains the data dir's REAL path, so it is not a root.
+    expect(decideAccess('req', IPC.fsRead, ['/data/nt/relay/host-key.json'], c).allow).toBe(false)
+    expect(decideAccess('req', IPC.fsRead, ['/data/other.txt'], c).allow).toBe(false)
   })
 
   it('editors are unaffected', () => {

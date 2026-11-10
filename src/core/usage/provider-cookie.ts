@@ -16,7 +16,7 @@
 // still found.
 import { promises as fs } from 'fs'
 import path from 'path'
-import { renameAtomic, tempNameFor } from '../fs-atomic'
+import { renameAtomic, sweepForeignTempFiles, tempNameFor } from '../fs-atomic'
 import { platform } from '../platform'
 
 /** Owner read/write only. The whole reason these are separate files. */
@@ -42,36 +42,6 @@ export async function readProviderCookie(provider: CookieProvider): Promise<stri
     return typeof j.cookie === 'string' && j.cookie.trim() ? j.cookie : null
   } catch {
     return null
-  }
-}
-
-/**
- * Remove temp files no writer in THIS process owns: the legacy fixed `<file>.tmp` (written by
- * builds before per-call names) and any `<file>.<pid>.<seq>[.<uuid>].tmp` whose pid is not ours.
- * Best effort — a failure here must never break a save.
- *
- * Unlike settings.json, an orphan here is a live credential at 0600 that nothing will ever
- * overwrite, so it has to be collected rather than left. Temps bearing our own pid are untouchable:
- * one may belong to a concurrent write sitting between its `writeFile` and its `rename`, and
- * deleting it would recreate the exact race the unique names fixed. A foreign pid can in theory be
- * a second LIVE process on the same data dir; that setup has no lock to begin with, and the worst
- * case is that process's rename failing cleanly (ENOENT, rethrown to its caller) instead of a
- * forgotten cookie sitting on disk forever.
- */
-async function sweepStaleTmp(target: string): Promise<void> {
-  try {
-    const dir = path.dirname(target)
-    const base = path.basename(target)
-    for (const entry of await fs.readdir(dir)) {
-      if (!entry.startsWith(base) || !entry.endsWith('.tmp')) continue
-      const middle = entry.slice(base.length, -'.tmp'.length) // '' or '.<pid>.<seq>[.<uuid>]'
-      const owner = /^\.(\d+)\.\d+(?:\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})?$/.exec(middle)?.[1]
-      if (middle === '' || (owner && owner !== String(process.pid))) {
-        await fs.rm(path.join(dir, entry), { force: true }).catch(() => undefined)
-      }
-    }
-  } catch {
-    // A dir we cannot read is not a reason to fail (or skip) the write below.
   }
 }
 
@@ -102,7 +72,7 @@ const writeChains = new Map<CookieProvider, Promise<unknown>>()
 async function writeCookieNow(provider: CookieProvider, cookie: string): Promise<void> {
   const target = file(provider)
   // Both paths sweep: clearing a cookie that leaves an orphan temp behind has not cleared anything.
-  await sweepStaleTmp(target)
+  await sweepForeignTempFiles(target)
   if (!cookie.trim()) {
     await fs.rm(target, { force: true })
     return

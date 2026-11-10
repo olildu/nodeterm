@@ -131,6 +131,15 @@ directory intentionally, including across PID namespaces where signal-0/`ESRCH` 
 `sweepStaleTempFiles` therefore never auto-deletes any pid-bearing temp; only the exact historical
 ownerless `<file>.tmp` shape can be swept, after a conservative 24-hour grace.
 
+Stores whose orphaned temp would be a live credential (a GitHub token, a provider cookie, the
+phone pairing bearers in `agent.json`) make the opposite trade on purpose, through
+`sweepForeignTempFiles`. A unique name is never written twice, so such an orphan would sit on disk
+at 0600 forever; that sweep removes every temp this process does not own, with no grace, and
+accepts that a second live process's rename can then fail with `ENOENT`. The workspace store uses
+it too, for `workspace.json` and `project.json`. Both sweeps recognize temps through the same
+`atomicTempCandidate`, so a change to `tempNameFor` reaches both. The rule used to be re-typed at
+five call sites, each with its own copy of the temp-name regex.
+
 ## Deletes whose purpose is to stop something
 
 `removeAtomic` retries the same transient Windows codes for `unlink`, and treats only `ENOENT` as

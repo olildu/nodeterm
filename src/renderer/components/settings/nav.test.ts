@@ -2,10 +2,10 @@ import { describe, it, expect } from 'vitest'
 import { SETTINGS_GROUPS, allSectionIds, FIRST_SECTION_ID, visibleSettingsGroups, projectsSettingsGroup } from './nav'
 
 describe('SETTINGS_GROUPS', () => {
-  it('lists exactly 26 sections with no duplicates', () => {
+  it('lists exactly 27 sections with no duplicates', () => {
     const ids = allSectionIds()
-    expect(ids).toHaveLength(26)
-    expect(new Set(ids).size).toBe(26)
+    expect(ids).toHaveLength(27)
+    expect(new Set(ids).size).toBe(27)
   })
   it('starts at a section that exists in the groups', () => {
     expect(allSectionIds()).toContain(FIRST_SECTION_ID)
@@ -13,10 +13,18 @@ describe('SETTINGS_GROUPS', () => {
   it('hides mac-only sections off macOS, keeps them on', () => {
     const off = visibleSettingsGroups(false).flatMap((g) => g.sections.map((s) => s.id))
     expect(off).not.toContain('notch')
-    expect(off).toHaveLength(25)
-    expect(visibleSettingsGroups(true)).toEqual(SETTINGS_GROUPS)
+    expect(off).toHaveLength(25) // notch and the browser-only sign-in are both out
+    expect(visibleSettingsGroups(true, true)).toEqual(SETTINGS_GROUPS)
     // No group is left empty by the filter.
     expect(visibleSettingsGroups(false).every((g) => g.sections.length > 0)).toBe(true)
+  })
+  it('shows the Sign-in section only in a browser tab (the Server Edition)', () => {
+    const ids = (isMac: boolean, isBrowser: boolean): string[] =>
+      visibleSettingsGroups(isMac, isBrowser).flatMap((g) => g.sections.map((s) => s.id))
+    expect(ids(true, false)).not.toContain('sign-in')
+    expect(ids(false, false)).not.toContain('sign-in')
+    expect(ids(false, true)).toContain('sign-in')
+    expect(ids(true, true)).toContain('sign-in')
   })
 })
 

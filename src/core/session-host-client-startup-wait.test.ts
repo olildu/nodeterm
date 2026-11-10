@@ -27,6 +27,13 @@ const emptyLock = (): never => {
 
 const tempDir = (): string => testTmpDir('nt-host-wait-')
 
+// The client's poll pause, injected so the 45- and 35-poll waits below cost no wall-clock: on the
+// real 150 ms timer this file took 12 s on CI. Only the pause is replaced, not
+// the loop, so the attempt counts these tests pin are exactly what production runs.
+const connectPollSleep = vi.fn(async (_ms: number) => {})
+const newClient = (): SessionHostClient =>
+  new SessionHostClient({ userDataDir: tempDir(), connectPollSleep })
+
 beforeEach(() => {
   vi.clearAllMocks()
   launcherMocks.resolveSessionHostScript.mockReturnValue('fake-session-host.cjs')
@@ -41,12 +48,11 @@ describe('SessionHostClient waits for a host that is still starting', () => {
       identityMocks.readExistingSessionHostIdentity.mock.calls.length < 45 ? 'starting' : 'other'
     )
 
-    await expect(new SessionHostClient({ userDataDir: tempDir() }).listSessions()).rejects.toThrow(
-      'file is empty'
-    )
+    await expect(newClient().listSessions()).rejects.toThrow('file is empty')
     // Proof it did not stop at 30: the ordinary budget would have given up long before this.
     expect(identityMocks.readExistingSessionHostIdentity.mock.calls.length).toBeGreaterThan(40)
-  }, 30_000)
+    expect(connectPollSleep.mock.calls.filter(([ms]) => ms === 150).length).toBeGreaterThan(30)
+  })
 
   it('does not spawn a second host while one is starting', async () => {
     identityMocks.readExistingSessionHostIdentity.mockImplementation(emptyLock)
@@ -54,22 +60,19 @@ describe('SessionHostClient waits for a host that is still starting', () => {
       identityMocks.readExistingSessionHostIdentity.mock.calls.length < 35 ? 'starting' : 'other'
     )
 
-    await expect(
-      new SessionHostClient({ userDataDir: tempDir() }).listSessions()
-    ).rejects.toThrow()
+    await expect(newClient().listSessions()).rejects.toThrow()
     expect(launcherMocks.spawnSessionHost).not.toHaveBeenCalled()
-  }, 30_000)
+  })
 
   it('fails fast, exactly as before, when nothing is starting', async () => {
     identityMocks.readExistingSessionHostIdentity.mockImplementation(emptyLock)
     identityMocks.startupLockState.mockReturnValue('other')
 
-    await expect(new SessionHostClient({ userDataDir: tempDir() }).listSessions()).rejects.toThrow(
-      'file is empty'
-    )
+    await expect(newClient().listSessions()).rejects.toThrow('file is empty')
     // Unchanged behaviour: an empty lock nobody is heartbeating is an integrity failure, reported
     // after the small pre-launch batch — no host is launched and nothing waits on it.
     expect(identityMocks.readExistingSessionHostIdentity.mock.calls.length).toBeLessThanOrEqual(6)
     expect(launcherMocks.spawnSessionHost).not.toHaveBeenCalled()
-  }, 30_000)
+    expect(connectPollSleep).not.toHaveBeenCalledWith(150)
+  })
 })

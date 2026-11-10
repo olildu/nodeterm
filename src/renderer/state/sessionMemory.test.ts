@@ -153,3 +153,29 @@ describe('failure semantics', () => {
     expect(useSessionMemory.getState().loading).toBe(false)
   })
 })
+
+describe('"nodeterm itself" group', () => {
+  const APP = { ok: true, groups: [{ kind: 'gpu', count: 1, mb: 1600 }], totalMb: 1600 }
+
+  it('carries the group from an answered sweep, and drops it when the sweep failed or the scope changed', async () => {
+    read.mockResolvedValueOnce({ ok: true, rows: [], mem: null, app: APP })
+    await useSessionMemory.getState().refreshFull('', 'p1')
+    expect(useSessionMemory.getState().app).toEqual(APP)
+    // ok:false: nothing from that report is adopted, the group included.
+    read.mockResolvedValueOnce({ ok: false, rows: [], mem: null, app: APP })
+    await useSessionMemory.getState().refreshFull('', 'p1')
+    expect(useSessionMemory.getState().app).toBeUndefined()
+    read.mockResolvedValueOnce({ ok: true, rows: [], mem: null, app: APP })
+    await useSessionMemory.getState().refreshFull('', 'p1')
+    // Leaving this machine for an SSH host must not keep this machine's processes on screen.
+    useSessionMemory.getState().startHostPoll('user@host', 'ssh1')
+    expect(useSessionMemory.getState().app).toBeUndefined()
+  })
+
+  it('a rejected call clears it too', async () => {
+    useSessionMemory.setState({ app: APP as never })
+    read.mockRejectedValueOnce(new Error('bridge down'))
+    await useSessionMemory.getState().refreshFull('', 'p1')
+    expect(useSessionMemory.getState().app).toBeUndefined()
+  })
+})

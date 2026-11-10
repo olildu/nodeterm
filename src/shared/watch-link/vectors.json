@@ -36,7 +36,7 @@
       "hex": "010002733168656c6c6f"
     },
     {
-      "sessionId": "sess-é",
+      "sessionId": "sess-\u00e9",
       "data": "a\u001b[31mb",
       "hex": "010007736573732dc3a9611b5b33316d62"
     }
@@ -55,6 +55,19 @@
       "clientNonceHex": "00000000000000000000000000000000",
       "info": "nodeterm-relay-session-v2",
       "sessionKeyHex": "b981020481a96beea9f8d84ad0821080833f37f1b8dd46bbbad8eb9350ac2543"
+    }
+  ],
+  "unlockSeals": [
+    {
+      "hostSecretHex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+      "hostPublicB64": "B6N8vBQgk8i3VdwbEOhstCY3StFqqFPtC9/AsrhtHHw=",
+      "sealed": {
+        "key": "Pry2khSTRNxU5YFgz5C+2e6h3RToHI6R3lV699ev2RU=",
+        "nonce": "AAcOFRwjKjE4P0ZNVFtiaXB3foWMk5qh",
+        "box": "hjkePn1uutxgyUjg/Z9NkwrtBYrnFHizAtqhlZFy7p/89pgiQC5HOWorQLFSz+QCRzgeRYPz5U7yyp8gbd9H2/4hggDN097+2YfGiWQ="
+      },
+      "name": "Ay\u015fe \ud83d\udc69\u200d\ud83d\udcbb",
+      "password": "tr0ub4dor & \u201c3\u201d"
     }
   ]
 }

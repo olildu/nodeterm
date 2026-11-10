@@ -28,8 +28,11 @@ import {
   remoteTmuxKillEverySocketArgs,
   hookForwardArgs,
   hookForwardCancelArgs,
+  hookTcpForwardArgs,
+  hookTcpForwardCancelArgs,
   remoteHookEnvArgs,
   remoteEndpointFileContents,
+  remoteTcpEndpointFileContents,
   scpArgs,
   scpDownArgs,
   remoteScpPath
@@ -187,14 +190,14 @@ describe('remoteTmuxPasteArgs', () => {
       ...childPrefix,
       'deploy@h.example.com',
       `${TP}${TMUX} load-buffer -b ${BUF} - ';' ` +
-        `if-shell -F -t nt-x '#{pane_in_mode}' 'send-keys -t nt-x -X cancel' ';' ` +
-        `paste-buffer -d -p -r -b ${BUF} -t nt-x ';' send-keys -t nt-x Enter`
+        `if-shell -F -t '=nt-x:' '#{pane_in_mode}' 'send-keys -t =nt-x: -X cancel' ';' ` +
+        `paste-buffer -d -p -r -b ${BUF} -t '=nt-x:' ';' send-keys -t '=nt-x:' Enter`
     ])
   })
 
   it('omits the Enter for a dictation insert (enter:false)', () => {
-    expect(cmd('nt-x', false)).not.toContain('send-keys -t nt-x Enter')
-    expect(cmd('nt-x', false).endsWith(`paste-buffer -d -p -r -b ${BUF} -t nt-x`)).toBe(true)
+    expect(cmd('nt-x', false)).not.toContain('Enter')
+    expect(cmd('nt-x', false).endsWith(`paste-buffer -d -p -r -b ${BUF} -t '=nt-x:'`)).toBe(true)
   })
 
   // The rule this PR is here to enforce: the payload is not on the command line at all, so there
@@ -202,7 +205,7 @@ describe('remoteTmuxPasteArgs', () => {
   it('carries NO payload — the text reaches the remote tmux over stdin', () => {
     const line = cmd('nt-x', true)
     expect(line).toContain(`load-buffer -b ${BUF} -`)
-    expect(line).not.toContain('send-keys -t nt-x -l')
+    expect(line).not.toContain(' -l')
     expect(line).not.toContain('set-buffer')
   })
 
@@ -226,7 +229,7 @@ describe('remoteTmuxPasteArgs', () => {
   // as one tmux argument. Both are single-quoted, and `control-master.realsh.test.ts`'s sibling
   // (`tmux-paste.realtmux.test.ts`) runs this very line through a real sh into a real tmux.
   it('quotes the format and the inner command so the remote shell passes them through', () => {
-    expect(cmd('nt-x', true)).toContain(`if-shell -F -t nt-x '#{pane_in_mode}' 'send-keys -t nt-x -X cancel'`)
+    expect(cmd('nt-x', true)).toContain(`if-shell -F -t '=nt-x:' '#{pane_in_mode}' 'send-keys -t =nt-x: -X cancel'`)
   })
 
   it('refuses a session id this app did not generate — it is spliced unquoted', () => {
@@ -247,7 +250,7 @@ describe('remoteTmuxEnterArgs', () => {
     expect(remoteTmuxEnterArgs(conn, '/s.sock', 'nt-x')).toEqual([
       ...childPrefix,
       'deploy@h.example.com',
-      `${TP}tmux -L ${RMT_TMUX_SOCKET} send-keys -t nt-x Enter`
+      `${TP}tmux -L ${RMT_TMUX_SOCKET} send-keys -t '=nt-x:' Enter`
     ])
   })
 })
@@ -255,11 +258,11 @@ describe('remoteTmuxEnterArgs', () => {
 describe('remoteCapturePaneArgs', () => {
   it('captures the whole scrollback (-S -) when full', () => {
     const args = remoteCapturePaneArgs(conn, '/s.sock', 'nt-x', true)
-    expect(args[args.length - 1]).toBe(`${TP}tmux -L ${RMT_TMUX_SOCKET} capture-pane -p -e -t nt-x -S -`)
+    expect(args[args.length - 1]).toBe(`${TP}tmux -L ${RMT_TMUX_SOCKET} capture-pane -p -e -t '=nt-x:' -S -`)
   })
   it('captures the recent ~200 lines (-S -200) when not full', () => {
     const args = remoteCapturePaneArgs(conn, '/s.sock', 'nt-x', false)
-    expect(args[args.length - 1]).toBe(`${TP}tmux -L ${RMT_TMUX_SOCKET} capture-pane -p -e -t nt-x -S -200`)
+    expect(args[args.length - 1]).toBe(`${TP}tmux -L ${RMT_TMUX_SOCKET} capture-pane -p -e -t '=nt-x:' -S -200`)
   })
 })
 
@@ -313,7 +316,7 @@ describe('remotePaneCommandArgs', () => {
   it('asks the remote tmux for the pane_current_command of the session', () => {
     const args = remotePaneCommandArgs(conn, '/s.sock', 'nt-x')
     expect(args[args.length - 1]).toBe(
-      `${TP}tmux -L ${RMT_TMUX_SOCKET} display-message -p -t nt-x '#{pane_current_command}'`
+      `${TP}tmux -L ${RMT_TMUX_SOCKET} display-message -p -t '=nt-x:' '#{pane_current_command}'`
     )
   })
 })
@@ -322,7 +325,7 @@ describe('remotePaneCwdArgs', () => {
   it('asks the remote tmux for the pane_current_path of the session', () => {
     const args = remotePaneCwdArgs(conn, '/s.sock', 'nt-x')
     expect(args[args.length - 1]).toBe(
-      `${TP}tmux -L ${RMT_TMUX_SOCKET} display-message -p -t nt-x '#{pane_current_path}'`
+      `${TP}tmux -L ${RMT_TMUX_SOCKET} display-message -p -t '=nt-x:' '#{pane_current_path}'`
     )
   })
 })
@@ -331,7 +334,7 @@ describe('remote foreground process termination', () => {
   it('reads pane pid + command through the existing ControlMaster', () => {
     const args = remotePaneProcessArgs(conn, '/s.sock', 'nt-x')
     expect(args[args.length - 1]).toBe(
-      `${TP}tmux -L ${RMT_TMUX_SOCKET} display-message -p -t nt-x '#{pane_pid}|#{pane_current_command}'`
+      `${TP}tmux -L ${RMT_TMUX_SOCKET} display-message -p -t '=nt-x:' '#{pane_pid}|#{pane_current_command}'`
     )
   })
 
@@ -493,6 +496,25 @@ describe('hook forwarding', () => {
     expect(body).toContain("NODETERM_HOOK_SOCK='/home/u/App Support/hook.sock'\n")
     expect(body).toContain("NODETERM_NODE_TOKEN_DIR='/home/u/App Support/node-tokens'\n")
   })
+  it('hookTcpForwardArgs binds the host side to loopback only, and its cancel mirrors it', () => {
+    expect(hookTcpForwardArgs(conn, '/s.sock', 45001, 51234)).toEqual([
+      '-O', 'forward', '-R', '127.0.0.1:45001:127.0.0.1:51234',
+      '-o', 'ControlPath=/s.sock', '-p', '2222', 'deploy@h.example.com'
+    ])
+    const cancel = hookTcpForwardCancelArgs(conn, '/s.sock', 45001, 51234)
+    expect(cancel.slice(0, 4)).toEqual(['-O', 'cancel', '-R', '127.0.0.1:45001:127.0.0.1:51234'])
+  })
+  it('hookTcpForwardArgs refuses a non-port value instead of building an ssh argument from it', () => {
+    expect(() => hookTcpForwardArgs(conn, '/s.sock', 0, 51234)).toThrow()
+    expect(() => hookTcpForwardArgs(conn, '/s.sock', 70000, 51234)).toThrow()
+    expect(() => hookTcpForwardArgs(conn, '/s.sock', 1.5, 51234)).toThrow()
+  })
+  it('remoteTcpEndpointFileContents advertises the port and empties the socket', () => {
+    expect(remoteTcpEndpointFileContents(45001, 'tok', '2', '/home/u/.nodeterm/node-tokens')).toBe(
+      "NODETERM_HOOK_SOCK=''\nNODETERM_HOOK_PORT='45001'\nNODETERM_HOOK_TOKEN='tok'\nNODETERM_HOOK_VERSION='2'\n" +
+        "NODETERM_NODE_TOKEN_DIR='/home/u/.nodeterm/node-tokens'\n"
+    )
+  })
 })
 
 describe('scpArgs', () => {
@@ -597,7 +619,7 @@ describe('killing a session by name (both sockets, exact target)', () => {
     expect(localTmuxKillArgs('node-terminal', 'nt-a-1')).toEqual([
       '-L', 'node-terminal', 'kill-session', '-t', '=nt-a-1'
     ])
-    expect(remoteTmuxKillArgs(conn, '/s.sock', 'nt-a-1').at(-1)).toContain('-t =nt-a-1')
+    expect(remoteTmuxKillArgs(conn, '/s.sock', 'nt-a-1').at(-1)).toContain("-t '=nt-a-1'")
   })
 
   it('aims a local destroy at the socket we hold, whatever the caller asked for', () => {
@@ -617,10 +639,10 @@ describe('killing a session by name (both sockets, exact target)', () => {
 
   it('keeps the remote default on the ssh socket, and overrides it explicitly', () => {
     expect(remoteTmuxKillArgs(conn, '/s.sock', 'nt-x').at(-1)).toBe(
-      `${TP}tmux -L ${RMT_TMUX_SOCKET} kill-session -t =nt-x`
+      `${TP}tmux -L ${RMT_TMUX_SOCKET} kill-session -t '=nt-x'`
     )
     expect(remoteTmuxKillArgs(conn, '/s.sock', 'nt-x', 'node-terminal').at(-1)).toBe(
-      `${TP}tmux -L node-terminal kill-session -t =nt-x`
+      `${TP}tmux -L node-terminal kill-session -t '=nt-x'`
     )
   })
 
@@ -628,8 +650,8 @@ describe('killing a session by name (both sockets, exact target)', () => {
     const runs = remoteTmuxKillEverySocketArgs(conn, '/s.sock', 'nt-x')
     expect(runs).toHaveLength(2)
     expect(runs.map((r) => r.at(-1)).sort()).toEqual([
-      `${TP}tmux -L node-terminal kill-session -t =nt-x`,
-      `${TP}tmux -L ${RMT_TMUX_SOCKET} kill-session -t =nt-x`
+      `${TP}tmux -L node-terminal kill-session -t '=nt-x'`,
+      `${TP}tmux -L ${RMT_TMUX_SOCKET} kill-session -t '=nt-x'`
     ])
     // Each is a complete child-ssh argv, not a bare command.
     for (const r of runs) expect(r.slice(0, childPrefix.length)).toEqual(childPrefix)

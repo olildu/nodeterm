@@ -59,6 +59,27 @@ for v1: a low ceiling OOM-kills a long-context session, which is worse than the 
 **Do not re-derive these numbers.** They are here so the next person does not spend an afternoon on
 `/proc` arithmetic to reach the same conclusion.
 
+**Power users: capping a node-based agent's heap.** nodeterm still ships no cap and must not grow a
+`NODE_OPTIONS` default. A user who wants one can set `NODE_OPTIONS=--max-old-space-size=2048` in a
+**custom agent's env** (Settings → Agents); project env cannot, because `NODE_OPTIONS` is a reserved
+spawn key (a code-execution guard). Three caveats belong with that advice: a session that outgrows
+the cap is OOM-killed (the pane and `--resume` recover the conversation, not the turn); it only
+affects npm-installed **node** CLIs (`claude.cmd`, gemini) — the native `claude.exe` is a Bun
+binary and codex is Rust, so there it does nothing (`where claude` says which one a Windows user
+runs); and it is a per-machine choice, never a project one.
+
+**Attached sessions are never reaped, by design.** The reaper (`session-budget.ts`) only ends
+DETACHED sessions; anything mounted on a canvas is watched and untouchable, on tmux and on the
+Windows session host alike. The levers for live sessions are offscreen release (which detaches the
+viewer, so the grace window / count cap can apply), Eco, Pause, and the panel's `×`. Heavy users can
+shorten the grace with `NODETERM_SESSION_GRACE_HOURS` (fractional values are honoured; see below).
+
+**Windows: the session host's own cost is shown, not hidden.** On Windows the panel adds a
+non-killable `nodeterm session host (N consoles)` line — the host process (headless emulators,
+node-pty's per-session conout worker thread) plus its conhost/OpenConsole children, which no
+session row can reach. It is a measured working set, added to the total only when measured. See
+docs/windows-session-host.md ("Observability", "Pane probes").
+
 ### A fractional `NODETERM_SESSION_*` value must not disarm the guard
 
 Found while running the live reaper experiment with `NODETERM_SESSION_GRACE_HOURS=1`.
@@ -239,6 +260,50 @@ machine read **23.9 / 24.0 GB**.
 
 The test fixture remains composed from Apple's documented format; what is verified is the FORMULA
 against a real machine, not that fixture's specific numbers.
+
+### Swap and kernel pressure in the pill (display only)
+
+Added 2026-10-19, from a performance measurement on a Mac. The pill said 86% "warn" while 8.5 GB
+were swapped and the kernel sat at pressure level 2, and nothing on screen said either.
+
+- **Where.** `MemInfo.display` — `swapUsedMb`, `swapTotalMb`, `pressureLevel`. darwin reads
+  `sysctl vm.swapusage` (`total = 9216.00M  used = 7853.62M  free = 1362.38M  (encrypted)`, parsed by
+  `parseSwapUsage`; K/M/G only) and `kern.memorystatus_vm_pressure_level` (`parsePressureLevel`:
+  1 normal, 2 warn, 4 critical, anything else omitted). Both come from ONE `/usr/sbin/sysctl` run
+  in `darwinMemInfo` (one more synchronous process per 30 s pill read, beside `vm_stat`); each field
+  is still optional on its own — an oid with no line omits that field, and a failed run leaves the
+  `vm_stat` reading untouched. Linux
+  copies its swap from the `/proc/meminfo` text already parsed. Linux has no kernel level; PSI is
+  not mapped to one because no threshold has been measured.
+- **Why a sub-object.** `hostUnderMemoryPressure` reads `swapTotalMb`/`swapFreeMb`. Filling those on
+  darwin would turn a Mac that keeps most of its swap in use (16% free on the measured one) into permanent "pressure" for the
+  reaper. The pill reads only `display`; nothing else does.
+- **The tint.** `max(used-% threshold, kernel level)`: the level can raise the colour, never lower it.
+- **No fake zero.** No `display` → no swap text. A measured 0 used is stated in the title only.
+- **Owed.** Pill vs `sysctl vm.swapusage` and Activity Monitor's pressure colour over a day.
+
+### "nodeterm itself" in the panel
+
+From the same measurement. The GPU helper's real footprint was 1557-1845 MB (window swap chain,
+raster tiles, terminal WebGL buffers, driver memory) while `ps` rss said 96-153 MB; the pill counted
+it in the host total, but the panel never attributed it.
+
+- **Data.** The desktop shell injects `appProcesses` (`app.getAppMetrics()` → pid, type,
+  `cumulativeCPUUsage`). Memory is looked up per pid in the sweep's own process table, so the group
+  uses the rows' accounting with no second `top`: footprint on darwin (only for pids `top` covered,
+  `ProcEntry.footprint`), VmRSS on Linux, working set on Windows. `getAppMetrics().memory` is not
+  used: on macOS `workingSetSize` is resident size and `privateBytes` is Windows-only.
+- **Groups.** Browser → main, Tab → renderer (the HUD is a second one), GPU → gpu, everything else
+  → helpers. A group with an unmeasured pid has no MB; the group total exists only when every group
+  has one.
+- **States.** Absent = this surface cannot enumerate its processes (Server Edition, SSH, relay):
+  nothing drawn. `ok:false` = it tried and could not: "Could not measure nodeterm's own processes."
+  Never in the header total, never a row, local scope only.
+- **CPU** is lifetime CPU time per group, not a percentage (`percentCPUUsage` returns 0 on its
+  first call, and the sweep takes one sample).
+- **Owed.** Panel GPU figure within 5% of `footprint <gpu pid>` and not equal to `ps rss`, on a
+  real build. The Linux (VmRSS) and Windows (working set) legs are unit-tested only; neither has
+  been checked on a real machine.
 
 ## 6. The SSH leg
 
@@ -491,6 +556,13 @@ macOS (the ps path never runs on Linux)
     AM's 19.00 GB of parts on a 24 GB machine (was 23.9/24.0 before the fix). Still open on
     macOS: give the memory-PRESSURE monitor a real signal (`kern.memorystatus_vm_pressure_level`)
     rather than a byte watermark — the same capture showed 82% used with AM's pressure graph GREEN.
+    **Code DONE 2026-10-19** — a separate darwin kernel-level leg in `core/memory-pressure.ts`
+    (`onKernelPressure`): renderer levers on escalations into warn/critical only, never on a held
+    level, at most once per `KERNEL_LEVER_GAP_MS` (10 min) at the same or a lower severity so a
+    flapping level does not re-run them, never through `hostMemReader`, no reaper sweep on kernel
+    CRITICAL yet (#211). Owed: a
+    firing log under induced pressure on a dev build (`memory_pressure -S -l warn`), plus the GPU
+    process `footprint` / IOSurface count before and 60 s after the lever run.
     RE-VERIFIED independently 2026-08-12 (second session, shipping function imported via esbuild
     bundle, vm_stat captured on the same tick as an AM screenshot): ours 18.87 GB used vs AM's
     parts 7.23 + 2.99 + 8.66 = 18.88 GB — 0.05% off; AM's HEADLINE "Memory Used" was 19.70 GB,

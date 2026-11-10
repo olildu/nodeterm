@@ -66,6 +66,7 @@ export type CommandId =
   | 'canvas.fitAll'
   | 'canvas.tidy'
   | 'canvas.tidyLineage'
+  | 'canvas.toggleLock'
   | 'canvas.groupSelection'
   | 'node.newTerminal'
   | 'node.newAgent'
@@ -79,21 +80,31 @@ export type CommandId =
   | 'node.newAgent.grok'
   | 'node.newAgent.copilot'
   | 'node.newAgent.antigravity'
+  | 'node.newAgent.cursor'
   | 'node.newSticky'
   | 'node.newBrowser'
   | 'node.newWebView'
   | 'node.newDino'
   | 'node.newSimulator'
+  | 'node.newWhiteboard'
   | 'node.newFile'
   | 'node.focusLeft'
   | 'node.focusRight'
   | 'node.focusUp'
   | 'node.focusDown'
+  | 'node.nextNeedingYou'
   | 'node.maximize'
   | 'node.zoneLeft'
   | 'node.zoneRight'
   | 'node.zoneUp'
   | 'node.zoneDown'
+  | 'node.zoneLeftThird'
+  | 'node.zoneCenterThird'
+  | 'node.zoneRightThird'
+  | 'node.zoneTopLeft'
+  | 'node.zoneTopRight'
+  | 'node.zoneBottomLeft'
+  | 'node.zoneBottomRight'
   | 'node.close'
   | 'node.toggleMarkdown'
   | 'board.openCard'
@@ -170,6 +181,10 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     defaultBindings: both() },
   { id: 'canvas.groupSelection', title: 'Group selection', group: 'Canvas', scope: 'canvas',
     defaultBindings: both() },
+  { id: 'canvas.toggleLock', title: 'Toggle canvas lock', group: 'Canvas', scope: 'canvas',
+    // Ships unbound (issue #1130): the obvious chord, Cmd+Shift+L, is the sessions sidebar's.
+    // Not allowInTerminal — a focused terminal keeps the chord, like every canvas command.
+    defaultBindings: both() },
 
   // Nodes
   { id: 'node.newTerminal', title: 'New terminal node', group: 'Nodes', scope: 'canvas',
@@ -196,6 +211,8 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     scope: 'canvas', defaultBindings: both() },
   { id: 'node.newAgent.antigravity', title: `New ${AGENT_CONFIG.antigravity.label} node`,
     group: 'Nodes', scope: 'canvas', defaultBindings: both() },
+  { id: 'node.newAgent.cursor', title: `New ${AGENT_CONFIG.cursor.label} node`, group: 'Nodes',
+    scope: 'canvas', defaultBindings: both() },
   { id: 'node.newSticky', title: 'New sticky note', group: 'Nodes', scope: 'canvas',
     defaultBindings: both() },
   { id: 'node.newBrowser', title: 'New browser node', group: 'Nodes', scope: 'canvas',
@@ -204,7 +221,9 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     defaultBindings: both() },
   { id: 'node.newDino', title: 'New dino node', group: 'Nodes', scope: 'canvas',
     defaultBindings: both() },
-  { id: 'node.newSimulator', title: 'New simulator node', group: 'Nodes', scope: 'canvas',
+  { id: 'node.newSimulator', title: 'New agent-drivable simulator node', group: 'Nodes', scope: 'canvas',
+    defaultBindings: both() },
+  { id: 'node.newWhiteboard', title: 'New whiteboard', group: 'Nodes', scope: 'canvas',
     defaultBindings: both() },
   { id: 'node.newFile', title: 'New file…', group: 'Nodes', scope: 'canvas',
     defaultBindings: both() },
@@ -232,6 +251,13 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
   { id: 'node.focusDown', title: 'Focus node below', group: 'Nodes', scope: 'canvas',
     defaultBindings: { darwin: ['Cmd+ArrowDown'], other: ['Ctrl+Shift+ArrowDown'] },
     allowInTerminal: true },
+  // Travel to the agent that has waited longest for you (waiting/blocked), across projects; each
+  // press steps to the next one, without going through the sidebar. Ships UNBOUND — every obvious chord already has an owner, and a default
+  // would steal it from a user who never asked. Scope 'canvas' + allowInTerminal for the
+  // node.focus* reason: the hand that wants to move is in a terminal, and over the kanban board
+  // there is no canvas to land on. The queue is built on demand per press (lib/nextNeedingYou).
+  { id: 'node.nextNeedingYou', title: 'Go to next agent needing you', group: 'Nodes',
+    scope: 'canvas', defaultBindings: both(), allowInTerminal: true },
   // The header maximize toggle's chord (issue #399): fill the viewport with the node under the
   // keyboard (else the single selected node), or restore it. allowInTerminal for focus-mode's
   // reason — the hand that wants more rows is already typing in the terminal being enlarged.
@@ -244,7 +270,6 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
   // default is Ctrl+Alt (literal Control, not Cmd). Off-mac the halves ship UNBOUND: Ctrl+Alt+Arrow
   // would trip the speech.dictation hold chord there ('Cmd+Alt' resolves to Ctrl+Alt held — the
   // exact trap the node.focus* comment documents), and Ctrl+Shift+Arrow is those focus commands.
-  // Quarters and thirds have no commands — the node context menu's "Snap to zone" carries them.
   { id: 'node.zoneLeft', title: 'Snap node to left half', group: 'Nodes', scope: 'canvas',
     defaultBindings: { darwin: ['Ctrl+Alt+ArrowLeft'], other: [] }, allowInTerminal: true },
   { id: 'node.zoneRight', title: 'Snap node to right half', group: 'Nodes', scope: 'canvas',
@@ -253,6 +278,24 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     defaultBindings: { darwin: ['Ctrl+Alt+ArrowUp'], other: [] }, allowInTerminal: true },
   { id: 'node.zoneDown', title: 'Snap node to bottom half', group: 'Nodes', scope: 'canvas',
     defaultBindings: { darwin: ['Ctrl+Alt+ArrowDown'], other: [] }, allowInTerminal: true },
+  // Thirds and quarters (issue #1169): the rest of the zone list, same rules as the halves, but
+  // shipped UNBOUND on every platform. There is no free chord family left for seven more zones
+  // (Ctrl+Alt+Arrow is the halves', Ctrl+Shift+Arrow and Cmd+Arrow are focus), and a default here
+  // would steal a key from somebody's shell via allowInTerminal. The user binds the ones they use.
+  { id: 'node.zoneLeftThird', title: 'Snap node to left third', group: 'Nodes', scope: 'canvas',
+    defaultBindings: both(), allowInTerminal: true },
+  { id: 'node.zoneCenterThird', title: 'Snap node to center third', group: 'Nodes', scope: 'canvas',
+    defaultBindings: both(), allowInTerminal: true },
+  { id: 'node.zoneRightThird', title: 'Snap node to right third', group: 'Nodes', scope: 'canvas',
+    defaultBindings: both(), allowInTerminal: true },
+  { id: 'node.zoneTopLeft', title: 'Snap node to top left quarter', group: 'Nodes', scope: 'canvas',
+    defaultBindings: both(), allowInTerminal: true },
+  { id: 'node.zoneTopRight', title: 'Snap node to top right quarter', group: 'Nodes', scope: 'canvas',
+    defaultBindings: both(), allowInTerminal: true },
+  { id: 'node.zoneBottomLeft', title: 'Snap node to bottom left quarter', group: 'Nodes', scope: 'canvas',
+    defaultBindings: both(), allowInTerminal: true },
+  { id: 'node.zoneBottomRight', title: 'Snap node to bottom right quarter', group: 'Nodes', scope: 'canvas',
+    defaultBindings: both(), allowInTerminal: true },
   // Main-process intercepted today (unconditional): keep firing everywhere.
   { id: 'node.close', title: 'Close node / window', group: 'Nodes', scope: 'app',
     defaultBindings: both('Cmd+W'), allowInTerminal: true, allowWhileTyping: true },

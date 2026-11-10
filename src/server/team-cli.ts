@@ -20,6 +20,7 @@ import {
 } from '../core/relay/team-admin'
 import { POP_REFUSED_MESSAGE } from '../core/relay/relay-pop'
 import { parseResumeSessions } from '../shared/share-team'
+import { SAS_COMPARE_HINT } from '../shared/remote/sas'
 
 // One rule for what never reaches the admin's terminal: the same characters a label may not
 // contain (C0/C1 controls, DEL, and the text-direction controls). Server-supplied strings can carry
@@ -294,6 +295,7 @@ export function describeStatus(result: AdminStatusResult): string[] {
   if (pending.length > 0) {
     lines.push(`${plural(pending.length, 'join request')} waiting for an owner (approve from an owner's desktop):`)
     for (const p of pending) lines.push(`  code ${str(p.sas, '?')}`)
+    lines.push(`  ${SAS_COMPARE_HINT}`)
   }
   return lines
 }

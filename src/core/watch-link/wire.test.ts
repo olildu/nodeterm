@@ -134,9 +134,11 @@ describe('protocol', () => {
     // A ZWJ is not a bidi control: an emoji sequence survives.
     expect(sanitizeChatText('hi \u{1F469}\u200D\u{1F4BB}')).toBe('hi \u{1F469}\u200D\u{1F4BB}')
   })
-  it("the chat bidi set is exactly @shared/presence's (restated: this directory imports nothing outside)", () => {
+  it("chat strips every @shared/presence bidi control (restated: this directory imports nothing outside), and from text exactly the invisible format characters but the two joiners", () => {
     // Over the whole BMP, outside the controls and the whitespace the sanitizer handles anyway: a
-    // character is stripped from chat if and only if presence calls it a bidi control.
+    // character is stripped from chat TEXT if and only if it is a format character (Cf) other than
+    // ZWNJ / ZWJ — and every one presence calls a bidi control is among them.
+    const cf = /^\p{Cf}$/u
     let checked = 0
     for (let cp = 0; cp <= 0xffff; cp++) {
       if (cp >= 0xd800 && cp <= 0xdfff) continue
@@ -145,11 +147,36 @@ describe('protocol', () => {
       if (/\s/.test(ch)) continue
       BIDI_CONTROL_CHARS.lastIndex = 0
       const bidi = BIDI_CONTROL_CHARS.test(ch)
+      const invisible = cf.test(ch) && cp !== 0x200c && cp !== 0x200d
       const stripped = sanitizeChatText(`a${ch}b`) === 'ab'
-      if (stripped !== bidi) expect.fail(`U+${cp.toString(16)}: presence bidi=${bidi}, stripped from chat=${stripped}`)
+      if (bidi && !stripped) expect.fail(`U+${cp.toString(16)}: a presence bidi control kept in chat`)
+      if (stripped !== invisible) expect.fail(`U+${cp.toString(16)}: invisible=${invisible}, stripped from chat=${stripped}`)
+      if (bidi && sanitizeChatName(`a${ch}b`) !== 'ab') expect.fail(`U+${cp.toString(16)}: a presence bidi control kept in a name`)
       checked++
     }
     expect(checked).toBeGreaterThan(60_000)
+  })
+  it('a NAME keeps no invisible character: every format character, and the blank letters, go', () => {
+    // Finding L4: "Sharer" and "Sharer" + an invisible character were two names drawn alike.
+    for (const ch of ['\u200b', '\u200c', '\u200d', '\u2060', '\u00ad', '\ufeff', '\u034f', '\u115f', '\u1160', '\u2800', '\u3164', '\uffa0', '\u{e0041}', '\u{e007f}']) {
+      expect(sanitizeChatName(`Sha${ch}rer${ch}`)).toBe('Sharer')
+    }
+    // Over the whole BMP: a name loses every format character.
+    for (let cp = 0; cp <= 0xffff; cp++) {
+      if (cp >= 0xd800 && cp <= 0xdfff) continue
+      const ch = String.fromCharCode(cp)
+      if (/^\p{Cf}$/u.test(ch) && sanitizeChatName(`a${ch}b`) !== 'ab') expect.fail(`U+${cp.toString(16)} kept in a name`)
+    }
+    // A name made only of them is no name.
+    expect(sanitizeChatName('\u200b\u3164\u2800')).toBeNull()
+    // Visible letters and emoji stay (an emoji sequence loses its joiner in a NAME: a name is a claim).
+    expect(sanitizeChatName('Ayşe')).toBe('Ayşe')
+    expect(sanitizeChatName('Ada \u{1F469}\u200D\u{1F4BB}')).toBe('Ada \u{1F469}\u{1F4BB}')
+  })
+  it('chat TEXT keeps the zero-width joiner (emoji sequences) and the non-joiner (Persian, the Indic scripts), and loses the other invisibles', () => {
+    expect(sanitizeChatText('hi \u{1F469}\u200D\u{1F4BB}')).toBe('hi \u{1F469}\u200D\u{1F4BB}')
+    expect(sanitizeChatText('\u0645\u06cc\u200c\u062e\u0648\u0627\u0645')).toBe('\u0645\u06cc\u200c\u062e\u0648\u0627\u0645')
+    expect(sanitizeChatText('pass\u200bword\u00ad \u2060here\u{e0041}')).toBe('password here')
   })
   it('caps by code point, never leaving half a surrogate pair', () => {
     // 499 units, then an astral character (2 units): it does not fit in 500, so it is left out WHOLE.

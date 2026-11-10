@@ -1,4 +1,5 @@
 import { getViewportForBounds, type Rect, type Viewport } from '@xyflow/system'
+import { rootPositionWith } from '@shared/root-position'
 
 import { NO_INSETS, measurePinnedInsets, type RectLike, type ScreenInsets } from './pinnedInsets'
 import { measureMaximizeInsets } from './maximizeInsets'
@@ -86,20 +87,7 @@ export function absolutePosition(
   node: FocusableNode,
   all: readonly FocusableNode[]
 ): { x: number; y: number } {
-  let x = node.position.x
-  let y = node.position.y
-  let parentId = node.parentId
-  const seen = new Set<string>([node.id])
-  for (let depth = 0; parentId && depth < MAX_PARENT_DEPTH; depth++) {
-    if (seen.has(parentId)) break
-    seen.add(parentId)
-    const parent = all.find((n) => n.id === parentId)
-    if (!parent) break
-    x += parent.position.x
-    y += parent.position.y
-    parentId = parent.parentId
-  }
-  return { x, y }
+  return rootPositionWith(node, (id) => all.find((n) => n.id === id), MAX_PARENT_DEPTH)
 }
 
 /**

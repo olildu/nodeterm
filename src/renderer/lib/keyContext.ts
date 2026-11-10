@@ -43,6 +43,19 @@ export function isChatComposerTarget(el: ContextElement | null): boolean {
   return !!el?.closest?.(CHAT_COMPOSER_BOX_SELECTOR)
 }
 
+/**
+ * A surface that takes the WHOLE keyboard while it has focus, though no element in it is a text
+ * field: the whiteboard's Excalidraw editor (nodes/WhiteboardNode.tsx), whose focused element is a
+ * plain container `<div>`. Without this every canvas command fired over it: Delete/Backspace opened
+ * the delete-node confirm, ⌘Z undid the canvas, Space panned it. Matched structurally by ancestry,
+ * like the chat composer, so whatever element inside the surface holds focus is covered.
+ */
+export const KEYBOARD_OWNER_SELECTOR = '[data-nt-keyboard-owner]'
+
+export function isKeyboardOwnerTarget(el: ContextElement | null): boolean {
+  return !!el?.closest?.(KEYBOARD_OWNER_SELECTOR)
+}
+
 export function isTerminalTarget(el: ContextElement | null): boolean {
   return el?.classList?.contains(XTERM_INPUT_CLASS) === true
 }
@@ -72,7 +85,7 @@ export function hasEditContext(el: ContextElement | null): boolean {
 export function isTypingTarget(el: ContextElement | null): boolean {
   if (!el || isTerminalTarget(el)) return false
   if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') return true
-  return el.isContentEditable === true || hasEditContext(el)
+  return el.isContentEditable === true || hasEditContext(el) || isKeyboardOwnerTarget(el)
 }
 
 /** `terminalFirst` is REQUIRED, not defaulted: it is a user policy, and a default here would let

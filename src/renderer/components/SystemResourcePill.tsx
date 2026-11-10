@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { formatBytes } from '@shared/fsLimits'
+import type { MemInfo } from '@shared/types'
 import { useProjects } from '../state/projects'
 import { useSshConn } from '../state/sshConn'
 import { useSessionMemory } from '../state/sessionMemory'
@@ -14,6 +15,25 @@ const MB = 1024 * 1024
 /** Used-RAM thresholds the bar changes colour at. Pressure, not quota — see the bar's comment. */
 const WARN_PERCENT = 75
 const DANGER_PERCENT = 90
+
+/** 0 none, 1 warn, 2 danger. */
+type Severity = 0 | 1 | 2
+const TINT: Record<Severity, string | undefined> = { 0: undefined, 1: 'var(--warn)', 2: 'var(--danger)' }
+
+function percentSeverity(usedPercent: number): Severity {
+  return usedPercent >= DANGER_PERCENT ? 2 : usedPercent >= WARN_PERCENT ? 1 : 0
+}
+
+/**
+ * The kernel's own verdict (darwin `kern.memorystatus_vm_pressure_level`, the colour Activity
+ * Monitor's pressure graph uses). It may only RAISE the tint, never lower it: used-% is the only
+ * signal on Linux and on an SSH host, and a "normal" level does not make 95% used comfortable.
+ * Absent = not measured → contributes nothing.
+ */
+function pressureSeverity(mem: MemInfo): Severity {
+  const level = mem.display?.pressureLevel
+  return level === 'critical' ? 2 : level === 'warn' ? 1 : 0
+}
 
 export interface SystemResourcePillProps {
   overBoard?: boolean
@@ -101,6 +121,7 @@ export function SystemResourcePill({
 
   let body: JSX.Element
   let iconColor: string | undefined
+  let swapTitle = ''
   // `null` = could not read — the normal answer on a non-Linux SSH host, and on any host whose
   // first read has not landed yet. Pulse, NEVER "0 GB": a confident zero is the one thing this pill
   // must never say, since the number is the whole reason anyone looks at it. A `totalMb` of zero is
@@ -112,18 +133,32 @@ export function SystemResourcePill({
     const usedPercent = Math.min(100, (usedMb / mem.totalMb) * 100)
     // The ICON carries the pressure reading now that the bar is gone: it tints as memory is
     // consumed, so a glance still says "this machine is tight" without the pill claiming a row of
-    // the canvas. Same thresholds the bar used.
-    const color =
-      usedPercent >= DANGER_PERCENT
-        ? 'var(--danger)'
-        : usedPercent >= WARN_PERCENT
-          ? 'var(--warn)'
-          : undefined
+    // the canvas. Same thresholds the bar used, raised (never lowered) by the kernel's pressure
+    // level where the OS reports one.
+    const color = TINT[Math.max(percentSeverity(usedPercent), pressureSeverity(mem)) as Severity]
+    const swap = mem.display
+    // Swap is shown only when BOTH halves were measured (`display` is display-only: the reaper never
+    // reads it). On a measured Mac the pill said 86% "warn" with 8.5 GB swapped and nothing on
+    // screen said so. No figure when the read failed or the OS has none —
+    // never "+0 GB"; a measured 0 with swap provisioned is a fact and only goes in the title.
+    const swapShown =
+      swap?.swapUsedMb !== undefined && swap.swapTotalMb !== undefined && swap.swapUsedMb > 0
+    // `swapTotalMb > 0`: a Mac with no swap file yet (or a swapless Linux host) has nothing to
+    // describe, and "swap 0 B of 0 B used" would read as a measurement of something.
+    if (swap?.swapUsedMb !== undefined && swap.swapTotalMb !== undefined && swap.swapTotalMb > 0)
+      swapTitle = ` · swap ${formatBytes(swap.swapUsedMb * MB)} of ${formatBytes(swap.swapTotalMb * MB)} used`
+    if (swap?.pressureLevel) swapTitle += ` · memory pressure ${swap.pressureLevel}`
     body = (
       <span className="sysres-pill__detail sysres-pill__num" style={color ? { color } : undefined}>
         {formatBytes(usedMb * MB)}
         <span className="sysres-pill__sep"> / </span>
         {formatBytes(mem.totalMb * MB)}
+        {swapShown && (
+          <span className="sysres-pill__swap sysres-pill__dim">
+            <span className="sysres-pill__sep"> · </span>
+            {formatBytes((swap.swapUsedMb as number) * MB)} swap
+          </span>
+        )}
       </span>
     )
     iconColor = color
@@ -149,7 +184,7 @@ export function SystemResourcePill({
         aria-controls="sessmem-panel"
         // The SSH pill is visually identical to the local one, so the title is what answers
         // "whose memory is this?" without opening the panel.
-        title={scopeKey ? `Memory on ${scopeKey}` : 'Memory on this machine'}
+        title={(scopeKey ? `Memory on ${scopeKey}` : 'Memory on this machine') + swapTitle}
       >
         <span className="sysres-pill__icon" style={iconColor ? { color: iconColor } : undefined}>
           <IconResource />

@@ -240,13 +240,13 @@ describe('sourceIsControlCapable', () => {
   })
 
   it('accepts every canvas-control-capable agent', () => {
-    for (const id of ['claude', 'codex', 'gemini', 'opencode', 'grok']) {
+    for (const id of ['claude', 'codex', 'gemini', 'opencode', 'grok', 'cursor', 'antigravity']) {
       expect(sourceIsControlCapable(id)).toBe(true)
     }
   })
 
   it('rejects an agent that never gets NODETERM_CANVAS_CONTROL', () => {
-    expect(sourceIsControlCapable('cursor')).toBe(false)
+    expect(sourceIsControlCapable('custom:unbased')).toBe(false)
   })
 })
 
@@ -323,7 +323,7 @@ describe('answerBrowserResolve — the renderer answers ONLY what it alone knows
   })
 
   it('a non-control-capable source is reported as such (main turns it into the refusal)', () => {
-    const p = proj({ nodes: [{ id: 'x-1', agentId: 'cursor' }], agentBrowserControl: true, capabilityAck: { agentBrowserControl: 'kept' } })
+    const p = proj({ nodes: [{ id: 'x-1', agentId: 'custom:unbased' }], agentBrowserControl: true, capabilityAck: { agentBrowserControl: 'kept' } })
     expect(answerBrowserResolve(p, 'x-1')).toMatchObject({ ok: true, sourceControlCapable: false })
   })
 })
@@ -351,6 +351,48 @@ describe('storedNodeListing', () => {
     expect(rows[0]).toMatchObject({ issue: 'o/r#7' })
     expect(rows[1]).not.toHaveProperty('issue')
     expect(controlListingText(rows)).toBe('term-1 [terminal] Claude — issue o/r#7\nterm-2 [terminal] Hostile')
+  })
+})
+
+// Issue #1288: `list` reads the geometry back, so a script can copy a size the user set by hand and
+// check what `resize` / `place` did. JSON rows ALWAYS carry it; the text form only behind the flag.
+describe('storedNodeListing — geometry', () => {
+  const stored = [
+    { id: 'g', kind: 'group', title: 'Team', position: { x: 1000, y: 500 }, size: { width: 800, height: 600 } },
+    { id: 'a', kind: 'terminal', title: 'A', parentId: 'g', position: { x: 28, y: 62.4 }, size: { width: 540, height: 480 } },
+    { id: 'b', kind: 'terminal', title: 'B', collapsed: true, position: { x: -10, y: 0 }, size: { width: 600, height: 400 } }
+  ]
+
+  it('every row carries x, y (canvas space), width, height and its parent — no flag needed', () => {
+    const rows = storedNodeListing(stored)
+    expect(rows[0]).toMatchObject({ x: 1000, y: 500, width: 800, height: 600, parent: null })
+    // Root space: the frame's origin is added in, and values are whole px.
+    expect(rows[1]).toMatchObject({ x: 1028, y: 562, width: 540, height: 480, parent: 'g' })
+    // A collapsed node occupies its header bar, and says what it opens to.
+    expect(rows[2]).toMatchObject({ x: -10, y: 0, width: 600, height: 40, collapsed: true, expandedHeight: 400 })
+  })
+
+  it('a precomputed (live, measured) geometry wins over the persisted fields', () => {
+    const [row] = storedNodeListing([
+      { ...stored[1], parentId: undefined, geometry: { x: 1, y: 2, width: 3, height: 4, parent: null } }
+    ])
+    expect(row).toMatchObject({ x: 1, y: 2, width: 3, height: 4, parent: null })
+  })
+
+  it('the text form stays one short line by default, and shows geometry only when asked', () => {
+    const rows = storedNodeListing(stored)
+    expect(controlListingText(rows)).toBe('g [group] Team\na [terminal] A\nb [terminal] B')
+    expect(controlListingText(rows, { geometry: true })).toBe(
+      'g [group] Team @ 1000,500 800×600\n' +
+        'a [terminal] A @ 1028,562 540×480 in g\n' +
+        'b [terminal] B @ -10,0 600×40 collapsed (expands to 400)'
+    )
+  })
+
+  it('a row with no geometry to report renders as before, flag or not', () => {
+    const rows = storedNodeListing([{ id: 't', kind: 'terminal', title: 'T' }])
+    expect(rows[0]).not.toHaveProperty('x')
+    expect(controlListingText(rows, { geometry: true })).toBe('t [terminal] T')
   })
 })
 

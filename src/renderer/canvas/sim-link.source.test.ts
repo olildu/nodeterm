@@ -26,7 +26,7 @@ describe('Canvas sim links', () => {
     expect(canvas).toMatch(/kind === 'sim' && te\.kind === 'agentsim'/)
   })
   it('sends the discovery note only to an agent, idle-gated, and none for the auto-link', () => {
-    expect(canvas).toMatch(/if \(kind === 'sim'\) \{[\s\S]*?state === 'working'\) return[\s\S]*?buildSimLinkNote/)
+    expect(canvas).toMatch(/if \(kind === 'sim'\) \{[\s\S]*?pushLinkNote\(target, buildSimLinkNote/)
     // The auto-link path appends the bridge and never sends a note.
     const auto = canvas.slice(canvas.indexOf('const applySimAutoLink'), canvas.indexOf('const applySimAutoLinkRef'))
     expect(auto).not.toMatch(/sendText|buildSimLinkNote/)

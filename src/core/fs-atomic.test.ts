@@ -14,6 +14,7 @@ import {
   renameAtomic,
   renameAtomicSync,
   STALE_TEMP_AGE_MS,
+  sweepForeignTempFiles,
   sweepStaleTempFiles,
   tempNameFor,
   writeFileAtomic
@@ -364,6 +365,40 @@ describe('unique temp names and abandoned-temp collection', () => {
 
     expect(kill).not.toHaveBeenCalled()
     expect(await fs.readFile(foreign, 'utf8')).toBe('foreign')
+  })
+})
+
+describe('sweepForeignTempFiles (credential stores)', () => {
+  it('removes the legacy temp and every foreign PID shape at once, with no age grace', async () => {
+    const target = join(dir, 'token.json')
+    const legacy = `${target}.tmp`
+    const priorPidShape = `${target}.1111.1.tmp`
+    const current = `${target}.2222.2.22222222-2222-4222-8222-222222222222.tmp`
+    const ours = `${target}.${process.pid}.3.33333333-3333-4333-8333-333333333333.tmp`
+    const oursPrior = `${target}.${process.pid}.4.tmp`
+    const unknown = `${target}.not-an-owner.tmp`
+    const unrelated = join(dir, 'other-fil!.tmp') // same basename length as token.json
+    const lookalike = join(dir, 'token.json.bak.1111.1.tmp')
+    await Promise.all(
+      [target, legacy, priorPidShape, current, ours, oursPrior, unknown, unrelated, lookalike].map((file) =>
+        fs.writeFile(file, file)
+      )
+    )
+
+    await sweepForeignTempFiles(target)
+
+    expect((await fs.readdir(dir)).sort()).toEqual([
+      'other-fil!.tmp',
+      'token.json',
+      `token.json.${process.pid}.3.33333333-3333-4333-8333-333333333333.tmp`,
+      `token.json.${process.pid}.4.tmp`,
+      'token.json.bak.1111.1.tmp',
+      'token.json.not-an-owner.tmp'
+    ].sort())
+  })
+
+  it('resolves quietly when the directory cannot be read', async () => {
+    await expect(sweepForeignTempFiles(join(dir, 'missing', 'token.json'))).resolves.toBeUndefined()
   })
 })
 

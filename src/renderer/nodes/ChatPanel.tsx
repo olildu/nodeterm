@@ -1,8 +1,8 @@
 import { TEXT_NOT_SUBMITTED, isChatPromptBlocked } from '@shared/text-delivery'
-import { claudeScreenBlocksInput, readClaudeScreen } from '@shared/agents/claude-screen'
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { claudeScreenBlocksInput, type ChatScreenRead } from '@shared/agents/claude-screen'
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { renderMarkdown } from '../lib/markdown'
-import { useAgentStatus } from '../state/agentStatus'
+import { inferInterruptAfterSettle, useAgentStatus } from '../state/agentStatus'
 import { useSession } from '../session/session'
 import { chipFor } from '../lib/keybindingOverrides'
 import {
@@ -14,9 +14,9 @@ import {
   screenBlockedSentence,
   type ScreenBlock
 } from '../lib/chatSendGate'
-import type { ChatMessage } from '@shared/types'
+import type { ChatMessage, ChatPart } from '@shared/types'
 import { chatPaneRefusal, chatPaneRefusalToast } from '../lib/chatPaneGate'
-import { chatAgentLabel, isNearBottom, shouldFollowOnLoad, toolCardTitle } from '../lib/chatPanel'
+import { chatAgentLabel, isNearBottom, shouldFollowOnLoad, toolCardTitle, unseenAfter } from '../lib/chatPanel'
 import { useSettings } from '../state/settings'
 import {
   CHAT_OLDER_PAGE_BYTES,
@@ -32,15 +32,22 @@ import {
 import { E_UNSUPPORTED } from '@shared/rpc'
 import { GROK_AMBIGUOUS_SESSION_MESSAGE, isGrokAmbiguousSessionError } from '@shared/chat-page'
 import { Spinner } from '../components/Spinner'
+import { newMessagesLabel } from '../lib/liveChatLook'
 import {
   CHAT_LIVE_RELOAD_MIN_MS,
   CHAT_OPTIMISTIC_WORKING_MS,
   CHAT_SCREEN_POLL_MS,
+  REMOTE_SUGGESTION_READ_DELAYS_MS,
+  SUGGESTION_BURST_MS,
+  SUGGESTION_BURST_WINDOW_MS,
+  endsTurn,
   TURN_END_RELOAD_DELAYS_MS,
   chatActivity,
   planLiveReload,
+  screenPollTickAllowed,
   shouldPollScreen,
-  turnEndReloadCarries
+  turnEndReloadCarries,
+  windowFocusHint
 } from '../lib/chatLive'
 import { sentCommand } from '@shared/chat-command'
 import { isInteractiveBuiltin } from '@shared/chat-catalog'
@@ -51,16 +58,38 @@ import { AnswerControlsUpdating, PlanAnswerControls, QuestionAnswerControls } fr
 import type { PermissionAnswer } from '@shared/agents/permission-answer'
 import { ChatComposer } from './ChatComposer'
 import { ChatTurnActions } from './ChatTurnActions'
-import { assistantTurnEnds } from '../lib/chatThread'
+import { useCodeBlockCopy } from './CodeBlockCopy'
+import { useCodeHighlight } from './CodeHighlight'
+import { assistantTurnEnds, chatAbsoluteTime, chatClockTime, dayDividers } from '../lib/chatThread'
+import { groupToolCalls, partPosition } from '../lib/chatToolGroups'
+import { thinkingLabel } from '../lib/chatThinking'
+import { TODO_WRITE_TOOL, latestTodoIndex, staleTodo } from '../lib/chatTodo'
+import { ChatToolGroup } from './ChatToolGroup'
+import { ChatImage } from './ChatImage'
+import { ChatToolDiff } from './ChatToolDiff'
+import { ChatTeammateMessage } from './ChatTeammate'
+import { isTeammateMessage } from '../lib/chatTeammate'
 import { FALLBACK_SESSION_NOTE, transcriptReadCwd } from '../lib/transcriptSession'
+import { chatPageDirection, pageChatThread } from '../lib/chatPageKeys'
+import { CLAUDE_INTERRUPT_LINE, chatEscInterrupts, chatInterruptRefusalText } from '../lib/chatEscInterrupt'
 
 // Memoized bubble: marked+DOMPurify re-ran for EVERY message on each ChatPanel render (each
 // turn-finish reload, each keystroke re-render). Text is stable per message, so cache per text.
 // `breaks`: a single newline is a line break, as Claude Code's own TUI renders it — without it a
 // multi-line prompt, or a reply quoting one line by line (`> a` / `> b`), collapsed onto one line.
+// Every code block gets a Copy button in its top-right corner (useCodeBlockCopy), and a fenced block
+// whose language lib/codeHighlight.ts names is syntax-colored by Monaco (useCodeHighlight).
 export const MarkdownText = memo(function MarkdownText({ text }: { text: string }) {
   const html = useMemo(() => renderMarkdown(text, { breaks: true }), [text])
-  return <div className="term-chat__text" dangerouslySetInnerHTML={{ __html: html }} />
+  const ref = useRef<HTMLDivElement>(null)
+  const copyButtons = useCodeBlockCopy(ref, html)
+  useCodeHighlight(ref, html)
+  return (
+    <>
+      <div ref={ref} className="term-chat__text" dangerouslySetInnerHTML={{ __html: html }} />
+      {copyButtons}
+    </>
+  )
 })
 
 interface ChatPanelProps {
@@ -216,6 +245,9 @@ export function ChatPanel({
   const identity = JSON.stringify([nodeId, sessionId ?? null, readCwd ?? null, accountId ?? null, agentId])
   const [thread, setThread] = useState<ChatThread>(() => emptyThread(identity))
   const messages = thread.messages
+  // For the "scroll to latest" pill's count, read from a stable callback (markFollowing, below).
+  const messagesRef = useRef<readonly ChatMessage[]>(messages)
+  messagesRef.current = messages
   // Read by the async handlers, which must decide against the thread as it is NOW, not as it was
   // when the read was issued.
   const threadRef = useRef(thread)
@@ -236,6 +268,8 @@ export function ChatPanel({
   olderStateRef.current = olderState
   const [input, setInput] = useState('')
   const [readonly, setReadonly] = useState(false)
+  // The last prompt this panel sent, for taking it back out of the agent's input box after an Esc.
+  const lastSentRef = useRef<string | null>(null)
   const [optimistic, setOptimistic] = useState(false)
   const state = useAgentStatus((s) => s.byId[nodeId]?.state)
   // The shell-owned-pane flags, each as its own primitive selector (an object selector would
@@ -268,6 +302,14 @@ export function ChatPanel({
     remote: sshProjectId !== undefined || source !== 'local',
     refusal
   })
+  // The prompt Claude suggests next (`readClaudeSuggestion`), from the latest screen read. Shown as
+  // the composer's placeholder only while a message could be sent and nothing else is on screen.
+  const [suggestion, setSuggestion] = useState<string | null>(null)
+  const shownSuggestion = !readonly && refusal === null && screenBlock === null ? suggestion : null
+  // An SSH node, read after each turn instead of polled (`REMOTE_SUGGESTION_READ_DELAYS_MS`). Not a
+  // relay tab: that pane is on the peer, and it has its own composer there.
+  const readsRemoteSuggestion =
+    readsScreenDialogs(agentId) && readOnly !== true && sshProjectId !== undefined && source === 'local'
   const agentLabel = chatAgentLabel(agentId, customAgents)
   // What the row closing the thread says (lib/chatLive.ts). `optimistic` covers the gap between a
   // send and the first hook event: set by `send`, retired by the next state change (the real state
@@ -327,6 +369,17 @@ export function ChatPanel({
   // bottom (updated on every scroll), and did they just send (they expect to see it land).
   const nearBottomRef = useRef(true)
   const justSentRef = useRef(false)
+  // The same fact as state, for the "scroll to latest" pill: it shows exactly while the view has
+  // stopped following, i.e. while a new message would land out of sight. `lastSeenRef` is the newest
+  // message on screen when following stopped; the pill counts what came in after it.
+  const [following, setFollowing] = useState(true)
+  const lastSeenRef = useRef<ChatMessage | null>(null)
+  const markFollowing = useCallback((v: boolean) => {
+    nearBottomRef.current = v
+    if (v) lastSeenRef.current = null
+    else if (lastSeenRef.current === null) lastSeenRef.current = messagesRef.current.at(-1) ?? null
+    setFollowing(v)
+  }, [])
   // Token for the older-page fetch. A TAIL load bumps it too: a tail read can reset the thread
   // (see applyTail), and an older page computed against the previous cursor must not land on it.
   const olderReqRef = useRef(0)
@@ -410,6 +463,8 @@ export function ChatPanel({
     // history pages in on scroll-up, and a reload merges by key instead of discarding it.
     void api.chat.readTranscript(sessionId, readCwd, accountId, nodeId, agentId, {
       maxBytes: CHAT_TAIL_PAGE_BYTES,
+      thinking: true,
+      rich: true,
       // A hook-driven refresh the user did not ask for: an expensive reader (opencode's export) may
       // space these out. An open, ↻, Retry or a held-request rebind is never marked.
       ...(live && !rebind ? { background: true } : {})
@@ -506,7 +561,9 @@ export function ChatPanel({
     }
     void api.chat.readTranscript(sessionId, readCwd, accountId, nodeId, agentId, {
       before,
-      maxBytes: CHAT_OLDER_PAGE_BYTES
+      maxBytes: CHAT_OLDER_PAGE_BYTES,
+      thinking: true,
+      rich: true
     }).then(
       (res) => {
         if (token !== olderReqRef.current) return
@@ -662,10 +719,69 @@ export function ChatPanel({
     prevState.current = state
   }, [state, load, nodeId])
 
-  // Any state change retires the optimistic working row: from here the real state speaks.
+  // Any state change retires the optimistic working row: from here the real state speaks. And a
+  // suggestion belongs to the turn that ended: the next read brings the new one.
   useEffect(() => {
     setOptimistic(false)
+    setSuggestion(null)
   }, [state])
+
+  // Right after a turn ends, read faster until Claude's suggestion is on screen (`SUGGESTION_BURST_MS`).
+  // Same gates as the regular poll, which keeps running beside it for dialogs.
+  const lastTurnStateRef = useRef(state)
+  useEffect(() => {
+    const prev = lastTurnStateRef.current
+    lastTurnStateRef.current = state
+    if (!pollScreen || !endsTurn(prev, state)) return
+    let cancelled = false
+    let inFlight = false
+    const until = Date.now() + SUGGESTION_BURST_WINDOW_MS
+    const t = setInterval(() => {
+      if (Date.now() > until) {
+        clearInterval(t)
+        return
+      }
+      const el = msgsRef.current
+      if (inFlight || el === null || el.clientHeight === 0) return
+      if (!screenPollTickAllowed({ hidden: document.hidden, focused: windowFocusHint(document) })) return
+      inFlight = true
+      void api.pty
+        .readChatScreen(nodeId, agentId)
+        .then((r) => {
+          if (cancelled || r.screen.kind === 'unknown' || r.suggestion === null) return
+          setSuggestion(r.suggestion)
+          clearInterval(t)
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          inFlight = false
+        })
+    }, SUGGESTION_BURST_MS)
+    return () => {
+      cancelled = true
+      clearInterval(t)
+    }
+  }, [pollScreen, state, api, nodeId, agentId])
+
+  useEffect(() => {
+    if (!readsRemoteSuggestion || state !== 'done') return
+    let cancelled = false
+    const read = async (): Promise<void> => {
+      const el = msgsRef.current
+      if (el === null || el.clientHeight === 0 || document.hidden) return
+      try {
+        const r = await api.pty.readChatScreen(nodeId, agentId)
+        if (!cancelled && r.screen.kind !== 'unknown') setSuggestion(r.suggestion)
+      } catch {
+        // A failed read offers nothing; the next turn reads again.
+      }
+    }
+    const timers = REMOTE_SUGGESTION_READ_DELAYS_MS.map((ms) => setTimeout(() => void read(), ms))
+    return () => {
+      cancelled = true
+      for (const t of timers) clearTimeout(t)
+    }
+  }, [readsRemoteSuggestion, state, api, nodeId, agentId])
   useEffect(() => {
     if (!optimistic) return
     const t = setTimeout(() => setOptimistic(false), CHAT_OPTIMISTIC_WORKING_MS)
@@ -674,35 +790,51 @@ export function ChatPanel({
 
   // Re-read the pane's screen while the view is visible (see `screenBlock`). A read that fails or
   // finds a blank screen changes nothing: unknown is not evidence either way.
+  // Ticks are skipped while the window is unfocused (`screenPollTickAllowed`: ~30 tmux spawns a
+  // minute per chat view otherwise), and coming back — `focus`, or the page turning
+  // visible — re-reads at once, so a dialog that opened meanwhile is on screen before anyone types.
   useEffect(() => {
     if (!pollScreen) {
       setScreenBlock((b) => (b?.live === true ? null : b))
       return
     }
     let cancelled = false
+    // A focus re-tick can land while the interval's read is still out; one read at a time.
+    let inFlight = false
     const tick = async (): Promise<void> => {
       const el = msgsRef.current
-      if (el === null || el.clientHeight === 0 || document.hidden) return
-      let screen: string
+      if (el === null || el.clientHeight === 0 || inFlight) return
+      if (!screenPollTickAllowed({ hidden: document.hidden, focused: windowFocusHint(document) })) return
+      let result: ChatScreenRead
+      inFlight = true
       try {
-        screen = await api.pty.capture(nodeId)
+        // One styled read answers both: who owns the keyboard, and the prompt Claude suggests next.
+        result = await api.pty.readChatScreen(nodeId, agentId)
       } catch {
         return
+      } finally {
+        inFlight = false
       }
       if (cancelled) return
-      const read = readClaudeScreen(screen)
+      const read = result.screen
       if (read.kind === 'unknown') return
+      setSuggestion(result.suggestion)
       if (!claudeScreenBlocksInput(read)) setScreenBlock(null)
       else if (read.kind === 'dialog') setScreenBlock({ kind: 'dialog', text: read.text, live: true })
       else setScreenBlock({ kind: 'no-prompt', text: null, live: true })
     }
     void tick()
     const t = setInterval(() => void tick(), CHAT_SCREEN_POLL_MS)
+    const onReturn = (): void => void tick()
+    window.addEventListener('focus', onReturn)
+    document.addEventListener('visibilitychange', onReturn)
     return () => {
       cancelled = true
       clearInterval(t)
+      window.removeEventListener('focus', onReturn)
+      document.removeEventListener('visibilitychange', onReturn)
     }
-  }, [pollScreen, api, nodeId])
+  }, [pollScreen, api, nodeId, agentId])
 
   // Follow the newest message only when the user was already at the bottom or just sent; a user
   // scrolled up reading an earlier answer keeps their place. Layout effect: the jump lands before
@@ -722,11 +854,11 @@ export function ChatPanel({
     }
     if (shouldFollowOnLoad({ wasNearBottom: nearBottomRef.current, justSent: justSentRef.current })) {
       el.scrollTop = el.scrollHeight
-      nearBottomRef.current = true
+      markFollowing(true)
     }
     justSentRef.current = false
     // `activity` / `screenBlock`: a row appearing at the end grows the thread like a message does.
-  }, [messages, olderState, activity, screenBlock])
+  }, [messages, olderState, activity, screenBlock, markFollowing])
 
   const maybeLoadOlder = useCallback(() => {
     const el = msgsRef.current
@@ -776,8 +908,64 @@ export function ChatPanel({
 
   const onScroll = () => {
     const el = msgsRef.current
-    if (el) nearBottomRef.current = isNearBottom(el)
+    if (el) markFollowing(isNearBottom(el))
     maybeLoadOlder()
+  }
+
+  // Page Up / Page Down page the thread from anywhere in the panel, the composer included
+  // (lib/chatPageKeys.ts). `contains`: a React portal's keydown bubbles here too.
+  const onPanelKey = (e: KeyboardEvent<HTMLDivElement>) => {
+    const el = msgsRef.current
+    if (!el || e.defaultPrevented || !(e.target instanceof Element) || !e.currentTarget.contains(e.target)) return
+    if (
+      chatEscInterrupts({ ...e, isComposing: e.nativeEvent.isComposing }, e.target, {
+        agentId,
+        state: useAgentStatus.getState().byId[nodeId]?.state,
+        draft: input,
+        readOnly: readOnly === true || readonly
+      })
+    ) {
+      e.preventDefault()
+      void interrupt()
+      return
+    }
+    const direction = chatPageDirection(e, e.target)
+    if (direction === null) return
+    e.preventDefault()
+    pageChatThread(el, direction)
+  }
+
+  // Esc while the agent works (lib/chatEscInterrupt.ts). Core checks the screen for a dialog first
+  // and, when the Esc beat the reply's first token, takes the prompt Claude put back into its own
+  // input box out again: it goes into this composer instead, where the user can see and edit it.
+  const interrupt = async () => {
+    const r = await api.pty.interruptChat(nodeId, agentId, lastSentRef.current ?? undefined)
+    if (!r.sent) {
+      if (r.reason === 'dialog') {
+        const dialog = r.dialog ?? null
+        setScreenBlock({ kind: dialog === null ? 'no-prompt' : 'dialog', text: dialog, live: pollScreen })
+      }
+      const message = chatInterruptRefusalText(r.reason, chatAgentLabel(agentId, useSettings.getState().settings.customAgents))
+      window.dispatchEvent(new CustomEvent('nodeterm:toast', { detail: { kind: 'error', message } }))
+      return
+    }
+    // An Esc before the first token writes no transcript marker and fires no hook, so the state would
+    // read working until the stale sweep. The same guess an Esc typed in the terminal makes: an
+    // interrupted `done` after a short settle, healed by the turn's next hook if the guess was wrong.
+    inferInterruptAfterSettle(nodeId)
+    const restored = r.restored
+    if (restored === null) return
+    lastSentRef.current = null
+    // The bubble for that send stays: Claude still writes the prompt to the transcript (as a branch it
+    // then drops from its context), so the next read would draw it again anyway.
+    setInput((cur) => (cur.trim() === '' ? restored : `${restored}\n${cur}`))
+  }
+
+  const scrollToLatest = () => {
+    const el = msgsRef.current
+    if (!el) return
+    el.scrollTop = el.scrollHeight
+    markFollowing(true)
   }
 
   // The optimistic bubbles sent into the CLI's queue mid-turn, drawn as "Queued" until the transcript
@@ -827,7 +1015,9 @@ export function ChatPanel({
     // Optimistic: show the prompt immediately. A live read keeps it until the transcript carries it
     // (`carryUnconfirmed`); the turn-end reload / ↻ reconcile from the transcript outright.
     setScreenBlock(null)
+    setSuggestion(null)
     justSentRef.current = true
+    lastSentRef.current = text
     const sent: ChatMessage = { role: 'user', parts: [{ kind: 'text', text }] }
     if (mode === 'queue') queuedRef.current.add(sent)
     setThread((t) => ({ ...t, messages: [...t.messages, sent] }))
@@ -905,6 +1095,17 @@ export function ChatPanel({
   // the turn's last message. `now` is ONE clock for every row's relative time, ticked once a minute
   // (a per-row timer would be a timer per turn for a label that changes once a minute).
   const turnEnds = useMemo(() => assistantTurnEnds(messages), [messages])
+  // Runs of consecutive tool calls, folded into one closed block each (lib/chatToolGroups.ts) —
+  // except, while the turn is live, the run at the end of the thread: its calls stay open chips until
+  // something else ends the run. Live = working, or waiting on a prompt (`dialog`: a permission
+  // request or question lands MID-turn, and folding on it would close the run on every prompt).
+  // A prompt queued meanwhile is drawn at the very end, but is not the turn's output: the tail is
+  // measured before it (`isQueued`; the set gains a send before the thread does, so it is current).
+  const liveTurn = refusal === 'working' || refusal === 'dialog'
+  const toolGroups = useMemo(
+    () => groupToolCalls(messages, { foldTail: !liveTurn, isQueued: (m) => queuedRef.current.has(m) }),
+    [messages, liveTurn]
+  )
   // The last key IS the latest turn end: `assistantTurnEnds` inserts in thread order.
   const latestTurnEnd = useMemo(() => {
     let last = -1
@@ -916,6 +1117,86 @@ export function ChatPanel({
     const t = setInterval(() => setNow(Date.now()), 60_000)
     return () => clearInterval(t)
   }, [])
+  // A divider at the first message of each local day; the same `now`, so Today rolls to Yesterday.
+  const days = useMemo(() => dayDividers(messages, now), [messages, now])
+  // Only the latest todo list is a card (lib/chatTodo.ts).
+  const latestTodo = useMemo(() => latestTodoIndex(messages), [messages])
+  // Whether the part at (i, j) draws anything at its own place: not when an earlier tool block holds it.
+  const drawsAt = (i: number, j: number): boolean => !toolGroups.absorbed.has(partPosition(i, j))
+
+  // One part of a message, as the thread draws it. Also used for the members of a folded tool block,
+  // which are drawn inside the block instead of at their own place (lib/chatToolGroups.ts).
+  const renderPart = (p: ChatPart, i: number, j: number, key: string | number = j): JSX.Element =>
+    p.kind === 'text' ? (
+      <MarkdownText key={key} text={p.text} />
+    ) : p.kind === 'thinking' ? (
+      // Claude's thinking summary — the "thinking out loud" line its TUI prints between tool calls.
+      // A fold, closed by default and dimmed, so it never reads as the answer; its line says how long
+      // the thinking took when the parser could stamp it (`p.ms`). Native and uncontrolled, like the
+      // tool block: it keeps whatever the user opened while the thread re-renders.
+      <details key={key} className="term-chat__thinking">
+        <summary>{thinkingLabel(p.ms)}</summary>
+        <MarkdownText text={p.text} />
+      </details>
+    ) : p.kind === 'image' ? (
+      // An image the user attached to the prompt (the opt-in `rich` read): a thumbnail, click to enlarge.
+      <ChatImage key={key} mediaType={p.mediaType} data={p.data} />
+    ) : p.kind === 'teammate' ? (
+      // A teammate's message (the opt-in `rich` read). A message of them is drawn whole below, so a
+      // run from one teammate folds into one row; this is the part on its own.
+      <ChatTeammateMessage key={key} parts={[p]} Markdown={MarkdownText} />
+    ) : p.kind === 'interrupt' ? (
+      // The user interrupted the turn (the opt-in `rich` read). Claude saves that as a user record,
+      // but the user did not type it: drawn as Claude's own TUI line, hanging off what came before.
+      <div key={key} className="term-chat__interrupt">
+        <span className="term-chat__interrupt-hook" aria-hidden="true">⎿</span>
+        {CLAUDE_INTERRUPT_LINE}
+      </div>
+    ) : p.body && !staleTodo(p, i, latestTodo) ? (
+      // A plan / question / the latest todo list is the content itself, not plumbing: shown
+      // expanded, in full, flowing with the thread (no inner scroll box). The answer stays under it.
+      // A superseded todo list falls through to the plain chip.
+      <div key={key} className={`term-chat__tool-card${p.name === TODO_WRITE_TOOL ? ' term-chat__todo' : ''}`}>
+        <div className="term-chat__tool-card-title">{toolCardTitle(p.name)}</div>
+        <MarkdownText text={p.body} />
+        {/* A TodoWrite's result is the CLI's canned "Todos have been modified…": plumbing, not content. */}
+        {p.result && p.name !== TODO_WRITE_TOOL && <pre className="term-chat__tool-result">{p.result}</pre>}
+        {answerCard && answerCard.card.message === i && answerCard.card.part === j && (
+          // Keyed by the BOUND ticket: a new hold on the same card starts from a clean
+          // state, and every answer names the request this card was drawn for.
+          p.name === 'AskUserQuestion' && p.questions ? (
+            <QuestionAnswerControls
+              key={answerCard.pendingId}
+              questions={p.questions}
+              agentLabel={agentLabel}
+              chip={mdChip}
+              onSubmit={(a) => answerHeld(answerCard.pendingId, a)}
+            />
+          ) : (
+            <PlanAnswerControls
+              key={answerCard.pendingId}
+              agentLabel={agentLabel}
+              chip={mdChip}
+              onSubmit={(a) => answerHeld(answerCard.pendingId, a)}
+            />
+          )
+        )}
+        {updatingCard && updatingCard.message === i && updatingCard.part === j && (
+          <AnswerControlsUpdating chip={mdChip} />
+        )}
+      </div>
+    ) : p.diff ? (
+      // An Edit / Write (the opt-in `rich` read): the plain chip plus `+N −M`, opening to the diff.
+      <ChatToolDiff key={key} name={p.name} diff={p.diff} result={p.result} />
+    ) : (
+      <details key={key} className="term-chat__tool">
+        <summary>
+          <span className="term-chat__tool-name">{p.name}</span>
+          {p.arg && <span className="term-chat__tool-arg">{p.arg}</span>}
+        </summary>
+        {p.result && <pre className="term-chat__tool-result">{p.result}</pre>}
+      </details>
+    )
 
   // A tail that yielded no message but has history behind it (all-metadata records, or a window a
   // single huge record filled) is STILL LOADING — the panel pages back by itself from here. Saying
@@ -925,12 +1206,13 @@ export function ChatPanel({
   const initialLoading =
     messages.length === 0 &&
     (loadState === 'loading' || (loadState === 'ok' && historyPending && olderState !== 'error'))
+  const unseen = following ? 0 : unseenAfter(messages, lastSeenRef.current)
   const showEmpty = messages.length === 0 && loadState !== 'loading' && !(loadState === 'ok' && historyPending)
 
   return (
     // `data-chat-node-id`: which node's chat view this is — the mics that name only a node ask it
     // (lib/chatComposerDictation.ts `dictationTargetForNode`) so a take never reaches the hidden pane.
-    <div className="term-chat nodrag nowheel" data-chat-node-id={nodeId}>
+    <div className="term-chat nodrag nowheel" data-chat-node-id={nodeId} onKeyDown={onPanelKey}>
       <div className="term-chat__bar">
         <span>{title ?? 'Chat'}</span>
         <span className="term-chat__bar-end">
@@ -950,135 +1232,149 @@ export function ChatPanel({
           {FALLBACK_SESSION_NOTE}
         </div>
       )}
-      <div className="term-chat__msgs" ref={msgsRef} onScroll={onScroll}>
-        {initialLoading && (
-          <ChatLoadingStatus text={EMPTY_TEXT.loading.title} />
-        )}
-        {messages.length > 0 && olderState === 'loading' && (
-          <div className="term-chat__older" role="status">
-            <Spinner />
-            <span>Loading earlier messages…</span>
-          </div>
-        )}
-        {olderState === 'error' && (
-          <div className="term-chat__older term-chat__older--error">
-            <span>Couldn't load earlier messages.</span>
-            <button className="term-chat__retry" onClick={loadOlder}>
-              Retry
-            </button>
-          </div>
-        )}
-        {/* Only a PAGED thread (keyed messages) can know it reached the start; grok's capped
-            whole-file read says nothing about what lies before it. */}
-        {olderState === 'idle' && thread.olderCursor === null && messages.some((m) => m.key !== undefined) && (
-          <div className="term-chat__older term-chat__older--start">Beginning of conversation</div>
-        )}
-        {showEmpty && (
-          <div className="term-chat__empty">
-            <div>{EMPTY_TEXT[loadState].title.replace('{agent}', agentLabel)}</div>
-            {EMPTY_TEXT[loadState].detail && (
-              <div className="term-chat__empty-detail">{EMPTY_TEXT[loadState].detail}</div>
-            )}
-            {loadState !== 'unsupported' && loadState !== 'remoteUnsupported' && loadState !== 'ambiguous' && loadState !== 'ok' && (
-              <button className="term-chat__retry" onClick={() => load()}>
+      <div className="term-chat__thread">
+        <div className="term-chat__msgs" ref={msgsRef} onScroll={onScroll}>
+          {initialLoading && (
+            <ChatLoadingStatus text={EMPTY_TEXT.loading.title} />
+          )}
+          {messages.length > 0 && olderState === 'loading' && (
+            <div className="term-chat__older" role="status">
+              <Spinner />
+              <span>Loading earlier messages…</span>
+            </div>
+          )}
+          {olderState === 'error' && (
+            <div className="term-chat__older term-chat__older--error">
+              <span>Couldn't load earlier messages.</span>
+              <button className="term-chat__retry" onClick={loadOlder}>
                 Retry
               </button>
-            )}
-          </div>
-        )}
-        {messages.map((m, i) => (
-          // Keyed by the source line's byte offset: a prepended page does not re-key (and so does
-          // not re-render) a single existing bubble. Unkeyed ones (grok, the optimistic sent
-          // bubble) fall back to their position.
-          <div
-            key={m.key !== undefined ? `k${m.key}` : `i${i}`}
-            className={`term-chat__msg term-chat__msg--${m.role}${m.role === 'user' ? ' term-chat__bubble' : ''}${
-              queuedRef.current.has(m) ? ' term-chat__msg--queued' : ''
-            }`}
-          >
-            {m.parts.map((p, j) =>
-              p.kind === 'text' ? (
-                <MarkdownText key={j} text={p.text} />
-              ) : p.kind === 'thinking' ? (
-                // Reasoning, not the answer: collapsed by default so it cannot be mistaken for it.
-                <details key={j} className="term-chat__thinking">
-                  <summary>Thinking</summary>
-                  <MarkdownText text={p.text} />
-                </details>
-              ) : p.body ? (
-                // A plan / question is the content itself, not plumbing: shown expanded, in full,
-                // flowing with the thread (no inner scroll box). The answer stays under it.
-                <div key={j} className="term-chat__tool-card">
-                  <div className="term-chat__tool-card-title">{toolCardTitle(p.name)}</div>
-                  <MarkdownText text={p.body} />
-                  {p.result && <pre className="term-chat__tool-result">{p.result}</pre>}
-                  {answerCard && answerCard.card.message === i && answerCard.card.part === j && (
-                    // Keyed by the BOUND ticket: a new hold on the same card starts from a clean
-                    // state, and every answer names the request this card was drawn for.
-                    p.name === 'AskUserQuestion' && p.questions ? (
-                      <QuestionAnswerControls
-                        key={answerCard.pendingId}
-                        questions={p.questions}
-                        agentLabel={agentLabel}
-                        chip={mdChip}
-                        onSubmit={(a) => answerHeld(answerCard.pendingId, a)}
-                      />
-                    ) : (
-                      <PlanAnswerControls
-                        key={answerCard.pendingId}
-                        agentLabel={agentLabel}
-                        chip={mdChip}
-                        onSubmit={(a) => answerHeld(answerCard.pendingId, a)}
-                      />
-                    )
-                  )}
-                  {updatingCard && updatingCard.message === i && updatingCard.part === j && (
-                    <AnswerControlsUpdating chip={mdChip} />
-                  )}
-                </div>
-              ) : (
-                <details key={j} className="term-chat__tool">
-                  <summary>
-                    <span className="term-chat__tool-name">{p.name}</span>
-                    {p.arg && <span className="term-chat__tool-arg">{p.arg}</span>}
-                  </summary>
-                  {p.result && <pre className="term-chat__tool-result">{p.result}</pre>}
-                </details>
-              )
-            )}
-            {queuedRef.current.has(m) && <div className="term-chat__queued-label">Queued</div>}
-            {turnEnds.has(i) && (
-              <ChatTurnActions
-                copyText={turnEnds.get(i)!.copyText}
-                at={turnEnds.get(i)!.at}
-                now={now}
-                latest={i === latestTurnEnd}
-              />
-            )}
-          </div>
-        ))}
-        {screenBlock && (
-          <div className="term-chat__screen-block" role="status" aria-live="polite">
-            <div className="term-chat__screen-block-title">
-              {screenBlockedSentence(screenBlock.kind, agentLabel, mdChip)}
             </div>
-            {screenBlock.text !== null && <pre className="term-chat__screen-block-text">{screenBlock.text}</pre>}
-          </div>
-        )}
-        {activity && (
-          // One live region for both sentences, so working → waiting changes its text instead of
-          // remounting it (a remounted role=status is announced again). The words are the
-          // composer placeholder's own (`chatComposerPlaceholder`), so the two never disagree.
-          <div className="term-chat__activity" role="status" aria-live="polite">
-            {activity === 'working' && <Spinner />}
-            {chatComposerPlaceholder({
-              readonly: false,
-              refusal: activity,
-              agentLabel,
-              chip: mdChip,
-              answerOnCard: answerCard !== null
-            })}
-          </div>
+          )}
+          {/* Only a PAGED thread (keyed messages) can know it reached the start; grok's capped
+              whole-file read says nothing about what lies before it. */}
+          {olderState === 'idle' && thread.olderCursor === null && messages.some((m) => m.key !== undefined) && (
+            <div className="term-chat__older term-chat__older--start">Beginning of conversation</div>
+          )}
+          {showEmpty && (
+            <div className="term-chat__empty">
+              <div>{EMPTY_TEXT[loadState].title.replace('{agent}', agentLabel)}</div>
+              {EMPTY_TEXT[loadState].detail && (
+                <div className="term-chat__empty-detail">{EMPTY_TEXT[loadState].detail}</div>
+              )}
+              {loadState !== 'unsupported' && loadState !== 'remoteUnsupported' && loadState !== 'ambiguous' && loadState !== 'ok' && (
+                <button className="term-chat__retry" onClick={() => load()}>
+                  Retry
+                </button>
+              )}
+            </div>
+          )}
+          {messages.map((m, i) => {
+            // A message whose every part is drawn inside an earlier message's tool block has nothing
+            // of its own to draw, unless it ends a turn: then it draws that turn's action row and
+            // nothing else — bar a day divider (below). (Only assistant parts fold, so a queued
+            // message — the user's — never does.)
+            const folded = m.parts.length > 0 && m.parts.every((_, j) => !drawsAt(i, j))
+            const turnEnd = turnEnds.get(i)
+            // Keyed by the source line's byte offset: a prepended page does not re-key (and so does
+            // not re-render) a single existing bubble. Unkeyed ones (grok, the optimistic sent
+            // bubble) fall back to their position.
+            const key = m.key !== undefined ? `k${m.key}` : `i${i}`
+            // The day divider is a sibling BEFORE the wrapper, a folded one's too. A message drawn
+            // whole inside an earlier tool block still draws its divider alone: its day would
+            // otherwise lose its label, since the divider goes only on a day's FIRST stamped message.
+            const day = days.get(i)
+            const divider = day !== undefined && (
+              <div className="term-chat__day" role="separator" aria-label={day}>
+                {day}
+              </div>
+            )
+            if (folded && !turnEnd) return divider ? <Fragment key={key}>{divider}</Fragment> : null
+            const actions = turnEnd && (
+              <ChatTurnActions copyText={turnEnd.copyText} at={turnEnd.at} now={now} latest={i === latestTurnEnd} />
+            )
+            if (folded) {
+              return (
+                <Fragment key={key}>
+                  {divider}
+                  <div className={`term-chat__msg term-chat__msg--${m.role} term-chat__msg--folded`}>{actions}</div>
+                </Fragment>
+              )
+            }
+            const queued = queuedRef.current.has(m)
+            return (
+              <Fragment key={key}>
+                {divider}
+                <div
+                  className={`term-chat__msg term-chat__msg--${m.role}${m.role === 'user' ? ' term-chat__bubble' : ''}${
+                    queued ? ' term-chat__msg--queued' : ''
+                  }`}
+                >
+                  {isTeammateMessage(m) ? (
+                    // A teammate's messages (the opt-in `rich` read), drawn whole so a run from one
+                    // teammate folds into one row, as Claude Code's TUI does.
+                    <ChatTeammateMessage parts={m.parts} Markdown={MarkdownText} />
+                  ) : (
+                    m.parts.map((p, j) => {
+                      if (!drawsAt(i, j)) return null
+                      const group = toolGroups.groupAt.get(partPosition(i, j))
+                      if (group) return <ChatToolGroup key={group.key} messages={messages} group={group} renderPart={renderPart} />
+                      return renderPart(p, i, j)
+                    })
+                  )}
+                  {m.role === 'user' && m.at !== undefined && (
+                    <time
+                      className="term-chat__time term-chat__time--user"
+                      dateTime={new Date(m.at).toISOString()}
+                      title={chatAbsoluteTime(m.at)}
+                    >
+                      {chatClockTime(m.at)}
+                    </time>
+                  )}
+                  {queued && <div className="term-chat__queued-label">Queued</div>}
+                  {actions}
+                </div>
+              </Fragment>
+            )
+          })}
+          {screenBlock && (
+            <div className="term-chat__screen-block" role="status" aria-live="polite">
+              <div className="term-chat__screen-block-title">
+                {screenBlockedSentence(screenBlock.kind, agentLabel, mdChip)}
+              </div>
+              {screenBlock.text !== null && <pre className="term-chat__screen-block-text">{screenBlock.text}</pre>}
+            </div>
+          )}
+          {activity && (
+            // One live region for both sentences, so working → waiting changes its text instead of
+            // remounting it (a remounted role=status is announced again). The words are the
+            // composer placeholder's own (`chatComposerPlaceholder`), so the two never disagree.
+            <div className="term-chat__activity" role="status" aria-live="polite">
+              {activity === 'working' && <Spinner />}
+              {chatComposerPlaceholder({
+                readonly: false,
+                refusal: activity,
+                agentLabel,
+                chip: mdChip,
+                answerOnCard: answerCard !== null
+              })}
+            </div>
+          )}
+        </div>
+        {!following && messages.length > 0 && (
+          // The Live chat drawer's "N new messages ↓" pill (LiveChatDrawer.tsx), plus a bare "↓" while
+          // nothing new has come in: here the thread is also read back from deep in its history.
+          <button
+            type="button"
+            className="confirm__btn primary term-chat__to-latest"
+            title="Scroll to the latest message"
+            aria-label={unseen > 0 ? undefined : 'Scroll to the latest message'}
+            // Keep the keyboard where it was (the composer): a click here is not a reason to leave it.
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={scrollToLatest}
+          >
+            {unseen > 0 ? `${newMessagesLabel(unseen)} ↓` : '↓'}
+          </button>
         )}
       </div>
       {!readOnly && (
@@ -1090,15 +1386,19 @@ export function ChatPanel({
           value={input}
           onChange={setInput}
           onSend={() => void send()}
-          placeholder={chatComposerPlaceholder({
-            readonly,
-            refusal,
-            agentLabel,
-            chip: mdChip,
-            answerOnCard: answerCard !== null,
-            sendMode,
-            screen: screenBlock?.live === true ? screenBlock.kind : null
-          })}
+          placeholder={
+            shownSuggestion ??
+            chatComposerPlaceholder({
+              readonly,
+              refusal,
+              agentLabel,
+              chip: mdChip,
+              answerOnCard: answerCard !== null,
+              sendMode,
+              screen: screenBlock?.live === true ? screenBlock.kind : null
+            })
+          }
+          suggestion={shownSuggestion}
           // A dialog the POLL found is also cleared by it; one a refused send found is not (a remote
           // pane is never polled), so that one leaves the draft editable for the resend.
           disabled={readonly || composerStandsDown(refusal) || screenBlock?.live === true}

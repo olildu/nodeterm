@@ -57,17 +57,36 @@ vi.mock('./pty-devices', async (importOriginal) => ({
   readPtyDevices: () => ({ ceiling: 511, inUse: 8 })
 }))
 
+// The "still JOINS" case holds a REMOTE session, whose spawn needs `findSsh` to resolve (without it
+// the remote branch is skipped) and whose agent-socket probe would run a real `ssh -G`. Every other
+// executable lookup is the real one.
+vi.mock('./exec-path', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./exec-path')>()
+  return {
+    ...real,
+    findExecutableSync: (bin: string, fallbacks?: string[]) =>
+      bin === 'ssh' ? '/usr/bin/ssh' : real.findExecutableSync(bin, fallbacks)
+  }
+})
+vi.mock('./remote-ssh/agent-probe', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./remote-ssh/agent-probe')>()),
+  probeAgentSockToPin: async () => undefined
+}))
+
 describe('pty create: requireRemote never falls back to a local shell', () => {
   let fake: FakePlatform
+  let manager: import('./pty-manager').PtyManager
 
   beforeEach(async () => {
     spawned.length = 0
     fake = fakePlatform()
     initPlatform(fake)
     const { PtyManager } = await import('./pty-manager')
-    new PtyManager().registerIpc()
+    manager = new PtyManager()
+    manager.registerIpc()
   })
   afterEach(() => {
+    vi.restoreAllMocks()
     resetPlatformForTests()
   })
 
@@ -96,15 +115,72 @@ describe('pty create: requireRemote never falls back to a local shell', () => {
     expect(res.sessionId).not.toBe('')
   })
 
-  it('still JOINS a live session for that node — only a fresh local spawn is refused', async () => {
-    // The session is already running (it was created while the master was up). A second view —
-    // the kanban card modal, another window — must attach to it: the session runs wherever it
-    // runs, and refusing the join would break a perfectly healthy remote terminal.
-    const first = await create(ALICE, {})
+  it('still JOINS a live REMOTE session for that node — only a fresh local spawn is refused', async () => {
+    // The session is already running on the host (it was created while the master was up). A
+    // second view — the kanban card modal, another window — whose master is momentarily down must
+    // attach to it: refusing the join would break a perfectly healthy remote terminal. (A held
+    // LOCAL session is the opposite case and is refused: pty-require-remote-join.test.ts.)
+    const internals = manager as unknown as {
+      remoteSessionVerdict: () => Promise<string>
+      captureForResync: (s: string) => Promise<string>
+      paneCursor: (s: string) => Promise<unknown>
+    }
+    // No host to ask: the freshness read answers "absent" (so the first create spawns its ssh
+    // client) and the joiner's paint capture answers nothing, instead of running a real ssh.
+    vi.spyOn(internals, 'remoteSessionVerdict').mockResolvedValue('absent')
+    vi.spyOn(internals, 'captureForResync').mockResolvedValue('')
+    vi.spyOn(internals, 'paneCursor').mockResolvedValue(undefined)
+    const first = await create(ALICE, {
+      requireRemote: true,
+      sshRemote: { controlPath: '/tmp/nt-test-cm-require-remote', conn: { host: 'h1', user: 'u' }, remoteCwd: '/srv/app' }
+    })
+    expect(first.unavailable).toBeUndefined()
+    expect(spawned).toHaveLength(1)
+    expect(spawned[0].file).toBe('/usr/bin/ssh') // the remote branch, never a local shell
+
     const joined = await create(BOB, { requireRemote: true })
 
     expect(spawned).toHaveLength(1)
     expect(joined.unavailable).toBeUndefined()
     expect(joined.sessionId).toBe(first.sessionId)
+  })
+
+  // Issue #1186: `requireRemote` comes from the node's own fields, which reach a node through a
+  // SHARED file the host's desktop also writes. The owning project — a machine-local fact — must
+  // refuse the local spawn on its own when a caller forgot to route the node.
+  describe('a node owned by an SSH project (issue #1186)', () => {
+    const sshProjects = new Set(['ssh-p'])
+    beforeEach(() => manager.setSshProjectCheck((id) => sshProjects.has(id)))
+
+    it('refuses a local spawn with no requireRemote and no sshRemote', async () => {
+      const res = await create(ALICE, { ownerProjectId: 'ssh-p', cwd: '.', agentId: 'codex' })
+      expect(spawned).toHaveLength(0)
+      expect(res.unavailable).toBe('ssh')
+    })
+
+    it('a LOCAL project still spawns locally', async () => {
+      const res = await create(ALICE, { ownerProjectId: 'local-p', cwd: '/srv/app' })
+      expect(spawned).toHaveLength(1)
+      expect(res.unavailable).toBeUndefined()
+    })
+
+    it('a plain `ssh <host>` terminal is a local pty by design and still spawns', async () => {
+      const res = await create(ALICE, { ownerProjectId: 'ssh-p', shell: 'ssh', shellArgs: ['-p', '22', 'u@h'] })
+      expect(spawned).toHaveLength(1)
+      expect(res.unavailable).toBeUndefined()
+    })
+
+    it('the renderer-marked local login node still spawns', async () => {
+      const res = await create(ALICE, { ownerProjectId: 'ssh-p', localOnSshCanvas: true })
+      expect(spawned).toHaveLength(1)
+      expect(res.unavailable).toBeUndefined()
+    })
+
+    it('unwired: no refusal (the pre-check behaviour)', async () => {
+      manager.setSshProjectCheck(null)
+      const res = await create(ALICE, { ownerProjectId: 'ssh-p' })
+      expect(spawned).toHaveLength(1)
+      expect(res.unavailable).toBeUndefined()
+    })
   })
 })

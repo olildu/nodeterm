@@ -30,6 +30,7 @@ import {
   type ShareReply,
   type ShareTeamApi
 } from '@shared/share-team'
+import { errorText } from '@shared/error-text'
 
 /** One terminal node of the project being shared, with what the renderer knows about its agent. */
 export interface ShareNode {
@@ -132,8 +133,6 @@ export interface ShareDeps {
 const BUSY_STATES = new Set<AgentState>(['working', 'blocked', 'waiting'])
 const isAgentResumable = (id: string | undefined): boolean =>
   !!id && (RESUMABLE_AGENTS as readonly string[]).includes(id)
-
-const errorText = (e: unknown): string => (e instanceof Error ? e.message : String(e))
 
 export const BUSY_REFUSAL = 'Wait for these agents to finish (or stop them), then share again.'
 export const CANVAS_CHANGED = 'The canvas changed while preparing the share. Nothing was changed; share again.'

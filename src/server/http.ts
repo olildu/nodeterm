@@ -7,14 +7,19 @@ import http from 'http'
 import fs from 'fs'
 import path from 'path'
 import zlib from 'zlib'
-import type { Auth } from './auth'
-import { proxyAuthAllowed, type TrustProxyConfig } from './proxy-trust'
+import { passwordTooShort, type Auth } from './auth'
+import { noteProxyRefusal, proxyAuthDecision, type TrustProxyConfig } from './proxy-trust'
+import { loginClientKey } from './client-address'
+import { sameOriginRequest } from './origin'
 import { handleDownload } from './download'
 import type { DownloadTickets } from '../core/download-tickets'
 
 export const SESSION_COOKIE = 'nt_session'
 
 const MAX_BODY_BYTES = 10 * 1024 // 10KB POST body cap
+/** A form body that has not arrived by now is abandoned. Login attempts hold a rate-limit slot
+ *  while their body is read (S1), so a client that never sends one must not hold it for long. */
+export const FORM_BODY_TIMEOUT_MS = 10_000
 
 const CONTENT_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -29,7 +34,15 @@ const CONTENT_TYPES: Record<string, string> = {
 }
 
 // CSP served with the inline login/setup pages (no app assets, no connections).
-const PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'"
+const PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"
+
+/** Sent on EVERY response (S6). The app's own CSP is a `<meta>`, where `frame-ancestors` is
+ *  ignored, so framing has to be refused by HTTP header; a second CSP header only adds a
+ *  restriction (browsers enforce each policy). The login/setup pages send PAGE_CSP instead,
+ *  which carries the same directive. */
+const FRAME_CSP = "frame-ancestors 'none'"
+/** HSTS when NODETERM_PUBLIC_ORIGIN says the server is reached over https (S5). */
+const HSTS = 'max-age=31536000'
 
 /** Types worth compressing. Everything else (png, woff2) is already compressed — running it
  *  through gzip only burns CPU and usually grows the payload. */
@@ -54,6 +67,12 @@ export interface HttpHandlerOpts {
   /** Ticket store backing `GET /download` (Explorer file downloads). Omitted in tests that don't
    *  exercise it — the route then simply doesn't exist. */
   downloadTickets?: DownloadTickets
+  /**
+   * NODETERM_PUBLIC_ORIGIN (an https origin, normalized). When set the session cookie is always
+   * `Secure`, every response carries HSTS, and an `Origin` equal to it passes the same-origin check
+   * even when the proxy rewrites `Host`. See config.ts.
+   */
+  publicOrigin?: string
 }
 
 /** Parse the `nt_session=` value out of a Cookie header. Exported for the WS upgrade (Task 5). */
@@ -73,19 +92,43 @@ function isHtmlNavigation(req: http.IncomingMessage): boolean {
   return typeof accept === 'string' && accept.includes('text/html')
 }
 
-function cookieAttributes(req: http.IncomingMessage): string {
+/**
+ * `Secure` is ALWAYS set when the operator declared an https public origin. Without one it follows
+ * `X-Forwarded-Proto` as before (S5): a client can only use that header against itself, but a
+ * proxy that does not send it silently loses `Secure` — hence the boot/first-request warning.
+ */
+function cookieAttributes(req: http.IncomingMessage, publicOrigin: string | undefined): string {
   let attrs = `HttpOnly; SameSite=Strict; Path=/`
-  if (req.headers['x-forwarded-proto'] === 'https') attrs += '; Secure'
+  if (publicOrigin !== undefined || req.headers['x-forwarded-proto'] === 'https') attrs += '; Secure'
   return attrs
 }
 
-function setSessionCookie(req: http.IncomingMessage, res: http.ServerResponse, token: string): void {
-  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${token}; ${cookieAttributes(req)}`)
+function setSessionCookie(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  token: string,
+  publicOrigin: string | undefined
+): void {
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${token}; ${cookieAttributes(req, publicOrigin)}`)
 }
 
-function clearSessionCookie(req: http.IncomingMessage, res: http.ServerResponse): void {
-  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; Max-Age=0; ${cookieAttributes(req)}`)
+function clearSessionCookie(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  publicOrigin: string | undefined
+): void {
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; Max-Age=0; ${cookieAttributes(req, publicOrigin)}`)
 }
+
+/** Is this `Host` header one of this machine's loopback names (no warning needed for it)? */
+function isLoopbackHost(host: string | undefined): boolean {
+  if (!host) return true
+  let name = host.toLowerCase()
+  if (name.startsWith('[')) name = name.slice(1, name.indexOf(']') === -1 ? undefined : name.indexOf(']'))
+  else if (name.lastIndexOf(':') !== -1 && name.indexOf(':') === name.lastIndexOf(':')) name = name.slice(0, name.lastIndexOf(':'))
+  return name === 'localhost' || name.endsWith('.localhost') || name === '::1' || /^127(\.\d{1,3}){3}$/.test(name)
+}
+
 
 function redirect(res: http.ServerResponse, status: number, location: string): void {
   res.writeHead(status, { Location: location })
@@ -98,8 +141,9 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
   res.end(s)
 }
 
-function sendPage(res: http.ServerResponse, status: number, html: string): void {
+function sendPage(res: http.ServerResponse, status: number, html: string, extra: http.OutgoingHttpHeaders = {}): void {
   res.writeHead(status, {
+    ...extra,
     'Content-Type': 'text/html; charset=utf-8',
     'Content-Security-Policy': PAGE_CSP,
     'X-Content-Type-Options': 'nosniff'
@@ -107,29 +151,45 @@ function sendPage(res: http.ServerResponse, status: number, html: string): void 
   res.end(html)
 }
 
-/** Read a form-encoded POST body (capped) and decode into URLSearchParams. */
+/** Read a form-encoded POST body (capped, and abandoned after FORM_BODY_TIMEOUT_MS) and decode
+ *  into URLSearchParams. */
 function readForm(req: http.IncomingMessage): Promise<URLSearchParams> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
     let size = 0
     let aborted = false
+    const abort = (err: Error): void => {
+      if (aborted) return
+      aborted = true
+      clearTimeout(timer)
+      reject(err)
+      req.destroy()
+    }
+    const timer = setTimeout(() => abort(new Error('body timeout')), FORM_BODY_TIMEOUT_MS)
+    if (timer.unref) timer.unref()
     req.on('data', (chunk: Buffer) => {
       if (aborted) return
       size += chunk.length
       if (size > MAX_BODY_BYTES) {
-        aborted = true
-        reject(new Error('body too large'))
-        req.destroy()
+        abort(new Error('body too large'))
         return
       }
       chunks.push(chunk)
     })
     req.on('end', () => {
       if (aborted) return
+      clearTimeout(timer)
       resolve(new URLSearchParams(Buffer.concat(chunks).toString('utf8')))
     })
     req.on('error', (err) => {
-      if (!aborted) reject(err)
+      if (aborted) return
+      aborted = true
+      clearTimeout(timer)
+      reject(err)
+    })
+    // A client that hangs up before the body is complete fires neither 'end' nor 'error'.
+    req.on('close', () => {
+      if (!aborted && !req.complete) abort(new Error('client closed'))
     })
   })
 }
@@ -155,8 +215,13 @@ const H1_STYLE = 'margin:0 0 4px;font-size:18px;font-weight:600'
 const SUB_STYLE = 'margin:0 0 16px;font-size:13px;color:#9aa0a6'
 const ERR_STYLE = 'margin:0 0 12px;font-size:13px;color:#f26d6d'
 
-function loginPage(hasError: boolean): string {
-  const errLine = hasError ? `<p style="${ERR_STYLE}">Wrong password. Try again.</p>` : ''
+function loginPage(error: 'wrong' | { retryAfterMs: number } | null): string {
+  const errLine =
+    error === 'wrong'
+      ? `<p style="${ERR_STYLE}">Wrong password. Try again.</p>`
+      : error !== null
+        ? `<p style="${ERR_STYLE}">Too many attempts. Try again in ${Math.max(1, Math.ceil(error.retryAfterMs / 60_000))} minute${Math.ceil(error.retryAfterMs / 60_000) > 1 ? 's' : ''}.</p>`
+        : ''
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in — nodeterm</title></head><body style="${PAGE_STYLE}"><form method="post" action="/auth/login" style="${CARD_STYLE}"><h1 style="${H1_STYLE}">nodeterm</h1><p style="${SUB_STYLE}">Sign in to continue</p>${errLine}<input style="${INPUT_STYLE}" type="password" name="password" placeholder="Password" autofocus autocomplete="current-password"><button style="${BUTTON_STYLE}" type="submit">Sign in</button></form></body></html>`
 }
 
@@ -330,7 +395,9 @@ async function serveStatic(
 
   const identity = async (): Promise<Buffer> => {
     const raw = await fs.promises.readFile(filePath)
-    // CSP rewrite ONLY on index.html: relax connect-src so the WS client can connect.
+    // CSP rewrite ONLY on index.html: give the WS client a connect-src. `'self'` covers a
+    // same-origin ws:/wss: URL (CSP3 matches ws↔http and wss↔https for 'self'), which is the only
+    // socket the bridge opens — `ws: wss:` allowed a socket to ANY host (S6).
     if (!isIndex) return raw
     const html = raw.toString('utf8')
     const marker = "default-src 'self';"
@@ -339,11 +406,11 @@ async function serveStatic(
       // would block the ws:/wss: WebSocket with no visible error — make sure an
       // operator sees this in the server logs.
       console.warn(
-        "[nodeterm-server] index.html CSP did not contain the expected `default-src 'self';` marker — the ws: connect-src rewrite did not apply; the browser will block the WebSocket. Rebuild the renderer or update the rewrite."
+        "[nodeterm-server] index.html CSP did not contain the expected `default-src 'self';` marker — the connect-src rewrite did not apply; the browser will block the WebSocket. Rebuild the renderer or update the rewrite."
       )
       return raw
     }
-    return Buffer.from(html.replace(marker, "default-src 'self'; connect-src 'self' ws: wss:;"))
+    return Buffer.from(html.replace(marker, "default-src 'self'; connect-src 'self';"))
   }
 
   const enc =
@@ -373,7 +440,8 @@ async function serveStatic(
 export function createHttpHandler(
   opts: HttpHandlerOpts
 ): (req: http.IncomingMessage, res: http.ServerResponse) => void {
-  const { auth, rendererDir, trustProxy, downloadTickets } = opts
+  const { auth, rendererDir, trustProxy, downloadTickets, publicOrigin } = opts
+  let warnedNoPublicOrigin = false
 
   return function handler(req: http.IncomingMessage, res: http.ServerResponse): void {
     void handle(req, res).catch(() => {
@@ -382,17 +450,51 @@ export function createHttpHandler(
     })
   }
 
+  /** A refused login: 429 with Retry-After — a page for a browser, JSON otherwise. */
+  function sendTooMany(req: http.IncomingMessage, res: http.ServerResponse, retryAfterMs: number): void {
+    const retryAfter = String(Math.max(1, Math.ceil(retryAfterMs / 1000)))
+    if (isHtmlNavigation(req)) {
+      sendPage(res, 429, loginPage({ retryAfterMs }), { 'Retry-After': retryAfter })
+      return
+    }
+    res.writeHead(429, { 'Content-Type': 'application/json; charset=utf-8', 'Retry-After': retryAfter })
+    res.end(JSON.stringify({ error: 'too_many_attempts' }))
+  }
+
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const url = new URL(req.url || '/', 'http://x')
     const pathname = url.pathname
     const method = req.method || 'GET'
 
-    const proxyAuthed =
-      trustProxy !== undefined && proxyAuthAllowed(trustProxy, req.headers, req.socket.remoteAddress)
+    // Every response, before any route can answer (S6, S5).
+    res.setHeader('X-Frame-Options', 'DENY')
+    res.setHeader('Content-Security-Policy', FRAME_CSP)
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    if (publicOrigin !== undefined) res.setHeader('Strict-Transport-Security', HSTS)
+    else if (!warnedNoPublicOrigin && !isLoopbackHost(req.headers['host'])) {
+      warnedNoPublicOrigin = true
+      // A fixed sentence: the Host header is the client's to write, so none of it reaches the log.
+      console.warn(
+        `[nodeterm-server] requests are arriving for a non-loopback host name but NODETERM_PUBLIC_ORIGIN is not set: the session cookie is marked Secure only when your proxy sends X-Forwarded-Proto: https, and no HSTS header is sent. Set NODETERM_PUBLIC_ORIGIN to the https address you open in the browser (for example https://term.example.com). See docs/SERVER.md.`
+      )
+    }
+
+    const decision =
+      trustProxy !== undefined ? proxyAuthDecision(trustProxy, req.headers, req.socket.remoteAddress) : 'none'
+    noteProxyRefusal(decision)
+    const proxyAuthed = decision === 'trusted'
 
     // A proxy-authed caller has no use for the password pages — send them home.
     if (proxyAuthed && method === 'GET' && (pathname === '/login' || pathname === '/setup')) {
       redirect(res, 302, '/')
+      return
+    }
+
+    // Every auth POST changes who is signed in, so a cross-site page must not be able to send one
+    // (login CSRF, forced logout, and — before S4 — locking the owner out from a page they visit).
+    // Refused BEFORE any rate-limit slot is taken, so a refused post costs the lockout nothing.
+    if (method === 'POST' && pathname.startsWith('/auth/') && !sameOriginRequest(req.headers, publicOrigin)) {
+      sendJson(res, 403, { error: 'cross_origin' })
       return
     }
 
@@ -420,7 +522,7 @@ export function createHttpHandler(
         redirect(res, 302, '/setup')
         return
       }
-      sendPage(res, 200, loginPage(url.searchParams.has('error')))
+      sendPage(res, 200, loginPage(url.searchParams.has('error') ? 'wrong' : null))
       return
     }
 
@@ -440,51 +542,82 @@ export function createHttpHandler(
       }
       const token = form.get('token') || ''
       const password = form.get('password') || ''
-      if (password.length < 8 || !auth.consumeSetupToken(token)) {
+      if (passwordTooShort(password) || !auth.consumeSetupToken(token)) {
         sendJson(res, 403, { error: 'invalid_setup' })
         return
       }
       auth.setPassword(password)
       const session = auth.createSession()
-      setSessionCookie(req, res, session)
+      setSessionCookie(req, res, session, publicOrigin)
       redirect(res, 303, '/')
       return
     }
 
     if (pathname === '/auth/login' && method === 'POST') {
-      if (!auth.loginAllowed()) {
-        sendJson(res, 429, { error: 'too_many_attempts' })
+      // Reserve the attempt BEFORE reading the body (S1): the old check-then-read-then-charge let
+      // every request whose body was held back pass the gate while the counter was still zero.
+      const gate = auth.beginLoginAttempt(
+        loginClientKey(req.socket.remoteAddress, req.headers['x-forwarded-for'], trustProxy)
+      )
+      if (!gate.ok) {
+        sendTooMany(req, res, gate.retryAfterMs)
         return
       }
       let form: URLSearchParams
       try {
         form = await readForm(req)
       } catch {
+        gate.finish('abandoned')
         sendJson(res, 400, { error: 'bad_request' })
         return
       }
       const password = form.get('password') || ''
-      if (auth.verifyPassword(password)) {
-        auth.recordLoginSuccess()
+      let ok: boolean
+      try {
+        ok = await auth.verifyPasswordAsync(password)
+      } catch (err) {
+        gate.finish('abandoned')
+        throw err
+      }
+      if (ok) {
+        gate.finish('success')
         const session = auth.createSession()
-        setSessionCookie(req, res, session)
+        setSessionCookie(req, res, session, publicOrigin)
         redirect(res, 303, '/')
         return
       }
-      auth.recordLoginFailure()
+      gate.finish('failure')
       redirect(res, 303, '/login?error=1')
       return
     }
 
     if (pathname === '/auth/logout' && method === 'POST') {
-      clearSessionCookie(req, res)
+      // Sign out THIS browser: the token it presented is deleted on the server (S3), so a copy of
+      // the cookie stops working too — clearing the cookie alone left it valid for 30 days.
+      const presented = sessionTokenFromCookie(req.headers['cookie'])
+      if (presented) auth.revokeSession(presented)
+      clearSessionCookie(req, res, publicOrigin)
+      redirect(res, 303, '/login')
+      return
+    }
+
+    const token = sessionTokenFromCookie(req.headers['cookie'])
+
+    if (pathname === '/auth/logout-all' && method === 'POST') {
+      // Sign out EVERY browser (S3). Only a signed-in caller may, or anyone could log the owner out.
+      if (!proxyAuthed && !auth.validateSession(token)) {
+        if (isHtmlNavigation(req)) redirect(res, 303, '/login')
+        else sendJson(res, 401, { error: 'unauthorized' })
+        return
+      }
+      auth.revokeAll()
+      clearSessionCookie(req, res, publicOrigin)
       redirect(res, 303, '/login')
       return
     }
 
     // ---- Everything else requires a valid session --------------------------
 
-    const token = sessionTokenFromCookie(req.headers['cookie'])
     if (!proxyAuthed && !auth.validateSession(token)) {
       if (isHtmlNavigation(req)) redirect(res, 302, '/login')
       else sendJson(res, 401, { error: 'unauthorized' })

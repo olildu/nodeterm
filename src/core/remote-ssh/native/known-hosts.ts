@@ -2,6 +2,14 @@
 // `StrictHostKeyChecking=accept-new` — a host never seen before is recorded and accepted; a host
 // whose recorded key CHANGED is refused (the MITM case), and so is a key marked @revoked.
 //
+// A host that has a recorded key is never "first seen" again, whatever key TYPE it presents.
+// The transport offers the recorded types first (`hostKeyAlgorithmsFor`, OpenSSH's
+// order_hostkeyalgs), so a host that still holds its recorded key always presents it; one that
+// presents another type has either dropped that key or is not the host — a MITM that holds only an
+// RSA key against a host recorded under ed25519. Recording that key as new (what a type-blind
+// accept-new did) let the swap through silently. It is refused like a changed key, with the remedy
+// named; this is stricter than OpenSSH's accept-new, which records a new type for a known host.
+//
 // The file format is OpenSSH's (sshd(8) "SSH_KNOWN_HOSTS FILE FORMAT"), read from the same files
 // `ssh -G` reports (userknownhostsfile + globalknownhostsfile), so a host the user already trusts
 // with their own ssh is trusted here, and one we record is trusted by their ssh too:
@@ -107,15 +115,31 @@ export function parseKnownHosts(text: string): Entry[] {
 }
 
 /**
+ * The key types recorded for `name` across all files, in file order, deduplicated. @revoked and
+ * @cert-authority lines are not recorded keys: a revoked key says which key to refuse, and the
+ * native transport does not do host certificates.
+ */
+export function recordedHostKeyTypes(texts: string[], name: string): string[] {
+  const types: string[] = []
+  for (const text of texts) {
+    for (const e of parseKnownHosts(text)) {
+      if (e.marker === '@cert-authority' || e.marker === '@revoked') continue
+      if (!hostPatternsMatch(e.hosts, name)) continue
+      if (!types.includes(e.keyType)) types.push(e.keyType)
+    }
+  }
+  return types
+}
+
+/**
  * The verdict for `blob` presented by `name` (already in knownHostsName form), across all files.
  * Order of precedence follows OpenSSH: a matching @revoked key refuses; a matching key accepts;
- * a recorded key of the SAME type that differs is a mismatch; otherwise the host is unknown.
- * A different key TYPE for a known host is "unknown", not a mismatch — OpenSSH offers the types it
- * has on record first, and a host that genuinely serves several types records each separately.
+ * otherwise, a host with ANY recorded key is a mismatch — the same type with different bytes (a
+ * changed key) and another type alike (see the file header); only a host with no recorded key at
+ * all is unknown.
  */
 export function verifyHostKey(texts: string[], name: string, blob: Buffer): HostKeyVerdict {
-  const type = keyTypeOfBlob(blob)
-  let sawSameTypeDifferent = false
+  let recorded = false
   let matched = false
   for (const text of texts) {
     for (const e of parseKnownHosts(text)) {
@@ -125,12 +149,49 @@ export function verifyHostKey(texts: string[], name: string, blob: Buffer): Host
         if (e.key.equals(blob)) return 'revoked'
         continue
       }
+      recorded = true
       if (e.key.equals(blob)) matched = true
-      else if (e.keyType === type) sawSameTypeDifferent = true
     }
   }
   if (matched) return 'match'
-  return sawSameTypeDifferent ? 'mismatch' : 'unknown'
+  return recorded ? 'mismatch' : 'unknown'
+}
+
+/**
+ * ssh2 1.17's own default server host key algorithms, in its order (pinned against the package by
+ * known-hosts.test.ts). The list handed to ssh2 is always a reordering of exactly these: an exact
+ * list naming anything ssh2 does not support makes `connect()` throw.
+ */
+export const SSH2_DEFAULT_SERVER_HOST_KEY = [
+  'ssh-ed25519',
+  'ecdsa-sha2-nistp256',
+  'ecdsa-sha2-nistp384',
+  'ecdsa-sha2-nistp521',
+  'rsa-sha2-512',
+  'rsa-sha2-256',
+  'ssh-rsa'
+] as const
+
+/** The known_hosts KEY type an algorithm's key is recorded under: RSA's SHA-2 signature
+ *  algorithms all use an `ssh-rsa` key; every other algorithm is named after its key type. */
+function keyTypeOfAlgorithm(alg: string): string {
+  return alg === 'rsa-sha2-512' || alg === 'rsa-sha2-256' ? 'ssh-rsa' : alg
+}
+
+/**
+ * OpenSSH's order_hostkeyalgs over ssh2's defaults: the algorithms whose key type is recorded for
+ * the host first, everything else after, each half in the default order. `undefined` (= ssh2's
+ * default) when nothing recorded maps to an algorithm we offer — a host recorded only under
+ * `ssh-dss` or a security-key type keeps the default order, and the verifier still refuses the
+ * key it then presents.
+ */
+export function orderHostKeyAlgorithms(recordedTypes: string[]): string[] | undefined {
+  const first: string[] = []
+  const last: string[] = []
+  for (const alg of SSH2_DEFAULT_SERVER_HOST_KEY) {
+    ;(recordedTypes.includes(keyTypeOfAlgorithm(alg)) ? first : last).push(alg)
+  }
+  return first.length ? [...first, ...last] : undefined
 }
 
 function readIfPresent(p: string): string {
@@ -153,6 +214,22 @@ export interface HostKeyPolicy {
   globalFiles: string[]
 }
 
+/** The `algorithms.serverHostKey` list for a connection to `host:port`, or undefined for ssh2's
+ *  default. Read from the same files, under the same name, the verifier reads. */
+export function hostKeyAlgorithmsFor(policy: HostKeyPolicy, host: string, port: number): string[] | undefined {
+  const texts = [...policy.userFiles, ...policy.globalFiles].map(readIfPresent)
+  return orderHostKeyAlgorithms(recordedHostKeyTypes(texts, knownHostsName(host, port)))
+}
+
+export interface HostKeyDecision {
+  accept: boolean
+  verdict: HostKeyVerdict
+  /** The presented key's type, and the types on record for the host — so a refusal can say
+   *  "recorded ssh-ed25519, presented ssh-rsa" instead of only "changed". */
+  presentedType?: string
+  recordedTypes?: string[]
+}
+
 /**
  * The accept-new decision, with the file side effects: an unknown key is appended to the FIRST
  * user known_hosts file (created with its directory, 0600/0700 — ssh's own modes) and accepted;
@@ -164,11 +241,19 @@ export function acceptNewHostKey(
   host: string,
   port: number,
   blob: Buffer
-): { accept: boolean; verdict: HostKeyVerdict } {
+): HostKeyDecision {
   const name = knownHostsName(host, port)
   const texts = [...policy.userFiles, ...policy.globalFiles].map(readIfPresent)
   const verdict = verifyHostKey(texts, name, blob)
   if (verdict === 'match') return { accept: true, verdict }
+  if (verdict === 'mismatch') {
+    return {
+      accept: false,
+      verdict,
+      presentedType: keyTypeOfBlob(blob) ?? 'unknown',
+      recordedTypes: recordedHostKeyTypes(texts, name)
+    }
+  }
   if (verdict !== 'unknown') return { accept: false, verdict }
   const line = knownHostsLine(name, blob)
   const file = policy.userFiles[0]
@@ -186,4 +271,17 @@ export function acceptNewHostKey(
     // the next connection simply asks again.
   }
   return { accept: true, verdict }
+}
+
+/** The refusal sentence for a mismatch: OpenSSH's banner (callers and users match on it), plus
+ *  what differed and the remedy when the TYPE changed — a rotation the user must confirm. */
+export function hostKeyMismatchMessage(knownAs: string, port: number, d: HostKeyDecision): string {
+  const head = `@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@ Host key verification failed for ${knownAs}.`
+  const recorded = d.recordedTypes ?? []
+  if (!d.presentedType || !recorded.length || recorded.includes(d.presentedType)) return head
+  return (
+    `${head} known_hosts records a ${recorded.join(' / ')} key for this host, and it presented a ` +
+    `${d.presentedType} key instead. If the host's keys really changed, remove the old entry ` +
+    `(ssh-keygen -R ${knownHostsName(knownAs, port)}) and connect again.`
+  )
 }

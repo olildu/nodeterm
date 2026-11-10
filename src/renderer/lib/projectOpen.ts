@@ -3,6 +3,7 @@
 // calls and the reply — so every decision that does not need React is unit-testable here, the
 // same reasoning as controlRouting.ts / pendingLaunch.ts.
 import { oneLine } from '@shared/one-line'
+import { rootPositionWith } from '@shared/root-position'
 import { sourceIsControlCapable } from './controlRouting'
 
 /** The little these helpers need to know about a project. */
@@ -294,27 +295,9 @@ export interface PlacedNode {
 const placedW = (n: PlacedNode): number => n.size?.width ?? (n.width as number) ?? 0
 const placedH = (n: PlacedNode): number => n.size?.height ?? (n.height as number) ?? 0
 
-/** A node's position in ROOT space: its own plus every ancestor frame's origin (a group child's
- *  stored position is frame-relative). Cycle-guarded like every other parent walk. */
-function rootPosition(n: PlacedNode, byId: Map<string, PlacedNode>): { x: number; y: number } {
-  let x = n.position.x
-  let y = n.position.y
-  const seen = new Set<string>(n.id ? [n.id] : [])
-  let parentId = n.parentId
-  while (parentId && !seen.has(parentId)) {
-    seen.add(parentId)
-    const parent = byId.get(parentId)
-    if (!parent) break
-    x += parent.position.x
-    y += parent.position.y
-    parentId = parent.parentId
-  }
-  return { x, y }
-}
-
 /**
- * A stored node's ROOT-space position — the public face of `rootPosition`, so the cold-open
- * planner does not need a third copy of a parent walk this repo already carries two of.
+ * A stored node's ROOT-space position (a group child's stored position is frame-relative), over
+ * the shared parent walk in `@shared/root-position`.
  */
 export function rootPositionIn(
   nodes: readonly PlacedNode[],
@@ -322,7 +305,7 @@ export function rootPositionIn(
 ): { x: number; y: number } {
   const byId = new Map<string, PlacedNode>()
   for (const n of nodes) if (n.id) byId.set(n.id, n)
-  return rootPosition(node, byId)
+  return rootPositionWith(node, (id) => byId.get(id))
 }
 
 /**
@@ -342,7 +325,7 @@ export function nextFreePosition(
   let left = Infinity
   let bottom = -Infinity
   for (const n of nodes) {
-    const at = rootPosition(n, byId)
+    const at = rootPositionWith(n, (id) => byId.get(id))
     if (Number.isFinite(at.x)) left = Math.min(left, at.x)
     const b = at.y + placedH(n)
     if (Number.isFinite(b)) bottom = Math.max(bottom, b)
@@ -375,12 +358,17 @@ export function nextFreePosition(
 export type UnavailableRecovery = 'clear' | 'rehydrate' | 'keep'
 
 export function unavailableRecovery(
-  project: { unavailable?: boolean; ssh?: unknown },
+  project: { unavailable?: boolean; ssh?: unknown; storeInAppData?: boolean },
   fileState: 'present' | 'absent' | 'unreadable'
 ): UnavailableRecovery {
   // Remote projects are not ours to judge from a local stat — their file lives on the host, and
   // their placeholder is cleared by the reconnect path instead.
   if (!project.unavailable || project.ssh) return 'keep'
+  // A project stored in app data (#1145) never had its canvas in the folder: a project.json there
+  // is a stale copy or a teammate's, never this project's to rehydrate from. Its placeholder means
+  // its app-data file and cache are both gone, so opening the folder starts it again, empty, in app
+  // data — and the store still refuses to write that empty canvas over a data file that reappears.
+  if (project.storeInAppData) return 'clear'
   if (fileState === 'absent') return 'clear'
   if (fileState === 'present') return 'rehydrate'
   return 'keep'

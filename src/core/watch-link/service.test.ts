@@ -131,6 +131,8 @@ interface Opts {
   verifyPassword?: (pw: string, h: ControlPasswordHash) => Promise<boolean>
   /** The REAL link host (and a relay transport no test reaches) instead of the fake. */
   realHost?: boolean
+  history?: WatchLinkServiceDeps['history']
+  historySupported?: WatchLinkServiceDeps['historySupported']
 }
 function service(o: Opts = {}) {
   const file = join(testTmpDir('wls-'), 'watch-links.json')
@@ -162,6 +164,8 @@ function service(o: Opts = {}) {
     ...(o.hashPassword ? { hashPassword: o.hashPassword } : {}),
     ...(o.verifyPassword ? { verifyPassword: o.verifyPassword } : {}),
     ...(o.unsupported ? { unsupported: true } : {}),
+    ...(o.history ? { history: o.history } : {}),
+    ...(o.historySupported ? { historySupported: o.historySupported } : {}),
     ...(o.persistTimeoutMs ? { persistTimeoutMs: o.persistTimeoutMs } : {}),
     ...(o.workspaceWaitMs ? { workspaceWaitMs: o.workspaceWaitMs } : {}),
     ...(o.now ? { now: o.now } : {})
@@ -559,6 +563,27 @@ describe('createWatchLinkService — ending a link', () => {
     t.s.onWorkspaceChanged()
     await flush()
     expect(t.s.list()).toHaveLength(1)
+  })
+
+  it('binds read-back to the link\'s own node: a viewer names only a cursor', async () => {
+    const reads: [string, number | null][] = []
+    const t = service({
+      history: async (nodeId, before) => {
+        reads.push([nodeId, before])
+        return { kind: 'unsupported' }
+      },
+      historySupported: (nodeId) => nodeId === 'n2'
+    })
+    expect((await t.s.create(req({ nodeId: 'n2' }))).ok).toBe(true)
+    const deps = t.hosts.made[0].deps
+    expect(deps.historySupported?.()).toBe(true)
+    await deps.history?.(77)
+    expect(reads).toEqual([['n2', 77]])
+    // Without the shell's reader there is no read-back at all.
+    const bare = service()
+    expect((await bare.s.create(req())).ok).toBe(true)
+    expect(bare.hosts.made[0].deps.history).toBeUndefined()
+    expect(bare.hosts.made[0].deps.historySupported).toBeUndefined()
   })
 
   it('a server-side end (onGone) ends the link locally, tells the owner, and does not revoke again', async () => {
@@ -1022,7 +1047,7 @@ describe('createWatchLinkService — creating a Control link', () => {
     expect(text).not.toContain(Buffer.from(PW).toString('base64'))
     expect(text).not.toContain(Buffer.from(PW).toString('hex'))
     const [loaded] = await t.store.load()
-    expect(Object.keys(loaded.control ?? {}).sort()).toEqual(['enabled', 'hash', 'locked', 'salt', 'wrong'])
+    expect(Object.keys(loaded.control ?? {}).sort()).toEqual(['enabled', 'hash', 'lockStep', 'locked', 'lockedUntil', 'salt', 'wrong'])
     expect(loaded.control).toMatchObject({ enabled: true, locked: false })
     expect(await verifyControlPassword(PW, loaded.control!)).toBe(true)
     const h = t.hosts.made[0]
@@ -1147,10 +1172,12 @@ describe('createWatchLinkService — the Control host seams', () => {
     const h = t.hosts.made[0]
     h.deps.onControlLocked()
     expect(h.record.control?.locked).toBe(true) // before any await: the host's lock rests on it
-    expect(t.notices().at(-1)).toEqual({ kind: 'control-locked', linkId: r.link.linkId, nodeId: 'n1', title: 'build' })
+    const until = h.record.control?.lockedUntil
+    expect(until).toEqual(expect.any(Number))
+    expect(t.notices().at(-1)).toEqual({ kind: 'control-locked', linkId: r.link.linkId, nodeId: 'n1', title: 'build', by: null, until })
     expect((await t.store.load())[0].control?.locked).toBe(true)
     await flush()
-    expect(t.states().at(-1)?.[0].control).toEqual({ enabled: true, locked: true })
+    expect(t.states().at(-1)?.[0].control).toEqual({ enabled: true, locked: true, lockedUntil: until })
   })
 
   it('a lock whose write fails still holds in memory, and the failure is logged', async () => {
@@ -1163,7 +1190,7 @@ describe('createWatchLinkService — the Control host seams', () => {
     outcome = 'failed'
     t.hosts.made[0].deps.onControlLocked()
     await vi.waitFor(() => expect(warn.mock.calls.some(([l]) => /lock/.test(String(l)))).toBe(true))
-    expect(t.s.list()[0].control).toEqual({ enabled: true, locked: true })
+    expect(t.s.list()[0].control).toMatchObject({ enabled: true, locked: true })
     const c = t.hosts.made[0].record.control!
     for (const secret of [PW, c.salt, c.hash]) expect(allLogged([warn])).not.toContain(secret)
     warn.mockRestore()
@@ -1224,6 +1251,132 @@ describe('createWatchLinkService — the Control host seams', () => {
     expect(again.hosts.made[0].record.control?.wrong).toBe(9)
   })
 
+  // Finding L2: a lock lifts by itself — 15 minutes for the first since the owner last allowed control,
+  // doubling each time, 24 h at most — so a link holder cannot lock control for everyone for good.
+  describe('a timed lock (finding L2)', () => {
+    const MIN = 60_000
+    async function locked(o: Opts = {}) {
+      vi.useFakeTimers()
+      const t = service({ hashPassword: fastHash, ...o })
+      // Unlimited: a lock can outlast a finite link, which would end it first.
+      const r = await t.s.create(ctlReq({ ttlSeconds: 0 }))
+      if (!r.ok) throw new Error(r.error)
+      const h = t.hosts.made[0]
+      return { t, h, id: r.link.linkId }
+    }
+    const lockNow = (h: FakeHost, by: string | null = null): void => {
+      for (let n = 1; n <= WRONG_PER_LINK; n++) h.deps.onWrongAttempt(n)
+      h.deps.onControlLocked(by)
+    }
+
+    it('lasts 15 minutes, names who tipped it, then lifts by itself: unlocking allowed again, the count over, the host told, saved', async () => {
+      const { t, h } = await locked()
+      const t0 = Date.now()
+      lockNow(h, 'Mert')
+      expect(h.record.control).toMatchObject({ locked: true, lockedUntil: t0 + 15 * MIN, lockStep: 1, wrong: WRONG_PER_LINK })
+      expect(t.notices().at(-1)).toMatchObject({ kind: 'control-locked', by: 'Mert', until: t0 + 15 * MIN })
+      expect(t.s.list()[0].control).toEqual({ enabled: true, locked: true, lockedUntil: t0 + 15 * MIN })
+      await vi.advanceTimersByTimeAsync(15 * MIN - 1)
+      expect(h.record.control?.locked).toBe(true)
+      expect(h.hooks).toEqual([])
+      await vi.advanceTimersByTimeAsync(1)
+      expect(h.record.control).toMatchObject({ locked: false, lockedUntil: null, wrong: 0, lockStep: 1 })
+      expect(h.hooks).toEqual(['allowControl'])
+      expect(t.s.list()[0].control).toEqual({ enabled: true, locked: false, lockedUntil: null })
+      await flush()
+      expect((await t.store.load())[0].control).toMatchObject({ locked: false, lockedUntil: null, wrong: 0, lockStep: 1 })
+    })
+
+    it('each later lock lasts twice as long, never past 24 h; Allow control again lifts it at once and starts the backoff over', async () => {
+      const { t, h, id } = await locked()
+      const lasted: number[] = []
+      for (let i = 0; i < 9; i++) {
+        lockNow(h)
+        lasted.push((h.record.control!.lockedUntil as number) - Date.now())
+        await vi.advanceTimersByTimeAsync(lasted.at(-1)!)
+        expect(h.record.control?.locked).toBe(false)
+      }
+      expect(lasted.map((ms) => ms / MIN)).toEqual([15, 30, 60, 120, 240, 480, 960, 1440, 1440])
+      lockNow(h)
+      expect(await t.s.allowControl(id)).toBe(true)
+      expect(h.record.control).toMatchObject({ locked: false, lockedUntil: null, wrong: 0, lockStep: 0 })
+      // The pending lift finds nothing to do when its time comes.
+      const hooks = h.hooks.length
+      await vi.advanceTimersByTimeAsync(25 * HOUR)
+      expect(h.hooks.length).toBe(hooks)
+      lockNow(h)
+      expect((h.record.control!.lockedUntil as number) - Date.now()).toBe(15 * MIN)
+    })
+
+    it('a restart neither lifts a lock early nor makes it permanent', async () => {
+      const { t, h } = await locked()
+      const t0 = Date.now()
+      lockNow(h, 'Mert')
+      await flush()
+      await t.s.shutdown()
+      await vi.advanceTimersByTimeAsync(5 * MIN)
+      const again = service({ store: new WatchLinkStore({ file: t.file }) })
+      await again.s.init()
+      const h2 = again.hosts.made[0]
+      expect(h2.record.control).toMatchObject({ locked: true, lockedUntil: t0 + 15 * MIN, wrong: WRONG_PER_LINK, lockStep: 1 })
+      await vi.advanceTimersByTimeAsync(10 * MIN)
+      expect(h2.record.control).toMatchObject({ locked: false, lockedUntil: null, wrong: 0, lockStep: 1 })
+      expect(h2.hooks).toEqual(['allowControl'])
+    })
+
+    it('a restart after the lock should have lifted lifts it BEFORE the host is built (it starts from a count of 0), and saves that', async () => {
+      const { t, h } = await locked()
+      lockNow(h)
+      await flush()
+      await t.s.shutdown()
+      await vi.advanceTimersByTimeAsync(2 * HOUR)
+      const again = service({ store: new WatchLinkStore({ file: t.file }) })
+      await again.s.init()
+      const h2 = again.hosts.made[0]
+      // The host was handed a record already lifted: nothing to tell it.
+      expect(h2.record.control).toMatchObject({ locked: false, lockedUntil: null, wrong: 0, lockStep: 1 })
+      expect(h2.hooks).toEqual([])
+      await flush()
+      expect((await again.store.load())[0].control).toMatchObject({ locked: false, wrong: 0, lockStep: 1 })
+    })
+
+    it('a lock written before timed locks (no lift time) keeps its meaning: it waits for the owner', async () => {
+      vi.useFakeTimers()
+      const t = service({ hashPassword: fastHash })
+      const r = await t.s.create(ctlReq({ ttlSeconds: 0 }))
+      if (!r.ok) throw new Error(r.error)
+      const old = t.hosts.made[0].record
+      await t.s.shutdown()
+      const legacy = { ...old, control: { enabled: true, salt: old.control!.salt, hash: old.control!.hash, locked: true, wrong: WRONG_PER_LINK } }
+      await new WatchLinkStore({ file: t.file }).save([legacy])
+      const again = service({ store: new WatchLinkStore({ file: t.file }) })
+      await again.s.init()
+      const h = again.hosts.made[0]
+      expect(h.record.control).toMatchObject({ locked: true, lockedUntil: null })
+      expect(again.s.list()[0].control).toEqual({ enabled: true, locked: true, lockedUntil: null })
+      await vi.advanceTimersByTimeAsync(400 * HOUR)
+      expect(h.record.control?.locked).toBe(true)
+      expect(h.hooks).toEqual([])
+      expect(await again.s.allowControl(r.link.linkId)).toBe(true)
+      expect(h.record.control).toMatchObject({ locked: false, lockStep: 0 })
+    })
+
+    it('a lift time further off than 24 h (the clock went back, a hand edit) is brought in to 24 h from now', async () => {
+      const { t, h } = await locked()
+      lockNow(h)
+      await flush()
+      await t.s.shutdown()
+      const saved = (await new WatchLinkStore({ file: t.file }).load())[0]
+      await new WatchLinkStore({ file: t.file }).save([{ ...saved, control: { ...saved.control!, lockedUntil: Date.now() + 400 * HOUR } }])
+      const again = service({ store: new WatchLinkStore({ file: t.file }) })
+      await again.s.init()
+      const h2 = again.hosts.made[0]
+      expect(h2.record.control?.lockedUntil).toBe(Date.now() + 24 * HOUR)
+      await vi.advanceTimersByTimeAsync(24 * HOUR)
+      expect(h2.record.control?.locked).toBe(false)
+    })
+  })
+
   it('a new password and Allow control again reset the count, on the record and on disk', async () => {
     const t = service({ hashPassword: fastHash })
     const r = await t.s.create(ctlReq())
@@ -1259,7 +1412,7 @@ describe('createWatchLinkService — the Control host seams', () => {
       { viewerId: 'v-2', name: null, joinedAt: 6, waiting: false, controlling: false, typing: false }
     ]
     expect(t.s.list()[0].viewers.map((v) => [v.controlling, v.typing])).toEqual([[true, true], [false, false]])
-    expect(t.s.list()[0].control).toEqual({ enabled: true, locked: false })
+    expect(t.s.list()[0].control).toEqual({ enabled: true, locked: false, lockedUntil: null })
   })
 })
 
@@ -1274,7 +1427,7 @@ describe('createWatchLinkService — the owner controls a Control link', () => {
     expect(h.hooks).toEqual(['controlChanged'])
     expect((await t.store.load()).find((l) => l.linkId === r.link.linkId)?.control?.enabled).toBe(false)
     await flush()
-    expect(t.states().at(-1)?.find((l) => l.linkId === r.link.linkId)?.control).toEqual({ enabled: false, locked: false })
+    expect(t.states().at(-1)?.find((l) => l.linkId === r.link.linkId)?.control).toEqual({ enabled: false, locked: false, lockedUntil: null })
     expect(await t.s.setControl(r.link.linkId, true)).toBe(true)
     expect(h.hooks).toEqual(['controlChanged', 'controlChanged'])
     // Not a Control link, an unknown link, an ended one.
@@ -1318,7 +1471,7 @@ describe('createWatchLinkService — the owner controls a Control link', () => {
     expect(await t.s.allowControl(r.link.linkId)).toBe(true)
     expect(h.hooks).toEqual(['allowControl'])
     expect((await t.store.load())[0].control?.locked).toBe(false)
-    expect(t.s.list()[0].control).toEqual({ enabled: true, locked: false })
+    expect(t.s.list()[0].control).toEqual({ enabled: true, locked: false, lockedUntil: null })
     expect(await t.s.allowControl('Nope000000000000000000')).toBe(false)
   })
 
@@ -1351,7 +1504,7 @@ describe('createWatchLinkService — the owner controls a Control link', () => {
     expect(await t.s.setControl(id, false)).toBe('unsaved')
     // Never undone: the record the host reads, the owner's view, and the host told once.
     expect(h.record.control?.enabled).toBe(false)
-    expect(t.s.list()[0].control).toEqual({ enabled: false, locked: false })
+    expect(t.s.list()[0].control).toEqual({ enabled: false, locked: false, lockedUntil: null })
     expect(h.hooks).toEqual(['controlChanged'])
     expect(f.saves.length).toBe(saves + 1) // no "corrected" list queued behind it
     expect(f.written.at(-1)?.enabled).toBe(false)
@@ -1360,7 +1513,7 @@ describe('createWatchLinkService — the owner controls a Control link', () => {
     const other = await t.s.create(req({ nodeId: 'n2' }))
     expect(other.ok).toBe(true)
     expect(f.written.at(-1)?.enabled).toBe(false)
-    expect(t.s.list().find((l) => l.linkId === id)?.control).toEqual({ enabled: false, locked: false })
+    expect(t.s.list().find((l) => l.linkId === id)?.control).toEqual({ enabled: false, locked: false, lockedUntil: null })
     expect(allLogged([warn])).not.toContain(PW)
     warn.mockRestore()
   })
@@ -1406,7 +1559,7 @@ describe('createWatchLinkService — the owner controls a Control link', () => {
     expect(await t.s.setPassword(id, NEW_PW)).toBe('unsaved')
     expect(h.hooks).toEqual(['controlChanged', 'passwordChanged'])
     const after = { ...h.record.control! }
-    expect(t.s.list()[0].control).toEqual({ enabled: false, locked: false })
+    expect(t.s.list()[0].control).toEqual({ enabled: false, locked: false, lockedUntil: null })
     // The disk answers again: the hung writes land, and the next write carries both changes.
     const d = held
     held = null
@@ -1431,7 +1584,7 @@ describe('createWatchLinkService — the owner controls a Control link', () => {
     h.deps.onControlLocked() // its own write fails too: the lock holds
     expect(await t.s.allowControl(id)).toBe(false)
     expect(h.hooks).toEqual([]) // a widening the write refused never reached the host
-    expect(t.s.list()[0].control).toEqual({ enabled: true, locked: true })
+    expect(t.s.list()[0].control).toMatchObject({ enabled: true, locked: true })
     warn.mockRestore()
   })
 })
@@ -1487,7 +1640,7 @@ describe('createWatchLinkService — owner changes, by direction', () => {
     // What an unlock checks (the host reads the record live): still off while the write is in flight.
     expect(x.h.record.control?.enabled).toBe(false)
     expect(x.h.hooks).toEqual([])
-    expect(x.t.s.list()[0].control).toEqual({ enabled: false, locked: false })
+    expect(x.t.s.list()[0].control).toEqual({ enabled: false, locked: false, lockedUntil: null })
     // …and yet the write carries the change.
     expect(x.written.at(-1)?.enabled).toBe(true)
     x.release('failed')
@@ -1509,7 +1662,7 @@ describe('createWatchLinkService — owner changes, by direction', () => {
     expect(await on).toBe(true)
     expect(x.h.record.control?.enabled).toBe(true)
     expect(x.h.hooks).toEqual(['controlChanged'])
-    expect(x.t.s.list()[0].control).toEqual({ enabled: true, locked: false })
+    expect(x.t.s.list()[0].control).toEqual({ enabled: true, locked: false, lockedUntil: null })
   })
 
   it('allowControl waits for the write too: still locked throughout, and a failed write never unlocks it', async () => {

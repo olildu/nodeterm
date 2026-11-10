@@ -248,6 +248,13 @@ export interface MirrorSettings {
    * custom node, exactly as before this field existed.
    */
   customAgents?: MirrorCustomAgent[]
+  /**
+   * `process.platform` of the machine whose sessions this file describes (`darwin` / `linux` /
+   * `win32`). A phone must not type POSIX shell syntax into a `win32` host's fresh pane — pwsh and
+   * cmd reject `2>/dev/null`, `env -u`, `VAR=x cmd` — so it asks the host to launch instead
+   * (`pty.attach { launch }`). Absent on old files and on SSH slices (whose hosts are POSIX).
+   */
+  hostPlatform?: string
 }
 
 /** One custom agent as the mirror advertises it (see MirrorSettings.customAgents). */
@@ -914,7 +921,8 @@ export function toolActivity(toolName: string, toolInput: Record<string, unknown
     case 'Read':
       out = `Reading ${basename(str(ti.file_path) || str(ti.notebook_path)) || 'file'}`
       break
-    case 'Bash': {
+    case 'Bash':
+    case 'Shell': { // cursor's shell tool, same `command` key (measured hook payload)
       const cmd = str(ti.command).replace(/\s+/g, ' ').trim()
       out = `Running ${cmd ? clip(cmd, 60) : 'command'}`
       break
@@ -1373,6 +1381,18 @@ export function pendingTicketsFor(nodeId: string): string[] {
   }
   for (const id of state.get(nodeId)?.concurrentApprovalIds ?? []) out.add(id)
   return [...out]
+}
+
+/**
+ * The ask that is CURRENTLY open on a node — its newest unresolved approval/question card, the same
+ * pick the phone renders its answer card from (`LiveActivityManager.needsYouContent`). The relay's
+ * `agent.key` compares it with the kind of answer it is about to type: a question's digit typed
+ * into a permission prompt ANSWERS it (`2` = "don't ask again"). Undefined = no open ask. Pure read.
+ */
+export function openAskFor(nodeId: string): { kind: 'approval' | 'question'; pendingId?: string } | undefined {
+  const e = newestUnresolved(inboxEvents, nodeId)
+  if (!e) return undefined
+  return { kind: e.kind as 'approval' | 'question', ...(e.pendingId ? { pendingId: e.pendingId } : {}) }
 }
 
 export function isEventUnresolved(nodeId: string, eventId: string): boolean {
@@ -2248,6 +2268,28 @@ export function nodeState(nodeId: string): AgentState | undefined {
  */
 export function mirrorEntry(nodeId: string): MirrorEntry | undefined {
   return state.get(nodeId)
+}
+
+/**
+ * Every mirror entry, as a fresh array of `[nodeId, entry]` — the `agent:status-snapshot` a late
+ * relay tab starts from reads it (core/agent-status-snapshot.ts). Read-only by contract, like
+ * `mirrorEntry`: the array is a copy, the entries are the live ones.
+ */
+export function mirrorEntries(): ReadonlyArray<readonly [string, Readonly<MirrorEntry>]> {
+  return [...state]
+}
+
+/**
+ * Every node whose CURRENT agent session is `sessionId` (usually one; a session resumed in two nodes
+ * is two). Read-only peek: the relay access policies attribute a `context:update` — keyed by the
+ * agent session, not the node — to the nodes it describes, so a peer limited to some projects
+ * receives a meter only for a session that runs in one of them.
+ */
+export function nodesForAgentSession(sessionId: string): string[] {
+  const out: string[] = []
+  if (typeof sessionId !== 'string' || !sessionId) return out
+  for (const [nodeId, e] of state) if (e.sessionId === sessionId) out.push(nodeId)
+  return out
 }
 
 /**

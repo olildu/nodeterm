@@ -6,7 +6,9 @@ import {
   hasEditContext,
   isTerminalTarget,
   isTypingTarget,
-  keyDispatchContextFor
+  keyDispatchContextFor,
+  KEYBOARD_OWNER_SELECTOR,
+  isKeyboardOwnerTarget
 } from './keyContext'
 
 const el = (
@@ -49,6 +51,16 @@ describe('isTypingTarget', () => {
   it('plain elements and null are not typing', () => {
     expect(isTypingTarget(el('DIV'))).toBe(false)
     expect(isTypingTarget(null)).toBe(false)
+  })
+
+  // The whiteboard's Excalidraw focuses a plain container div. Without this, Space panned the canvas
+  // and Delete/⌘Z reached canvas commands while drawing (measured in the dev build).
+  it('a plain element inside a keyboard-owning surface is typing (the whiteboard editor)', () => {
+    const inside = { ...el('DIV'), closest: (sel: string) => (sel === KEYBOARD_OWNER_SELECTOR ? {} : null) }
+    const outside = { ...el('DIV'), closest: () => null }
+    expect(isKeyboardOwnerTarget(inside)).toBe(true)
+    expect(isTypingTarget(inside)).toBe(true)
+    expect(isTypingTarget(outside)).toBe(false)
   })
 })
 

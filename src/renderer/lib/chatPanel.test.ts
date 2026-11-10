@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest'
-import { CHAT_FOLLOW_THRESHOLD_PX, chatAgentLabel, chatKeyAction, isNearBottom, shouldFollowOnLoad, toolCardTitle } from './chatPanel'
+import {
+  CHAT_FOLLOW_THRESHOLD_PX,
+  chatAgentLabel,
+  chatKeyAction,
+  isNearBottom,
+  shouldFollowOnLoad,
+  toolCardTitle,
+  unseenAfter
+} from './chatPanel'
+import type { ChatMessage } from '@shared/types'
 
 describe('chatKeyAction', () => {
   it('Enter sends', () => {
@@ -59,9 +68,42 @@ describe('chatAgentLabel', () => {
 })
 
 describe('toolCardTitle', () => {
-  it('names a plan and a question for what they are, anything else by its tool name', () => {
+  it('names a plan, a question and a todo list for what they are, anything else by its tool name', () => {
     expect(toolCardTitle('ExitPlanMode')).toBe('Plan')
     expect(toolCardTitle('AskUserQuestion')).toBe('Question')
+    expect(toolCardTitle('TodoWrite')).toBe('Todo list')
     expect(toolCardTitle('SomeFutureTool')).toBe('SomeFutureTool')
+  })
+})
+
+describe('unseenAfter', () => {
+  const msg = (key?: number): ChatMessage => ({ role: 'assistant', key, parts: [{ kind: 'text', text: String(key) }] })
+
+  it('counts the messages after the last one seen, found by key', () => {
+    const seen = msg(20)
+    const thread = [msg(10), msg(20), msg(30), msg(40)]
+
+    const unseen = unseenAfter(thread, seen)
+
+    expect(unseen).toBe(2)
+  })
+
+  it('finds an unkeyed message by identity', () => {
+    const seen = msg()
+    const thread = [msg(), seen, msg()]
+
+    const unseen = unseenAfter(thread, seen)
+
+    expect(unseen).toBe(1)
+  })
+
+  it('counts nothing when no message was seen or the thread was replaced', () => {
+    const thread = [msg(10), msg(20)]
+
+    const none = unseenAfter(thread, null)
+    const gone = unseenAfter(thread, msg(99))
+
+    expect(none).toBe(0)
+    expect(gone).toBe(0)
   })
 })

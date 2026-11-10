@@ -31,7 +31,9 @@ import { groupsFirst } from '@shared/node-order'
 import { applyOwnCanvasMutation, createProject, reorderGroupWithinParent } from './workspace'
 import { registerCodexRelayProjectCheck } from './codexCli'
 import { markWorkspaceDirty } from './workspaceDirty'
+import { rootPositionWith } from '@shared/root-position'
 import { folderName } from '../lib/projectOpen'
+import { useSettings } from './settings'
 // One order-independent key for an edge's endpoints — the SAME rule `hiddenLinkIds` uses, so a
 // rope and the bridge it covers are recognized as one relationship here too.
 import { pairKey as bridgePairKey } from '../lib/noteLink'
@@ -95,6 +97,9 @@ interface ProjectsState {
    *  on `Project.icon` and git-shared via project.json like name/color. No-op for an unknown id. */
   setProjectIcon(id: string, icon: ProjectIcon | undefined): void
   setProjectCwd(id: string, cwd: string): void
+  /** Issue #1145: where this folder project's canvas is stored. Only the flag — the move itself
+   *  (save, then the core step) is `lib/projectStorageMove`. */
+  setProjectStoreInAppData(id: string, on: boolean): void
   /** Grey (or un-grey) a project tab as "unavailable" WITHOUT dropping it — runtime-only, never
    *  persisted (see the toWorkspace tripwire). Set true when a relay tab's socket drops (Stage 4
    *  Task 7) so it stays reconnectable; cleared when it reconnects. */
@@ -322,25 +327,23 @@ interface ProjectsState {
   toWorkspace(): Workspace
 }
 
+/**
+ * A local folder project CREATED from now on (never one adopted from an existing project.json)
+ * keeps its canvas where Settings → Behavior says (issue #1145).
+ */
+function withNewProjectStorage(project: Project): Project {
+  return project.cwd && !project.ssh && useSettings.getState().settings.newProjectStorage === 'appData'
+    ? { ...project, storeInAppData: true }
+    : project
+}
+
 /** A persisted node's position in ROOT space: its own plus every ancestor frame's origin. */
 function rootStatePosition(
   node: CanvasNodeState,
   nodes: CanvasNodeState[]
 ): { x: number; y: number } {
   const byId = new Map(nodes.map((candidate) => [candidate.id, candidate]))
-  const seen = new Set<string>([node.id])
-  let x = node.position.x
-  let y = node.position.y
-  let parentId = node.parentId
-  while (parentId && !seen.has(parentId)) {
-    seen.add(parentId)
-    const parent = byId.get(parentId)
-    if (!parent) break
-    x += parent.position.x
-    y += parent.position.y
-    parentId = parent.parentId
-  }
-  return { x, y }
+  return rootPositionWith(node, (id) => byId.get(id))
 }
 
 function stateIsDescendant(
@@ -489,6 +492,13 @@ export function sameSshEndpoint(a: NonNullable<Project['ssh']>, b: NonNullable<P
   )
 }
 
+/** The cwd `registerProject` dedupes by: trailing slashes stripped, so `/a/b/` and `/a/b` cannot
+ *  mint two tabs for one directory. Root stays '/': stripping it to '' would match every cwd-less
+ *  project. Exported so anything predicting registerProject's match uses this rule, not a copy. */
+export function registeredCwd(resolvedCwd: string): string {
+  return resolvedCwd.length > 1 ? resolvedCwd.replace(/\/+$/, '') : resolvedCwd
+}
+
 export const useProjects = create<ProjectsState>((set, get) => ({
   projects: [],
   activeProjectId: '',
@@ -514,7 +524,7 @@ export const useProjects = create<ProjectsState>((set, get) => ({
     // Every new project's name — a folder's own name, an SSH label, a relay host's project
     // name — gets the same cap as a rename (issue #940). A blank one keeps createProject's default.
     const clean = name === undefined ? undefined : clampProjectName(name) || undefined
-    const project = createProject(get().projects.length, clean, cwd, ssh)
+    const project = withNewProjectStorage(createProject(get().projects.length, clean, cwd, ssh))
     set((s) => ({ projects: [...s.projects, project] }))
     return project
   },
@@ -594,6 +604,17 @@ export const useProjects = create<ProjectsState>((set, get) => ({
   setProjectCwd(id, cwd) {
     set((s) => ({
       projects: s.projects.map((p) => (p.id === id ? { ...p, cwd } : p))
+    }))
+  },
+
+  setProjectStoreInAppData(id, on) {
+    set((s) => ({
+      projects: s.projects.map((p) => {
+        if (p.id !== id) return p
+        if (on) return { ...p, storeInAppData: true }
+        const { storeInAppData: _drop, ...rest } = p
+        return rest
+      })
     }))
   },
 
@@ -1093,9 +1114,8 @@ export const useProjects = create<ProjectsState>((set, get) => ({
 
   registerProject({ resolvedCwd, name, color, probed }) {
     // The same exact-match rule as `openFolderProject` (a folder maps to one project), with the
-    // trailing slash stripped so `/a/b/` and `/a/b` cannot mint two tabs for one directory.
-    // Root stays '/': stripping it to '' would match every cwd-less project.
-    const cwd = resolvedCwd.length > 1 ? resolvedCwd.replace(/\/+$/, '') : resolvedCwd
+    // trailing slash stripped (`registeredCwd`).
+    const cwd = registeredCwd(resolvedCwd)
     const existing = get().projects.find((p) => p.cwd === cwd)
     if (existing) {
       if (existing.closed) {
@@ -1126,7 +1146,7 @@ export const useProjects = create<ProjectsState>((set, get) => ({
     const fallbackName = clampProjectName(folderName(cwd)) || 'Project'
     // `name` is the agent's `--name`, free text like a rename: same cap (issue #940).
     const project = {
-      ...createProject(get().projects.length, clampProjectName(name ?? '') || fallbackName, cwd),
+      ...withNewProjectStorage(createProject(get().projects.length, clampProjectName(name ?? '') || fallbackName, cwd)),
       ...(color ? { color } : {})
     }
     set((s) => ({ projects: [...s.projects, project] }))
@@ -1141,6 +1161,21 @@ export const useProjects = create<ProjectsState>((set, get) => ({
     return { version: 2, activeProjectId, projects: projects.filter((p) => !p.remote) }
   }
 }))
+
+/**
+ * Add an EMPTY relay tab: a project for a connection whose host shared nothing that could be adopted
+ * (a Team Access tab's fallback, a hosted team's placeholder). Marked `remote` like every relay tab,
+ * because it IS one: the host's nodes reach it over canvas sync, so it must never be saved into this
+ * machine's workspace (`toWorkspace` filters `remote`) nor, once its relay session is gone, resolve
+ * to the local session (session.ts `sessionForProject`). Added like any project first, so it takes
+ * the store's name cap and does not take the screen.
+ */
+export function addRelayTab(label: string): Project {
+  const store = useProjects.getState()
+  const relay = { ...store.addProject(label), remote: true }
+  store.replaceProject(relay)
+  return relay
+}
 
 // Codex launch caps must know a relay tab when they see one: its sessions run on ANOTHER machine's
 // codex, which this machine's probe never saw (see `codexApprovalCaps`). Registered here rather

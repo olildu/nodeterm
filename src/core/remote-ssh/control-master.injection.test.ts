@@ -257,7 +257,7 @@ describe('remotePaneOwnerCombinedArgs: one script, every splice accounted for', 
     // The CONSTANT, not a copy of it — "verbatim" is the property under test, so it is compared
     // against the thing the local leg actually sends, quoted so the remote shell hands tmux the
     // string rather than parsing its metacharacters ({, }, |).
-    expect(script).toContain(`display-message -p -t nt-n1 '${PANE_OWNER_FMT}'`)
+    expect(script).toContain(`display-message -p -t '=nt-n1:' '${PANE_OWNER_FMT}'`)
     expect(PANE_OWNER_FMT).toMatch(/[{}|]/)
   })
 

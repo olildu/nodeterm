@@ -17,6 +17,7 @@
   },
   "include": [
     "electron.vite.config.ts",
+    "scripts/excalidraw-assets-plugin.ts",
     "src/main/**/*",
     "src/preload/**/*",
     "src/shared/**/*",

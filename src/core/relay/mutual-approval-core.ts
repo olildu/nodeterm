@@ -1,4 +1,4 @@
-// Pure state for SYMMETRIC pairing approval: both ends verify the same 6-digit SAS out of band and
+// Pure state for SYMMETRIC pairing approval: both ends verify the same SAS out of band and
 // both pin the other's key. Today approval is one-way (only the host pins the client). This adds the
 // second confirmation direction + the pin-both-ends bookkeeping as pure logic — no sockets, no
 // Electron — so it unit-tests directly and 4c can wire it into either end's handshake.
@@ -80,7 +80,7 @@ export function isMutuallyApproved(s: MutualApproval): boolean {
   return s.localConfirmed && s.remoteConfirmed
 }
 
-/** The 6-digit code ("NNN NNN") BOTH ends compute + confirm. Thin alias so 4c reads clearly. */
+/** The 10-digit code ("NNN NNN NNNN", SAS v2) BOTH ends compute + confirm. Thin alias so 4c reads clearly. */
 export function mutualSas(shared: Uint8Array): string {
   return sasFromSharedKey(shared)
 }

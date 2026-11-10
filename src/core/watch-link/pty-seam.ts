@@ -94,7 +94,8 @@ function sshConnOf(v: unknown): SshConnection | null {
  *    whether or not that master is up (the renderer's own rule for the node's spawn);
  *  - anything else (a local node, a standalone ssh terminal whose `ssh` runs in LOCAL tmux): local.
  * Records that throw answer `requireRemote` with no master: a join that cannot be placed never reaches
- * the local socket (it joins a session this process already holds, or waits).
+ * the local socket. It joins only a REMOTE session this process already holds; a held LOCAL one is
+ * refused (`held-elsewhere`, see PtyManager `join`), and otherwise it waits.
  */
 export function watchRemoteFor(nodeId: string, r: WatchRemoteRecords): WatchRemote {
   try {

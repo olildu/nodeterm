@@ -52,6 +52,7 @@ import {
 } from '../../shared/share-team'
 import type { SshConnection } from '../../shared/ssh'
 import type { RelayBookmark } from '../remote/relay-bookmarks'
+import { isRecord } from '../../shared/is-record'
 
 /** ssh timeouts per verb. `bootstrap` and `resume` outlast the server's own admin timeouts behind
  *  them (45 s and 60 s) plus the CLI's start-up, so a slow but healthy server answers before ssh
@@ -116,7 +117,6 @@ const CONTROL_G = new RegExp(CONTROL_RE.source, 'gu')
 const QUOTE_OR_BACKSLASH_G = /['\\]/g
 const RESUME_STATUSES: ReadonlySet<string> = new Set<ResumeStatus>(['resumed', 'already-running', 'refused'])
 
-const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const fail = (error: string, code?: string): ShareFail => ({ ok: false, error, ...(code ? { code } : {}) })
 /** A server-sent sentence, made safe to print: controls (and text-direction overrides) blanked, bounded. */
 const shown = (text: string): string => text.replace(CONTROL_G, ' ').slice(0, SHOWN_MAX)

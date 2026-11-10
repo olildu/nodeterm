@@ -82,6 +82,11 @@ interface ApprovalDialect {
   flag: string
   modes: Partial<Record<AgentPermissionMode, string>>
   /**
+   * Optional boolean switch emitted instead of `[flag, value]` for modes that use a standalone flag
+   * (antigravity's `--dangerously-skip-permissions` alongside `--mode accept-edits|auto|plan`).
+   */
+  standaloneFlags?: Partial<Record<AgentPermissionMode, string>>
+  /**
    * Does this CLI's OWN default already prompt before every action?
    *
    * This is what decides whether `manual` ("Ask each time") is honoured by emitting NOTHING. For
@@ -99,6 +104,9 @@ interface ApprovalDialect {
   /** What this CLI actually does when `manual` turns out to be inexpressible, for the UI note.
    *  Lives beside the table so the sentence cannot drift from it. */
   manualGapNote?: string
+  /** argv for a table value. Default `[flag, value]`. Only for a CLI whose modes are DIFFERENT
+   *  flags rather than values of one (cursor: `--mode plan` but a bare `--force`). */
+  spell?: (value: string) => string[]
 }
 
 const GEMINI_MODES: Partial<Record<AgentPermissionMode, string>> = {
@@ -117,6 +125,15 @@ const GEMINI_MODES: Partial<Record<AgentPermissionMode, string>> = {
   // always launched bare (= `default` = prompt for approval), and `modeSupported` would have
   // answered `true`, so the derived copy would not have admitted it either. No flag is the honest
   // answer and reproduces the pre-branch launch exactly. See `unsupportedModesNote`.
+}
+
+const ANTIGRAVITY_MODES: Partial<Record<AgentPermissionMode, string>> = {
+  plan: 'plan',
+  acceptEdits: 'accept-edits',
+  auto: 'auto'
+  // `manual` → agy's own default (no flag).
+  // `bypassPermissions` uses the standalone switch `--dangerously-skip-permissions`
+  // (`standaloneFlags` below), measured on `agy --help` (1.2.7).
 }
 
 const CODEX_MODES: Partial<Record<AgentPermissionMode, string>> = {
@@ -150,6 +167,36 @@ const CODEX_MODES: Partial<Record<AgentPermissionMode, string>> = {
   // `plan` and `acceptEdits` are absent ON PURPOSE — see modeSupported.
 }
 
+const CURSOR_MODES: Partial<Record<AgentPermissionMode, string>> = {
+  auto: 'auto-review',
+  plan: 'plan',
+  bypassPermissions: 'force'
+  // MEASURED on cursor-agent 2026.09.28-64d2043: the flags reach the session from BEFORE the `agent`
+  // subcommand (see AGENT_CONFIG.cursor), and the effect is real, not just a footer label. With
+  // `--model composer-2.5 --force agent '<touch a file>'` the shell command ran with no approval
+  // prompt and the footer read "Run Everything"; the same command with no mode flag stopped at
+  // "Run this command? Not in allowlist: touch"; `--mode plan` answered a "create a file" prompt
+  // with a written plan ("Ready to build?") and created nothing.
+  //
+  // `manual` → cursor's own default, NO flag, and that default really prompts: `approvalMode:
+  // "allowlist"` in ~/.cursor/cli-config.json, shell commands off the allowlist stop at a dialog.
+  //
+  // `auto` → `--auto-review` ("Auto-review (Smart Auto): a server classifier auto-runs safe tool
+  // calls and prompts for the rest"). That is the same shape as claude's `--permission-mode auto`
+  // (a classifier decides), so it is the honest equivalent, not a nearest match. MEASURED on
+  // 2026.10.01-e373342: `--auto-review agent '<touch a file>'` ran `touch` with no prompt and the
+  // footer read "Auto-review". `auto` is DEFAULT_PERMISSION_MODE, so this IS what an untouched cursor
+  // node launches with. It was first left bare to avoid widening existing nodes at upgrade (the
+  // gemini `auto_edit` trap), but cursor ships in this same change, so there are no existing nodes,
+  // and the bare allowlist default asked for every command (the user's own report, 2026-10-02).
+  // No flag means "auto-approve edits, prompt for shell", so `acceptEdits` has no candidate and
+  // `unsupportedModesNote` admits it. `--mode ask` (read-only Q&A) and `--sandbox` (a separate
+  // axis, like codex's) are deliberately not touched.
+  //
+  // `--force` over its alias `--yolo`: same code path ("Run Everything"), and `--force` is the name
+  // `--help` gives first.
+}
+
 /**
  * The agents that need a translation, flag and vocabulary together.
  *
@@ -163,6 +210,12 @@ const CODEX_MODES: Partial<Record<AgentPermissionMode, string>> = {
  */
 const APPROVAL_DIALECTS: Partial<Record<AgentId, ApprovalDialect>> = {
   gemini: { flag: '--approval-mode', modes: GEMINI_MODES, manualIsDefault: true },
+  antigravity: {
+    flag: '--mode',
+    modes: ANTIGRAVITY_MODES,
+    standaloneFlags: { bypassPermissions: '--dangerously-skip-permissions' },
+    manualIsDefault: true
+  },
   codex: {
     flag: '--ask-for-approval',
     modes: CODEX_MODES,
@@ -172,6 +225,13 @@ const APPROVAL_DIALECTS: Partial<Record<AgentId, ApprovalDialect>> = {
     manualGapNote:
       'That default asks only when the model chooses to: `untrusted`, the policy that meant ' +
       'ask-every-time, was removed in codex-cli 0.149.0 and has no replacement.'
+  },
+  cursor: {
+    flag: '--mode',
+    modes: CURSOR_MODES,
+    manualIsDefault: true,
+    spell: (value) =>
+      value === 'force' ? ['--force'] : value === 'auto-review' ? ['--auto-review'] : ['--mode', value]
   }
 }
 
@@ -195,6 +255,15 @@ function emittableValue(
   return dialect.vocabulary(caps).includes(value) ? value : undefined
 }
 
+function standaloneFlag(
+  dialect: ApprovalDialect,
+  mode: AgentPermissionMode
+): string | undefined {
+  return dialect.standaloneFlags && Object.hasOwn(dialect.standaloneFlags, mode)
+    ? dialect.standaloneFlags[mode]
+    : undefined
+}
+
 const dialectFor = (agentId: AgentId): ApprovalDialect | null =>
   Object.hasOwn(APPROVAL_DIALECTS, agentId) ? APPROVAL_DIALECTS[agentId] ?? null : null
 
@@ -211,12 +280,13 @@ export function modeSupported(
   if (!dialect) return hasPermissionMode(agentId)
   // `manual` — "ask each time" — is reached two different ways, which is why the table alone is
   // not its authority: by emitting NO flag on a CLI whose own default already prompts
-  // (`manualIsDefault`: claude, grok, gemini), or by emitting a value that means it (codex's
-  // `untrusted`). An agent that can do NEITHER cannot keep the promise, and this is where that is
-  // admitted — codex >= 0.149.0 is exactly that case, and it is why this early return stopped
-  // being an unconditional `true`.
+  // (`manualIsDefault`: claude, grok, gemini, antigravity), or by emitting a value that means it
+  // (codex's `untrusted`). An agent that can do NEITHER cannot keep the promise, and this is where
+  // that is admitted — codex >= 0.149.0 is exactly that case, and it is why this early return
+  // stopped being an unconditional `true`.
   if (mode === 'manual')
     return dialect.manualIsDefault || emittableValue(dialect, 'manual', caps) !== undefined
+  if (standaloneFlag(dialect, mode) !== undefined) return true
   return emittableValue(dialect, mode, caps) !== undefined
 }
 
@@ -237,8 +307,10 @@ export function approvalFlags(
   if (!isPermissionMode(mode)) return []
   const dialect = dialectFor(agentId)
   if (dialect) {
+    const sw = standaloneFlag(dialect, mode)
+    if (sw) return [sw]
     const value = emittableValue(dialect, mode, caps)
-    return value ? [dialect.flag, value] : []
+    return value ? (dialect.spell?.(value) ?? [dialect.flag, value]) : []
   }
   // claude + grok keep their exact historical spelling, validated at the interpolation site.
   return hasPermissionMode(agentId) ? permissionModeFlag(mode) : []
@@ -249,8 +321,9 @@ export function approvalFlags(
  * CLI launch path (new node, cold-restore resume, branch, handoff, canvas control).
  *
  * WHERE the flag lands is decided one layer up, by `createAgentNode`: with no `argvPromptSeparator`
- * (claude, gemini, codex) it goes LAST, keeping those command lines byte-identical; with one
- * (grok's `--`) it must go BEFORE the separator, because `--` is end-of-options.
+ * (claude, gemini, codex, antigravity) it goes LAST, keeping those command lines byte-identical;
+ * with one (grok's `--`, cursor's `agent`) it must go BEFORE the separator: `--` is end-of-options,
+ * and cursor's flags are root options that the `agent` subcommand reads (measured, see CURSOR_MODES).
  *
  * **A flag the command already carries is left alone (issue #601).** `cmd` is not always ours:
  * `settings.agentLaunchCommands` lets the user replace the program part with a wrapper, and a
@@ -281,7 +354,13 @@ export function withPermissionMode(
 ): string {
   const flags = approvalFlags(id, mode, caps)
   if (!flags.length) return cmd
-  if (argvHasFlag(cmd, flags[0])) return cmd
+  const dialect = dialectFor(id)
+  if (dialect) {
+    const knownFlags = [flags[0], dialect.flag, ...Object.values(dialect.standaloneFlags ?? {})]
+    if (knownFlags.some((f) => f && argvHasFlag(cmd, f))) return cmd
+  } else if (argvHasFlag(cmd, flags[0])) {
+    return cmd
+  }
   return `${cmd} ${flags.join(' ')}`
 }
 

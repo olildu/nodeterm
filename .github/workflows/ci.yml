@@ -21,7 +21,14 @@ permissions:
 
 jobs:
   quality:
-    runs-on: ubuntu-latest
+    # PINNED, not `ubuntu-latest`. On 2026-11-04 `ubuntu-latest` rolled 24.04 -> 26.04 and four
+    # host-measurement tests went red on every branch at once: the BSD-chmod stand-in in
+    # remote-atomic-write (26.04's coreutils accepts `chmod 600 -- f` under POSIXLY_CORRECT, so the
+    # guard for the macOS `chmod --` bug stopped being armed), both real-tmux pane-cwd measurements,
+    # and pane-owner's foreground argv (`bash -c sh`). Those suites exist to pin a measured host
+    # behaviour, so they are only meaningful against a host we chose. Bump this deliberately, with
+    # the measurements re-run. See the 26.04 issue for what has to be re-measured first.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -32,13 +39,17 @@ jobs:
 
       # Skip postinstall's electron-rebuild (node-pty + whisper.cpp). Tests need neither the
       # Electron build nor smart-whisper, but many suites import node-pty at runtime, so it is
-      # rebuilt for Node from the patched sources (Windows takes its shipped prebuild). The patch step
-      # also writes the markers src/main/node-pty-patch.test.ts asserts.
+      # rebuilt for Node from the patched sources (Windows takes its shipped prebuild). The patch steps
+      # also write the markers src/main/node-pty-patch.test.ts and
+      # src/core/speech/smart-whisper-patch.test.ts assert.
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
       - name: Patch node-pty sources
         run: node scripts/patch-node-pty.mjs
+
+      - name: Patch smart-whisper sources
+        run: node scripts/patch-smart-whisper.mjs
 
       - name: Build node-pty and link esbuild
         run: npm rebuild node-pty esbuild
