@@ -1,4 +1,6 @@
 import { PrepareUpdateDialog } from '../components/PrepareUpdateDialog'
+import { CloudHandoffButton } from '../components/CloudHandoff'
+import type { CloudReopenSpec } from '@shared/types'
 import type { PrepNode } from '../lib/updatePrep'
 import { markLocalOnSshCanvas } from '../lib/localOnSshCanvas'
 import { useDevPortScanner } from './useDevPortScanner'
@@ -5792,6 +5794,24 @@ export function Canvas() {
     },
     [setNodes, markDirty, emptyNodePos, cwdForNewNodeIn, parentInto]
   )
+
+  /** Fork-only (Cloud hand-off): put a closed agent node back while its tab runs on the cloud box.
+   *  Built exactly like a new terminal (`addTerminal`): its own fresh id (reusing the closed node's id
+   *  races the closed node's session teardown, which then ends the NEW session), size from
+   *  `newNodeSize`, and the cross layout places and frames it. Title and colour are the agent's. A
+   *  plain terminal running the reconnecting attach, never an agent node, so nothing starts a second
+   *  copy of the agent here. Returns the new node's id; the caller binds it to the agent. */
+  const reopenCloudNode = useCallback(
+    (spec: CloudReopenSpec): string => {
+      const made = createTerminalNode(nodesRef.current.length, spec.cwd, emptyNodePos(), spec.command)
+      const node = { ...made, data: { ...made.data, title: spec.title, color: spec.color, tags: ['cloud'] } }
+      setNodes((ns) => [...ns, node])
+      markDirty()
+      return node.id
+    },
+    [setNodes, markDirty, emptyNodePos, nodesRef]
+  )
+  const hasCanvasNode = useCallback((id: string) => nodesRef.current.some((n) => n.id === id), [nodesRef])
 
   /** Open a new terminal that runs a command on start (e.g. gh auth login). `cwd` lets a caller
    *  (Source Control) run it in the checkout it is scoped to instead of the project's own — routed
@@ -20173,6 +20193,8 @@ export function Canvas() {
         <button title={commandTooltip('Explorer', 'panel.explorer')} onClick={() => showExplorer('toggle')}>
           <IconExplorer />
         </button>
+        {/* Fork-only: move this tab's agents to the cloud box and back (components/CloudHandoff). */}
+        <CloudHandoffButton projectId={activeProjectId} hasNode={hasCanvasNode} onReopen={reopenCloudNode} />
         <button title={commandTooltip('Source Control', 'panel.sourceControl')} onClick={() => setScOpen(true)}>
           <IconBranch />
         </button>

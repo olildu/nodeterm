@@ -4732,8 +4732,105 @@ export interface OpenLinkApi {
   cancel(id: string): void
 }
 
+/** Fork-only: the cloud hand-off script's verbs the Cloud button may run (main/cloud-handoff.ts). */
+export type CloudHandoffVerb =
+  | 'where' | 'plan' | 'out' | 'back' | 'back-force' | 'queue' | 'warm-on' | 'warm-off' | 'reconnect' | 'cancel' | 'bind'
+
+export interface CloudHandoffRequest {
+  verb: CloudHandoffVerb
+  /** nodeterm project id (the script accepts a tab name or id). */
+  tabId: string
+  /** queue only: the agent's node id and the task text. */
+  node?: string
+  text?: string
+  /** bind only: the canvas node that now shows the agent `node` (a reopened node gets a fresh id). */
+  canvasNode?: string
+}
+
+export interface CloudHandoffAgent {
+  node: string
+  title: string
+  /** Mac side: idle | busy | stopped. Box side: the overseer's working | idle | needs-you | limited | stuck | stopped | starting. */
+  status: string
+  summary?: string | null
+  commits?: number
+  files?: number
+  queued?: number
+  /** Opened on the box by a manager (comes home with the tab). */
+  station?: boolean
+  model?: string | null
+  closed?: boolean
+  /** On the box: how to put this agent's node back on the canvas if it was closed. */
+  reopen?: CloudReopenSpec
+  /** On the box: its canvas node is showing the agent right now (the attach loop is running). */
+  attached?: boolean
+  /** The canvas node showing this agent, when it is not the agent's own id (reopened with Open). */
+  canvas?: string | null
+}
+
+/** A canvas node that shows an agent's box session: same id, title and place as before. */
+export interface CloudReopenSpec {
+  id: string
+  title: string
+  position: { x: number; y: number }
+  size: { width: number; height: number }
+  color: string
+  cwd: string
+  /** The reconnecting attach the node runs (`sh ~/.cloud-handoff/attach.sh <id>`). */
+  command: string
+}
+
+export interface CloudHandoffPlan {
+  tab: { id: string; name: string }
+  where: string
+  at?: string | null
+  host: string
+  warm: boolean
+  last_sync?: string | null
+  agents: CloudHandoffAgent[]
+  folders: string[]
+  /** Repos the move covers; trees = main checkout + worktrees. */
+  repos?: { name: string; trees: number; cloned: boolean }[]
+  problems: string[]
+  free_mb?: number | null
+  queued: number
+  site: string
+}
+
+export interface CloudHandoffWhere {
+  tab: { id: string; name: string }
+  where: string
+  at?: string | null
+  agents: number
+  warm: boolean
+}
+
+/** `where`/`plan` answer with their JSON in `data`; long verbs stream `cloudHandoffProgress` and
+ *  resolve when the script exits. `notInstalled`: the script is not on this machine. */
+export interface CloudHandoffResult {
+  ok: boolean
+  data?: unknown
+  error?: string
+  notInstalled?: boolean
+}
+
+export interface CloudHandoffProgress {
+  tabId: string
+  verb: CloudHandoffVerb
+  line?: string
+  done?: boolean
+  ok?: boolean
+}
+
+export interface CloudHandoffApi {
+  run: (req: CloudHandoffRequest) => Promise<CloudHandoffResult>
+  onProgress: (cb: (p: CloudHandoffProgress) => void) => () => void
+}
+
 export interface NodeTerminalApi {
   pty: PtyApi
+  /** Fork-only, desktop only (absent in the Server Edition and relay tabs). */
+  cloudHandoff?: CloudHandoffApi
   workspace: WorkspaceApi
   projectSettings: ProjectSettingsApi
   projectSetup: ProjectSetupApi

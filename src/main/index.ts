@@ -270,6 +270,7 @@ import { createSessionReaper } from '../core/session-budget'
 import { initKeepAwake } from './keep-awake'
 import type { KeepAwakeTracker } from '../core/keep-awake'
 import { startSessionMemoryService, sshScopePredicate } from '../core/session-memory-service'
+import { registerCloudHandoffIpc } from './cloud-handoff'
 import { startDevPortsService } from '../core/dev-ports-service'
 import { createMemoryPressureMonitor } from '../core/memory-pressure'
 import { createPtyPressureMonitor } from '../core/pty-pressure'
@@ -1727,6 +1728,13 @@ app.whenReady().then(async () => {
   // `platform().handle` registration would answer relay peers too — a paired phone or remote tab
   // could read every API key in this process's environment. The browser/relay bridges hardcode
   // an empty snapshot instead, and expansion there degrades to the missing-env refusal.
+  // Fork-only: the Cloud button (move a tab's agents to the cloud box and back).
+  registerCloudHandoffIpc({
+    handle: (channel, fn) => ipcMain.handle(channel, (_e, req) => fn(req)),
+    send: (channel, payload) => {
+      for (const w of BrowserWindow.getAllWindows()) if (!w.isDestroyed()) w.webContents.send(channel, payload)
+    }
+  })
   ipcMain.handle(IPC.envSnapshot, () => {
     const out: Record<string, string> = {}
     for (const [k, v] of Object.entries(process.env)) {

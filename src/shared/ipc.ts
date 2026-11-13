@@ -410,6 +410,13 @@ export const IPC = {
   /** The scoped machine's RAM (available/total) — the cheap read behind the system-resource
    *  pill. Safe to poll locally; NOT polled for an SSH scope. */
   sessionMemoryHost: 'session-memory:host',
+  /** Fork-only (cross build): run the user's `cloud-handoff` script (move a tab's Claude agents to
+   *  a cloud box and back). Desktop main only; HOST_ONLY for relay peers. See
+   *  main/cloud-handoff.ts. */
+  cloudHandoffRun: 'cloud-handoff:run',
+  /** main → renderer: one progress line of a running hand-off (`{tabId, verb, line}`), then a
+   *  final `{tabId, verb, done: true, ok}`. */
+  cloudHandoffProgress: 'cloud-handoff:progress',
   /** Dev-server ports (core/dev-ports-service.ts): which TCP ports each node's session listens on
    *  (ownership by process tree, one round trip per host), and the same-port SSH forward that makes
    *  `http://localhost:<port>` reach an SSH project's host. Desktop only; host-only for relay peers. */

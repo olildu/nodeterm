@@ -18,6 +18,8 @@ import type {
   RelayPeerPending,
   RemoteUsageQuery,
   SessionMemoryQuery,
+  CloudHandoffProgress,
+  CloudHandoffRequest,
   UpdateInfo,
   UpdateInstalling,
   UpdateProgress,
@@ -590,6 +592,14 @@ const api: NodeTerminalApi = {
   // claim, which the core service ORs with its own `isRemoteProject`. Normalizing it here (say,
   // dropping a `false`, or defaulting the object) would silently re-open the misattribution this
   // surface exists to prevent — one machine's sessions published under another's name.
+  cloudHandoff: {
+    run: (req: CloudHandoffRequest) => ipcRenderer.invoke(IPC.cloudHandoffRun, req),
+    onProgress: (cb: (p: CloudHandoffProgress) => void) => {
+      const handler = (_e: unknown, p: CloudHandoffProgress): void => cb(p)
+      ipcRenderer.on(IPC.cloudHandoffProgress, handler)
+      return () => ipcRenderer.removeListener(IPC.cloudHandoffProgress, handler)
+    }
+  },
   sessionMemory: {
     read: (q?: SessionMemoryQuery) => ipcRenderer.invoke(IPC.sessionMemory, q),
     host: (q?: SessionMemoryQuery) => ipcRenderer.invoke(IPC.sessionMemoryHost, q)
